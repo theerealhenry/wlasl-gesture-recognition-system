@@ -1,0 +1,181 @@
+# =============================================================================
+# WLASL Gesture Recognition — Python Dependencies
+# =============================================================================
+# Python version : 3.10.20 (tested, required)
+# Environment    : Miniconda virtual environment
+# Last updated   : 2026-05-29
+#
+# INSTALLATION (in order — respect the pinned versions to avoid conflicts):
+#
+#   conda activate <your-env>
+#   pip install -r requirements.txt
+#
+# KEY COMPATIBILITY CONSTRAINTS:
+#   - TensorFlow 2.13.x requires numpy < 2.0  →  numpy pinned to 1.24.3
+#   - MediaPipe 0.10.14 requires TF 2.x and protobuf >= 3.20
+#   - SHAP 0.44.x requires numpy >= 1.20  →  satisfied by numpy 1.24.3
+#   - pandas 2.0.x is the last version with full Python 3.10 + numpy 1.24 support
+#   - OpenCV 4.8.x is the last release before ABI changes that break MediaPipe
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Core Scientific Stack
+# Pinned tightly — these three packages must be mutually compatible.
+# Do NOT upgrade numpy without verifying TF and MediaPipe still work.
+# -----------------------------------------------------------------------------
+numpy==1.24.3
+scipy==1.11.4
+
+
+# -----------------------------------------------------------------------------
+# Deep Learning — TensorFlow
+# TF 2.13.1 is the recommended stable release for Python 3.10 with:
+#   - Full TFLite converter support
+#   - Keras 2 API (compatible with all LSTM/GRU/BiLSTM layers used here)
+#   - SavedModel format support
+#   - Post-training quantisation support
+# tensorflow-metal or tensorflow-gpu can be added separately for GPU training.
+# -----------------------------------------------------------------------------
+tensorflow==2.13.1
+keras==2.13.1                    # Pinned to match TF version exactly
+
+
+# -----------------------------------------------------------------------------
+# MediaPipe — Landmark Extraction
+# 0.10.14 is the latest stable release compatible with TF 2.13 and numpy 1.24.
+# Provides: Holistic, Hands, Pose solutions used in extractor.py
+# -----------------------------------------------------------------------------
+mediapipe==0.10.14
+protobuf==3.20.3                 # MediaPipe upper-bound constraint; DO NOT upgrade
+
+
+# -----------------------------------------------------------------------------
+# Experiment Tracking — MLflow
+# 2.14.3 is a stable 2.x release with:
+#   - TensorFlow model logging (mlflow.tensorflow.log_model)
+#   - Model Registry support
+#   - Artifact storage
+#   - Run comparison API
+# -----------------------------------------------------------------------------
+mlflow==2.14.3
+alembic>=1.13.1                  # MLflow database migration dependency
+sqlalchemy>=2.0.0,<3.0.0        # MLflow backend store
+
+
+# -----------------------------------------------------------------------------
+# Configuration Management
+# OmegaConf: hierarchical YAML config with dot-access and interpolation.
+# Pydantic v2: schema validation for config objects (strict type checking).
+# PyYAML: raw YAML parsing used by OmegaConf.
+# -----------------------------------------------------------------------------
+omegaconf==2.3.0
+pydantic==2.7.4
+PyYAML==6.0.1
+
+
+# -----------------------------------------------------------------------------
+# Data Manipulation and Analysis
+# pandas 2.0.3: last version with full compatibility under numpy 1.24.
+# -----------------------------------------------------------------------------
+pandas==2.0.3
+pyarrow==14.0.2                  # pandas optional backend for parquet I/O
+
+
+# -----------------------------------------------------------------------------
+# Machine Learning Utilities — Scikit-learn
+# Used for: train/val/test split utilities, confusion matrix, classification
+# report, per-class metrics, calibration analysis.
+# 1.3.2 is the last stable release compatible with numpy 1.24.
+# -----------------------------------------------------------------------------
+scikit-learn==1.3.2
+
+
+# -----------------------------------------------------------------------------
+# Visualisation
+# matplotlib: all training curves, confusion matrices, ablation plots.
+# seaborn: heatmaps, distribution plots, calibration diagrams.
+# Pillow: image I/O for saving figures and processing video frames.
+# -----------------------------------------------------------------------------
+matplotlib==3.7.5
+seaborn==0.13.2
+Pillow==10.3.0
+
+
+# -----------------------------------------------------------------------------
+# Computer Vision — OpenCV
+# opencv-python 4.8.1.78: stable release for:
+#   - Webcam capture (VideoCapture)
+#   - Frame reading from video files
+#   - HUD rendering and overlay drawing
+#   - GIF/video export for demo
+# Note: use opencv-python-headless on servers without a display.
+# -----------------------------------------------------------------------------
+opencv-python==4.8.1.78
+
+
+# -----------------------------------------------------------------------------
+# Model Interpretability — SHAP
+# shap 0.44.1: stable release compatible with numpy 1.24 and TF 2.13.
+# Used for: DeepExplainer on LSTM, frame importance, landmark heatmaps.
+# -----------------------------------------------------------------------------
+shap==0.44.1
+
+
+# -----------------------------------------------------------------------------
+# Progress and Logging Utilities
+# tqdm: progress bars for preprocessing loops and training epochs.
+# rich: structured terminal output for pipeline CLI scripts.
+# -----------------------------------------------------------------------------
+tqdm==4.66.4
+rich==13.7.1
+
+
+# -----------------------------------------------------------------------------
+# HTTP and Data Download
+# requests: WLASL video download from manifest URLs.
+# urllib3: pinned to avoid SSL deprecation warnings with older requests.
+# -----------------------------------------------------------------------------
+requests==2.32.3
+urllib3==2.2.2
+
+
+# -----------------------------------------------------------------------------
+# Reproducibility and Environment Utilities
+# python-dotenv: load environment variables from .env file.
+# psutil: system info logging (RAM, CPU) for environment metadata.
+# platform: stdlib (no install needed) — used in reproducibility.py.
+# -----------------------------------------------------------------------------
+python-dotenv==1.0.1
+psutil==6.0.0
+
+
+# -----------------------------------------------------------------------------
+# Notebook Support
+# ipykernel: required for VS Code Jupyter notebook execution.
+# ipywidgets: tqdm progress bars inside notebooks.
+# nbformat: notebook validation and conversion.
+# -----------------------------------------------------------------------------
+ipykernel==6.29.4
+ipywidgets==8.1.3
+nbformat==5.10.4
+
+
+# -----------------------------------------------------------------------------
+# CLI and Argument Parsing
+# click: used in pipeline CLI scripts (run_training.py, run_evaluation.py).
+# -----------------------------------------------------------------------------
+click==8.1.7
+
+
+# =============================================================================
+# Development Dependencies
+# Install with: pip install -r requirements-dev.txt
+# Listed here for reference — not needed for production inference.
+# =============================================================================
+# pytest==8.2.2
+# pytest-cov==5.0.0
+# flake8==7.1.0
+# black==24.4.2
+# isort==5.13.2
+# pre-commit==3.7.1

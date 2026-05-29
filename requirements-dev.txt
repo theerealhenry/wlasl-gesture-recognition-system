@@ -1,0 +1,29 @@
+# =============================================================================
+# WLASL Gesture Recognition — Development Dependencies
+# =============================================================================
+# Install AFTER requirements.txt:
+#   pip install -r requirements-dev.txt
+#
+# These packages are used for testing, linting, and code formatting only.
+# They are NOT required for training, inference, or deployment.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Testing
+# -----------------------------------------------------------------------------
+pytest==8.2.2
+pytest-cov==5.0.0                # Coverage reporting
+pytest-mock==3.14.0              # Mocking for unit tests
+
+# -----------------------------------------------------------------------------
+# Code Quality
+# -----------------------------------------------------------------------------
+flake8==7.1.0                    # PEP8 linting (used in CI)
+black==24.4.2                    # Code formatter
+isort==5.13.2                    # Import sorter
+
+# -----------------------------------------------------------------------------
+# Pre-commit Hooks
+# Run: pre-commit install
+# -----------------------------------------------------------------------------
+pre-commit==3.7.1
