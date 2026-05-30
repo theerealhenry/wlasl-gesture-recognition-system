@@ -1,535 +1,678 @@
 """
 src/utils/reproducibility.py
-==============================
-Reproducibility utilities for the WLASL gesture recognition pipeline.
+=============================
+Full reproducibility stack for the WLASL gesture recognition pipeline.
 
-Ensures that every experiment run is deterministic and that the exact
-software environment that produced each result is recorded permanently
-in MLflow alongside the model artefacts.
+Responsibilities:
+  1. Set all random seeds (Python, NumPy, TensorFlow) before any training operation.
+  2. Set TensorFlow determinism environment variables BEFORE importing TensorFlow —
+     many TF env vars are read at import time and have no effect if set afterwards.
+  3. Collect comprehensive environment metadata (library versions, hardware, git state,
+     requirements hash) so that every experiment can be exactly reproduced.
+  4. Log all metadata to the active MLflow run.
+  5. Save a run manifest JSON to disk as a reproducibility artefact.
+  6. Compute cryptographic hashes of model files for integrity verification.
 
-Design principles:
-  - Seeds are set atomically across all randomness sources before any
-    other operation in a training run.
-  - Environment metadata is logged to MLflow so future engineers can
-    verify whether a result can be reproduced on their hardware.
-  - A run manifest is written to disk at the start of every experiment,
-    independent of MLflow, so reproducibility information survives even
-    if the MLflow store is lost.
-  - GPU determinism is enabled when a GPU is available, with a clear
-    warning that this may reduce training speed.
+Critical ordering:
+    # CORRECT — env vars set before TF is imported anywhere
+    from src.utils.reproducibility import set_seeds
+    set_seeds(42)
 
-Usage (at the top of any pipeline entry point):
-    from src.utils.reproducibility import set_seeds, log_environment, save_run_manifest
-    from src.utils.logger import get_logger
+    import tensorflow as tf   # TF reads env vars at this point
 
-    logger = get_logger(__name__)
-    set_seeds(seed=42, logger=logger)
-    log_environment(run_name="bilstm_seq30_aug")
-    save_run_manifest(config=cfg, output_dir="artifacts/experiments/bilstm_seq30_aug")
+    # WRONG — TF already imported by another module; env vars too late
+    import tensorflow as tf
+    set_seeds(42)
+
+Usage in pipeline entry points:
+    from src.utils.reproducibility import setup_experiment
+
+    with mlflow.start_run(run_name="bilstm_seq30"):
+        manifest_path = setup_experiment(
+            config=cfg,
+            run_name="bilstm_seq30",
+            output_dir="artifacts/experiments/bilstm_seq30",
+        )
 """
 
-import os
-import json
-import random
-import platform
+from __future__ import annotations
+
 import hashlib
+import json
+import os
+import platform
+import random
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
-
 from src.utils.logger import get_logger
 
-# Lazy imports — only required during experiment runs, not at import time
-# This prevents import errors when running tests without a full TF install.
-def _import_tf():
-    import tensorflow as tf
-    return tf
-
-def _import_mediapipe():
-    import mediapipe as mp
-    return mp
-
-def _import_mlflow():
-    import mlflow
-    return mlflow
+logger = get_logger(__name__)
+_ENV_METADATA_CACHE: Optional[dict[str, Any]] = None
 
 
-# ---------------------------------------------------------------------------
-# Seed management
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Step 1 — Set determinism environment variables
+# This function must be called, and TF imported, in the correct order.
+# =============================================================================
 
-def set_seeds(seed: int = 42, logger=None) -> None:
+def _set_determinism_env_vars(seed: int) -> None:
     """
-    Set all randomness sources to a fixed seed for full reproducibility.
+    Set environment variables that control TensorFlow determinism.
 
-    Sources covered:
-      - Python built-in random module
-      - NumPy random number generator
-      - TensorFlow global random seed (covers Keras layer initialisation,
-        dropout masks, and data shuffling within tf.data pipelines)
-      - PYTHONHASHSEED environment variable (affects dict ordering and set
-        iteration in Python 3.3+)
-      - TF GPU determinism (CuDNN ops become deterministic; may slow training)
+    MUST be called before tensorflow is imported anywhere in the process.
+    These variables are read by TF at import time; setting them after import
+    has no effect.
+
+    Variables set:
+        PYTHONHASHSEED          — controls Python's hash randomisation
+        TF_DETERMINISTIC_OPS    — enables deterministic GPU ops
+        TF_CUDNN_DETERMINISTIC  — forces deterministic cuDNN algorithms
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
+    os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+    logger.debug(
+        f"Determinism env vars set | "
+        f"PYTHONHASHSEED={seed} | "
+        f"TF_DETERMINISTIC_OPS=1 | "
+        f"TF_CUDNN_DETERMINISTIC=1"
+    )
+
+
+def set_seeds(seed: int = 42) -> None:
+    """
+    Set all random seeds for full reproducibility.
+
+    Sets: Python random, NumPy random, TensorFlow random, PYTHONHASHSEED,
+    TF_DETERMINISTIC_OPS, TF_CUDNN_DETERMINISTIC.
+
+    IMPORTANT: This function should be called at the very start of any pipeline
+    entry point, before importing tensorflow or any library that uses random
+    state. If TensorFlow has already been imported when this is called, the
+    environment variables will have no effect on TF's GPU operation selection —
+    a warning is logged in that case.
 
     Parameters
     ----------
     seed : int
-        The seed value. Must be reproducible across runs — store in config.yaml.
-        Default: 42.
-    logger : StructuredAdapter, optional
-        Logger to use. If None, a module-level logger is created.
-
-    Notes
-    -----
-    TensorFlow's GPU ops (CuDNN) are non-deterministic by default for performance.
-    Setting TF_DETERMINISTIC_OPS=1 forces determinism at the cost of ~10–20%
-    slower training on GPU. On CPU (this project's primary target), there is no
-    speed penalty.
-
-    Even with all seeds set, results may vary across:
-      - Different hardware (CPU vs GPU floating-point rounding differences)
-      - Different TF/CUDA/cuDNN versions
-      - Different OS thread scheduling
-
-    This is documented in the run manifest so future engineers understand the limits.
-    """
-    if logger is None:
-        logger = get_logger(__name__)
-
-    # 1. Python stdlib random
-    random.seed(seed)
-
-    # 2. NumPy
-    np.random.seed(seed)
-
-    # 3. PYTHONHASHSEED — must be set before the Python interpreter starts
-    #    for full effect, but setting here still affects most hash-dependent ops.
-    os.environ["PYTHONHASHSEED"] = str(seed)
-
-    # 4. TensorFlow
-    try:
-        tf = _import_tf()
-        tf.random.set_seed(seed)
-
-        # 5. GPU determinism — forces CuDNN ops to be deterministic
-        os.environ["TF_DETERMINISTIC_OPS"] = "1"
-        os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
-
-        gpus = tf.config.list_physical_devices("GPU")
-        if gpus:
-            logger.warning(
-                "GPU detected: TF_DETERMINISTIC_OPS=1 enabled. "
-                "Expect ~10-20% slower GPU training for full reproducibility.",
-                extra={"stage": "reproducibility"},
-            )
-        else:
-            logger.debug(
-                "CPU-only mode: GPU determinism flags set but have no effect.",
-                extra={"stage": "reproducibility"},
-            )
-
-    except ImportError:
-        logger.warning(
-            "TensorFlow not available — TF seeds not set.",
-            extra={"stage": "reproducibility"},
-        )
-
-    logger.info(
-        f"All randomness sources seeded with seed={seed}",
-        extra={"stage": "reproducibility"},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Environment metadata collection
-# ---------------------------------------------------------------------------
-
-def collect_environment_metadata() -> dict[str, Any]:
-    """
-    Collect a comprehensive snapshot of the current software environment.
-
-    Returns a dictionary suitable for logging to MLflow, writing to JSON,
-    or embedding in a run manifest. Designed to be self-contained: no
-    external services are called.
-
-    Returns
-    -------
-    dict
-        Keys: tf_version, keras_version, mediapipe_version, numpy_version,
-        sklearn_version, pandas_version, python_version, python_implementation,
-        os_system, os_release, os_machine, cuda_available, gpu_devices,
-        cpu_count, timestamp_utc, git_commit_hash, git_branch.
-    """
-    meta: dict[str, Any] = {}
-
-    # --- Python ---
-    meta["python_version"] = platform.python_version()
-    meta["python_implementation"] = platform.python_implementation()  # CPython / PyPy
-
-    # --- OS ---
-    meta["os_system"] = platform.system()       # Linux / Darwin / Windows
-    meta["os_release"] = platform.release()
-    meta["os_machine"] = platform.machine()     # x86_64 / arm64
-
-    # --- CPU ---
-    meta["cpu_count"] = os.cpu_count()
-
-    # --- TensorFlow ---
-    try:
-        tf = _import_tf()
-        meta["tf_version"] = tf.__version__
-        meta["keras_version"] = tf.keras.__version__
-        gpus = tf.config.list_physical_devices("GPU")
-        meta["cuda_available"] = len(gpus) > 0
-        meta["gpu_devices"] = [gpu.name for gpu in gpus] if gpus else []
-    except ImportError:
-        meta["tf_version"] = "not installed"
-        meta["keras_version"] = "not installed"
-        meta["cuda_available"] = False
-        meta["gpu_devices"] = []
-
-    # --- MediaPipe ---
-    try:
-        mp = _import_mediapipe()
-        meta["mediapipe_version"] = mp.__version__
-    except ImportError:
-        meta["mediapipe_version"] = "not installed"
-
-    # --- NumPy ---
-    meta["numpy_version"] = np.__version__
-
-    # --- Scikit-learn ---
-    try:
-        import sklearn
-        meta["sklearn_version"] = sklearn.__version__
-    except ImportError:
-        meta["sklearn_version"] = "not installed"
-
-    # --- pandas ---
-    try:
-        import pandas as pd
-        meta["pandas_version"] = pd.__version__
-    except ImportError:
-        meta["pandas_version"] = "not installed"
-
-    # --- MLflow ---
-    try:
-        mlflow = _import_mlflow()
-        meta["mlflow_version"] = mlflow.__version__
-    except ImportError:
-        meta["mlflow_version"] = "not installed"
-
-    # --- Git ---
-    meta["git_commit_hash"] = _get_git_commit_hash()
-    meta["git_branch"] = _get_git_branch()
-
-    # --- Timestamp ---
-    meta["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
-
-    return meta
-
-
-def _get_git_commit_hash() -> str:
-    """Return the current git commit hash, or 'unknown' if not in a git repo."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return "unknown"
-
-
-def _get_git_branch() -> str:
-    """Return the current git branch name, or 'unknown' if not in a git repo."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return "unknown"
-
-
-# ---------------------------------------------------------------------------
-# MLflow environment logging
-# ---------------------------------------------------------------------------
-
-def log_environment(
-    run_name: Optional[str] = None,
-    extra_tags: Optional[dict[str, str]] = None,
-    logger=None,
-) -> dict[str, Any]:
-    """
-    Log the full environment snapshot to the active MLflow run.
-
-    This function must be called INSIDE an active mlflow.start_run() context.
-    It logs all environment metadata as MLflow params and sets descriptive tags.
-
-    Parameters
-    ----------
-    run_name : str, optional
-        Human-readable name for this run (used as an MLflow tag).
-    extra_tags : dict, optional
-        Additional MLflow tags to set (e.g. experiment_group, signer_split).
-    logger : StructuredAdapter, optional
-        Logger instance. Created if not provided.
-
-    Returns
-    -------
-    dict
-        The full environment metadata dictionary (also logged to MLflow).
+        The global random seed. Default 42.
 
     Example
     -------
-    with mlflow.start_run(run_name="bilstm_seq30_aug"):
-        set_seeds(42)
-        env = log_environment(
-            run_name="bilstm_seq30_aug",
-            extra_tags={"experiment_group": "architecture_comparison"}
-        )
+    # In a pipeline entry point (e.g. pipelines/run_training.py):
+    from src.utils.reproducibility import set_seeds
+    set_seeds(42)
+
+    import tensorflow as tf   # Import TF AFTER set_seeds
     """
-    if logger is None:
-        logger = get_logger(__name__)
+    # Check if TF is already imported — if so, env vars are too late for GPU determinism
+    tf_already_imported = "tensorflow" in sys.modules
 
-    mlflow = _import_mlflow()
-    env = collect_environment_metadata()
+    # Set env vars first — even if TF is imported, PYTHONHASHSEED still helps
+    _set_determinism_env_vars(seed)
 
-    # Log as MLflow params — these are searchable in the MLflow UI
-    mlflow.log_params({
-        "env.tf_version":         env.get("tf_version", "unknown"),
-        "env.keras_version":      env.get("keras_version", "unknown"),
-        "env.mediapipe_version":  env.get("mediapipe_version", "unknown"),
-        "env.numpy_version":      env.get("numpy_version", "unknown"),
-        "env.python_version":     env.get("python_version", "unknown"),
-        "env.os_system":          env.get("os_system", "unknown"),
-        "env.os_machine":         env.get("os_machine", "unknown"),
-        "env.cuda_available":     str(env.get("cuda_available", False)),
-        "env.cpu_count":          str(env.get("cpu_count", "unknown")),
-        "env.git_commit":         env.get("git_commit_hash", "unknown")[:8],  # short hash
-        "env.git_branch":         env.get("git_branch", "unknown"),
-    })
+    # Python built-in random
+    random.seed(seed)
 
-    # Set MLflow tags — more descriptive, not searchable as params
-    tags = {
-        "mlflow.runName": run_name or "unnamed_run",
-        "project": "wlasl-gesture-recognition",
-        "timestamp_utc": env["timestamp_utc"],
+    # NumPy
+    try:
+        import numpy as np
+        np.random.seed(seed)
+        logger.debug(f"NumPy seed set: {seed}")
+    except ImportError:
+        logger.warning("NumPy not available — skipping NumPy seed.")
+
+    # TensorFlow
+    try:
+        import tensorflow as tf
+
+        tf.random.set_seed(seed)
+
+        try:
+            tf.config.experimental.enable_op_determinism()
+            logger.debug("TensorFlow op determinism enabled.")
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "TensorFlow op determinism API unavailable on this TF version."
+            )
+
+        logger.debug(f"TensorFlow seed set: {seed}")
+
+        if tf_already_imported:
+            logger.warning(
+                "TensorFlow was already imported before set_seeds() was called. "
+                "TF_DETERMINISTIC_OPS and TF_CUDNN_DETERMINISTIC environment variables "
+                "may have no effect on GPU operation selection for this run. "
+                "For full GPU determinism, call set_seeds() before any TF import."
+            )
+    except ImportError:
+        logger.warning("TensorFlow not available — skipping TF seed.")
+
+    logger.info(f"All random seeds set | seed={seed}")
+
+
+# =============================================================================
+# Step 2 — Environment metadata collection
+# =============================================================================
+
+def _get_git_info() -> dict[str, str]:
+    """
+    Collect git repository state.
+
+    Returns commit hash, branch name, and whether the working tree is dirty
+    (has uncommitted changes). A commit hash alone does not guarantee
+    reproducibility if there are uncommitted changes — dirty=True is a warning.
+    """
+    info: dict[str, str] = {
+        "git_commit_hash": "unavailable",
+        "git_branch": "unavailable",
+        "git_dirty": "unavailable",
     }
+
+    def _run(cmd: list[str]) -> str:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path(__file__).parents[2],
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    try:
+        commit = _run(["git", "rev-parse", "HEAD"])
+        if commit:
+            info["git_commit_hash"] = commit
+
+        branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        if branch:
+            info["git_branch"] = branch
+
+        remote = _run(
+            ["git", "config", "--get", "remote.origin.url"]
+        )
+        if remote:
+            info["git_remote"] = remote
+
+        # git status --porcelain outputs nothing if the tree is clean
+        status = _run(["git", "status", "--porcelain"])
+        info["git_dirty"] = "true" if status else "false"
+
+        if info["git_dirty"] == "true":
+            logger.warning(
+                "Git working tree is dirty (uncommitted changes present). "
+                "The commit hash alone does not guarantee full reproducibility. "
+                "Commit your changes before running experiments for exact reproduction."
+            )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        logger.debug("Git not available or not in a git repository.")
+
+    return info
+
+
+def _get_cuda_info() -> dict[str, str]:
+    """
+    Collect CUDA and cuDNN version information if a GPU is available.
+    """
+    info: dict[str, str] = {
+        "git_commit_hash": "unavailable",
+        "git_branch": "unavailable",
+        "git_dirty": "unavailable",
+        "git_remote": "unavailable",
+    }
+
+    try:
+        import tensorflow as tf
+
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            info["cuda_available"] = "true"
+            info["gpu_devices"] = ", ".join(g.name for g in gpus)
+
+            # TF exposes CUDA/cuDNN versions in build info
+            build_info = tf.sysconfig.get_build_info()
+            info["cuda_version"] = str(build_info.get("cuda_version", "unavailable"))
+            info["cudnn_version"] = str(build_info.get("cudnn_version", "unavailable"))
+    except Exception:  # noqa: BLE001
+        pass
+
+    return info
+
+
+def _get_requirements_hash() -> str:
+    """
+    Compute SHA256 of requirements.txt.
+
+    Library version numbers in environment metadata can be spoofed or
+    ambiguous (e.g. local editable installs). The requirements.txt hash
+    provides a stronger guarantee that the exact dependency set is recorded.
+    Returns "unavailable" if requirements.txt is not found.
+    """
+    for candidate in [
+        Path("requirements.txt"),
+        Path(__file__).parents[2] / "requirements.txt",
+    ]:
+        if candidate.exists():
+            content = candidate.read_bytes()
+            return hashlib.sha256(content).hexdigest()
+    logger.debug("requirements.txt not found — skipping requirements hash.")
+    return "unavailable"
+
+
+def _get_pip_freeze() -> str:
+    """
+    Capture a pip freeze snapshot.
+
+    Returns the full list of installed packages as a newline-separated string,
+    or "unavailable" if pip is not accessible. This supplements version numbers
+    in metadata with the actual installed state, including local editable installs.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "freeze"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    logger.debug("pip freeze failed — skipping pip snapshot.")
+    return "unavailable"
+
+
+def _get_library_versions() -> dict[str, str]:
+    """Collect versions of all key pipeline libraries."""
+    versions: dict[str, str] = {}
+
+    libraries = [
+        ("tensorflow", "tensorflow"),
+        ("keras", "keras"),
+        ("mediapipe", "mediapipe"),
+        ("numpy", "numpy"),
+        ("sklearn", "sklearn"),
+        ("pandas", "pandas"),
+        ("mlflow", "mlflow"),
+        ("omegaconf", "omegaconf"),
+        ("pydantic", "pydantic"),
+        ("shap", "shap"),
+        ("cv2", "cv2"),
+    ]
+
+    for import_name, display_name in libraries:
+        try:
+            mod = __import__(import_name)
+            versions[f"{display_name}_version"] = getattr(mod, "__version__", "unknown")
+        except ImportError:
+            versions[f"{display_name}_version"] = "not installed"
+
+    return versions
+
+
+def collect_environment_metadata(include_pip_freeze: bool = True) -> dict[str, Any]:
+    """
+    Collect comprehensive environment metadata for reproducibility records.
+
+    Captures: library versions, Python version, OS, CPU, GPU/CUDA info,
+    git commit and branch, git dirty status, requirements.txt hash,
+    and optionally a full pip freeze snapshot.
+
+    Parameters
+    ----------
+    include_pip_freeze : bool
+        Whether to include a full pip freeze snapshot. Can be slow (~1s)
+        on environments with many packages. Default True.
+
+    Returns
+    -------
+    dict[str, Any]
+        Flat or nested dict suitable for logging to MLflow or writing to JSON.
+    """
+    global _ENV_METADATA_CACHE
+
+    if _ENV_METADATA_CACHE is not None:
+        return _ENV_METADATA_CACHE.copy()
+
+    metadata: dict[str, Any] = {
+        "collected_at_utc": datetime.now(timezone.utc).isoformat(),
+        "python_version": platform.python_version(),
+        "python_executable": sys.executable,
+        "os": platform.system(),
+        "os_version": platform.version(),
+        "cpu_count": os.cpu_count(),
+        "platform": platform.platform(),
+    }
+
+    metadata.update(_get_library_versions())
+    metadata.update(_get_git_info())
+    metadata.update(_get_cuda_info())
+
+    metadata["requirements_hash"] = _get_requirements_hash()
+
+    metadata["determinism"] = {
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+        "tf_deterministic_ops": os.environ.get("TF_DETERMINISTIC_OPS"),
+        "tf_cudnn_deterministic": os.environ.get("TF_CUDNN_DETERMINISTIC"),
+    }
+
+    if include_pip_freeze:
+        metadata["pip_freeze"] = _get_pip_freeze()
+
+    _ENV_METADATA_CACHE = metadata.copy()
+
+    return metadata
+
+
+# =============================================================================
+# Step 3 — MLflow integration
+# =============================================================================
+
+def log_environment(
+    run_name: str = "",
+    extra_tags: Optional[dict[str, str]] = None,
+    include_pip_freeze: bool = False,
+) -> None:
+    """
+    Log environment metadata to the active MLflow run.
+
+    Must be called inside an mlflow.start_run() context. If no MLflow run
+    is active, logs a warning and returns without error.
+
+    Parameters
+    ----------
+    run_name : str
+        Human-readable run name, added as an MLflow tag.
+    extra_tags : dict[str, str], optional
+        Additional MLflow tags to set (e.g. experiment_group, model_type).
+    include_pip_freeze : bool
+        Whether to log the full pip freeze as an MLflow param. Disabled by
+        default because it produces a very long param value. The pip freeze
+        is always saved to the run manifest on disk.
+    """
+    try:
+        import mlflow  # type: ignore[import]
+    except ImportError:
+        logger.warning("MLflow not installed — skipping environment logging to MLflow.")
+        return
+
+    active = mlflow.active_run()
+    if active is None:
+        logger.warning(
+            "log_environment() called but no MLflow run is active. "
+            "Call this inside an mlflow.start_run() context."
+        )
+        return
+
+    metadata = collect_environment_metadata(include_pip_freeze=include_pip_freeze)
+
+    # Log as MLflow params — exclude pip_freeze (too long for MLflow params)
+    loggable_params = {
+        k: str(v)[:500]  # MLflow param value limit is 500 chars
+        for k, v in metadata.items()
+        if k != "pip_freeze" and v != "unavailable"
+    }
+    mlflow.log_params(loggable_params)
+
+    # Set tags
+    tags: dict[str, str] = {"run_name": run_name}
     if extra_tags:
         tags.update(extra_tags)
     mlflow.set_tags(tags)
 
-    # GPU devices as a tag (can be a list, not suitable as a param)
-    gpu_info = ", ".join(env.get("gpu_devices", [])) or "none"
-    mlflow.set_tag("env.gpu_devices", gpu_info)
+    # Log git dirty as a prominent tag for visibility in the MLflow UI
+    if metadata.get("git_dirty") == "true":
+        mlflow.set_tag("git_dirty", "true")
+        mlflow.set_tag("reproducibility_warning", "uncommitted_changes_present")
 
     logger.info(
-        f"Environment metadata logged to MLflow | "
-        f"TF={env.get('tf_version')} | "
-        f"MediaPipe={env.get('mediapipe_version')} | "
-        f"GPU={'yes' if env.get('cuda_available') else 'no'}",
+        f"Environment metadata logged to MLflow run {active.info.run_id[:8]}",
         extra={"stage": "reproducibility"},
     )
 
-    return env
 
-
-# ---------------------------------------------------------------------------
-# Run manifest — disk-level reproducibility record
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Step 4 — Run manifest
+# =============================================================================
 
 def save_run_manifest(
     config: Any,
     output_dir: str,
     seed: int = 42,
-    logger=None,
+    extra_metadata: Optional[dict[str, Any]] = None,
+    include_pip_freeze: bool = True,
 ) -> Path:
     """
-    Write a JSON run manifest to disk before training begins.
+    Save a complete run manifest JSON to disk.
 
-    The manifest is a complete record of everything needed to reproduce this
-    experiment: the full config, all software versions, git state, seed, and
-    timestamps. It is independent of MLflow — if MLflow is unavailable or its
-    store is deleted, the manifest is the fallback.
+    The manifest contains the full config, environment snapshot, seed, and
+    reproduction instructions. It is the disk-based reproducibility record,
+    independent of MLflow — useful when MLflow is unavailable or when you
+    want to reproduce a run on a different machine.
 
     Parameters
     ----------
-    config : OmegaConf DictConfig or dict
-        The full experiment configuration (will be serialised to JSON).
+    config : ExperimentConfig | dict
+        The experiment configuration. Accepts both Pydantic v2 models
+        (with model_dump()) and plain dicts.
     output_dir : str
-        Directory where the manifest is written. Created if not exists.
-        Recommended: "artifacts/experiments/<run_name>/"
+        Directory where run_manifest.json is written. Created if needed.
     seed : int
-        The seed value used for this run.
-    logger : StructuredAdapter, optional
-        Logger instance.
+        The random seed used for this run.
+    extra_metadata : dict, optional
+        Additional key-value pairs to include in the manifest.
 
     Returns
     -------
     Path
         Absolute path to the written manifest file.
-
-    File written
-    ------------
-    <output_dir>/run_manifest.json
     """
-    if logger is None:
-        logger = get_logger(__name__)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    manifest_file = output_path / "run_manifest.json"
 
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    # Serialise config — support both Pydantic v2 models and plain dicts
+    if hasattr(config, "model_dump"):
+        config_dict = config.model_dump()
+    elif hasattr(config, "dict"):
+        # Pydantic v1 fallback
+        config_dict = config.dict()
+    elif isinstance(config, dict):
+        config_dict = config
+    else:
+        logger.warning(
+            f"save_run_manifest: config type {type(config).__name__} is not a "
+            f"Pydantic model or dict. Attempting str() serialisation."
+        )
+        config_dict = {"raw": str(config)}
 
-    manifest_path = out_path / "run_manifest.json"
+    env_metadata = collect_environment_metadata(
+    include_pip_freeze=include_pip_freeze
+    )
 
-    # Serialise config — handle OmegaConf DictConfig transparently
-    try:
-        from omegaconf import OmegaConf
-        config_dict = OmegaConf.to_container(config, resolve=True, throw_on_missing=True)
-    except (ImportError, Exception):
-        # Fallback: try treating config as a plain dict
-        try:
-            config_dict = dict(config)
-        except Exception:
-            config_dict = {"error": "config not serialisable"}
-
-    manifest = {
+    manifest: dict[str, Any] = {
         "manifest_version": "1.0",
-        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "seed": seed,
         "config": config_dict,
-        "environment": collect_environment_metadata(),
-        "reproduction_instructions": (
-            "To reproduce: "
-            "(1) checkout git commit shown in environment.git_commit_hash, "
-            "(2) install requirements.txt pinned versions, "
-            "(3) run with the config block above using the seed shown."
-        ),
+        "environment": env_metadata,
+        "reproduction_instructions": {
+            "step_1": "Clone the repository at the git_commit_hash recorded in environment.",
+            "step_2": "Install dependencies: pip install -r requirements.txt",
+            "step_3": (
+                "Verify requirements hash matches environment.requirements_hash: "
+                "sha256sum requirements.txt"
+            ),
+            "step_4": "Run: python pipelines/run_training.py with the same config.",
+            "note": (
+                "If environment.git_dirty=true, exact reproduction is not guaranteed "
+                "because uncommitted changes were present when this run was executed."
+            ),
+        },
     }
 
-    with open(manifest_path, "w", encoding="utf-8") as f:
+    if extra_metadata:
+        manifest["extra"] = extra_metadata
+
+    with open(manifest_file, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, default=str)
 
     logger.info(
-        f"Run manifest written to {manifest_path.resolve()}",
+        f"Run manifest saved: {manifest_file.resolve()}",
         extra={"stage": "reproducibility"},
     )
+    return manifest_file
 
-    return manifest_path
 
+# =============================================================================
+# Step 5 — Model integrity
+# =============================================================================
 
-# ---------------------------------------------------------------------------
-# Model hash — verify model file integrity
-# ---------------------------------------------------------------------------
-
-def compute_model_hash(model_path: str, algorithm: str = "md5") -> str:
+def compute_model_hash(
+    model_path: str | Path,
+    algorithm: str = "sha256",
+) -> str:
     """
-    Compute a hash of a model file or SavedModel directory for integrity checking.
+    Compute a cryptographic hash of a model file or SavedModel directory.
 
-    Used to verify that a loaded model file matches the one logged during training.
-    The hash is stored in the run manifest and can be logged to MLflow.
+    Use this to verify that a TFLite file or SavedModel has not been modified
+    since training. Store the hash in gesture_model_metadata.json alongside
+    the model.
 
     Parameters
     ----------
-    model_path : str
+    model_path : str | Path
         Path to a .tflite file or a SavedModel directory.
     algorithm : str
-        Hash algorithm. One of 'md5', 'sha256'. Default: 'md5' (faster).
+        Hash algorithm. Must be one of "md5" or "sha256". Default "sha256".
 
     Returns
     -------
     str
-        Hex digest of the model file(s).
+        Hex digest of the hash.
 
-    Example
-    -------
-    >>> h = compute_model_hash("models/gesture_bilstm_v1.tflite")
-    >>> print(h)  # e.g. "a3f2c1d4..."
+    Raises
+    ------
+    ValueError
+        If algorithm is not "md5" or "sha256", or if the path does not exist.
+    FileNotFoundError
+        If model_path does not exist.
     """
+    allowed_algorithms = {"md5", "sha256"}
+    if algorithm not in allowed_algorithms:
+        raise ValueError(
+            f"algorithm must be one of {allowed_algorithms}, got '{algorithm}'. "
+            "MD5 and SHA256 are the only supported algorithms."
+        )
+
     path = Path(model_path)
-    h = hashlib.new(algorithm)
+    if not path.exists():
+        raise FileNotFoundError(f"Model path does not exist: {path.resolve()}")
+
+    hasher = hashlib.new(algorithm)
 
     if path.is_file():
         # Single file (e.g. .tflite)
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
+                hasher.update(chunk)
     elif path.is_dir():
-        # SavedModel directory — hash all files in sorted order for consistency
-        for file_path in sorted(path.rglob("*")):
-            if file_path.is_file():
-                h.update(str(file_path.relative_to(path)).encode())
-                with open(file_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(65536), b""):
-                        h.update(chunk)
+        # SavedModel directory — hash all files in deterministic (sorted) order
+        all_files = sorted(p for p in path.rglob("*") if p.is_file())
+        if not all_files:
+            raise ValueError(f"SavedModel directory is empty: {path.resolve()}")
+        for file_path in all_files:
+            # Include relative path in hash so directory structure changes are detected
+            hasher.update(str(file_path.relative_to(path)).encode("utf-8"))
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    hasher.update(chunk)
     else:
-        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+        raise ValueError(f"model_path is neither a file nor a directory: {path}")
 
-    return h.hexdigest()
+    digest = hasher.hexdigest()
+    logger.info(
+        f"Model hash computed | algorithm={algorithm} | path={path} | hash={digest[:16]}...",
+        extra={"stage": "export"},
+    )
+    return digest
 
 
-# ---------------------------------------------------------------------------
-# Convenience: full setup in one call
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Convenience: setup_experiment — call once per run entry point
+# =============================================================================
 
 def setup_experiment(
     config: Any,
     run_name: str,
     output_dir: str,
     extra_mlflow_tags: Optional[dict[str, str]] = None,
-    logger=None,
-) -> dict[str, Any]:
+    include_pip_freeze_in_manifest: bool = True,
+) -> Path:
     """
-    Convenience function that performs all reproducibility setup in one call.
+    Full experiment setup in one call.
 
-    Does, in order:
-      1. set_seeds(config.seed)
-      2. save_run_manifest(config, output_dir)
-      3. log_environment(run_name, extra_mlflow_tags)  [requires active MLflow run]
+    Executes in order:
+        1. set_seeds(config.seed)
+        2. save_run_manifest(config, output_dir)
+        3. log_environment(run_name, extra_mlflow_tags)  [if MLflow run is active]
 
     Parameters
     ----------
-    config : OmegaConf DictConfig
-        Full experiment config. Must have a `seed` attribute.
+    config : ExperimentConfig
+        The validated experiment config.
     run_name : str
-        MLflow run name and manifest directory name.
+        Human-readable name for this run.
     output_dir : str
-        Directory for the run manifest.
-    extra_mlflow_tags : dict, optional
-        Additional MLflow tags.
-    logger : StructuredAdapter, optional
-        Logger instance.
+        Directory for the run manifest and per-run artefacts.
+    extra_mlflow_tags : dict[str, str], optional
+        Extra tags to set in the active MLflow run.
+    include_pip_freeze_in_manifest : bool
+        Whether to capture a pip freeze snapshot in the manifest. Default True.
 
     Returns
     -------
-    dict
-        Environment metadata dictionary.
+    Path
+        Path to the saved run manifest.
 
     Example
     -------
-    with mlflow.start_run(run_name=run_name):
-        env = setup_experiment(
+    with mlflow.start_run(run_name="bilstm_seq30_aug"):
+        manifest = setup_experiment(
             config=cfg,
-            run_name=run_name,
-            output_dir=f"artifacts/experiments/{run_name}",
-            extra_mlflow_tags={"experiment_group": "architecture_comparison"},
+            run_name="bilstm_seq30_aug",
+            output_dir="artifacts/experiments/bilstm_seq30_aug",
+            extra_mlflow_tags={
+                "experiment_group": "architecture_comparison",
+                "model_type": "bilstm",
+            },
         )
     """
-    if logger is None:
-        logger = get_logger(__name__)
+    if isinstance(config, dict):
+        seed = config.get("seed", 42)
+    else:
+        seed = getattr(config, "seed", 42)
+    set_seeds(seed)
 
-    seed = getattr(config, "seed", 42)
-    set_seeds(seed=seed, logger=logger)
-    save_run_manifest(config=config, output_dir=output_dir, seed=seed, logger=logger)
-    env = log_environment(run_name=run_name, extra_tags=extra_mlflow_tags, logger=logger)
+    manifest_path = save_run_manifest(
+        config=config,
+        output_dir=output_dir,
+        seed=seed,
+        include_pip_freeze=include_pip_freeze_in_manifest,
+    )
 
-    return env
+    log_environment(
+        run_name=run_name,
+        extra_tags=extra_mlflow_tags,
+        include_pip_freeze=False,  # Pip freeze already in manifest; skip MLflow upload
+    )
+
+    logger.info(
+        f"Experiment setup complete | run={run_name} | seed={seed} | "
+        f"manifest={manifest_path}",
+        extra={"stage": "reproducibility"},
+    )
+
+    return manifest_path
