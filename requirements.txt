@@ -47,7 +47,7 @@ keras==2.13.1                    # Pinned to match TF version exactly
 # Provides: Holistic, Hands, Pose solutions used in extractor.py
 # -----------------------------------------------------------------------------
 mediapipe==0.10.14
-protobuf==3.20.3                 # MediaPipe upper-bound constraint; DO NOT upgrade
+# protobuf==3.20.3                 # MediaPipe upper-bound constraint; DO NOT upgrade
 
 
 # -----------------------------------------------------------------------------
@@ -66,11 +66,11 @@ sqlalchemy>=2.0.0,<3.0.0        # MLflow backend store
 # -----------------------------------------------------------------------------
 # Configuration Management
 # OmegaConf: hierarchical YAML config with dot-access and interpolation.
-# Pydantic v2: schema validation for config objects (strict type checking).
+# Pydantic v1: schema validation for config objects (strict type checking).
 # PyYAML: raw YAML parsing used by OmegaConf.
 # -----------------------------------------------------------------------------
 omegaconf==2.3.0
-pydantic==2.7.4
+pydantic==1.10.15
 PyYAML==6.0.1
 
 
@@ -137,7 +137,7 @@ rich==13.7.1
 # urllib3: pinned to avoid SSL deprecation warnings with older requests.
 # -----------------------------------------------------------------------------
 requests==2.32.3
-urllib3==2.2.2
+#urllib3==2.2.2
 
 
 # -----------------------------------------------------------------------------
