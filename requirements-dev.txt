@@ -6,6 +6,12 @@
 #
 # These packages are used for testing, linting, and code formatting only.
 # They are NOT required for training, inference, or deployment.
+
+# NOTE:
+# TensorFlow 2.13.x requires typing-extensions<4.6.0.
+# pip check may report a virtualenv typing-extensions conflict.
+# TensorFlow compatibility takes precedence for this project.
+
 # =============================================================================
 
 # -----------------------------------------------------------------------------
