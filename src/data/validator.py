@@ -34,6 +34,10 @@ The 8 checks
 7.  dataset_size               — total size computed (always passes; informational)
 8.  class_imbalance            — max/min clip-count ratio across signs ≤ threshold
 
+An additional structural check validates that the number of distinct sign
+classes in the found inventory matches ``num_classes`` (default 35). This
+check runs as part of ``all_signs_present`` and is reported in its details.
+
 Report schema
 -------------
 Written to ``data/data_validation_report.json``. The top-level structure:
@@ -90,6 +94,7 @@ Usage
         min_frames=10,
         max_frames=300,
         imbalance_threshold=3.0,
+        num_classes=35,
     )
     report = validator.run_all_checks()
     report.save("data/data_validation_report.json")
@@ -208,7 +213,8 @@ class ValidationReport:
     generated_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     # ------------------------------------------------------------------
-    # Computed properties
+    # Computed properties — all derived from self.checks, so they are
+    # always consistent with the actual check results.
     # ------------------------------------------------------------------
 
     @property
@@ -313,6 +319,102 @@ class ValidationReport:
                 extra={"stage": "validation"},
             )
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], inventory_path: str = "") -> "ValidationReport":
+        """
+        Reconstruct a ValidationReport from a previously saved JSON dict.
+
+        This is the canonical way to load a cached report. It reconstructs
+        the full ``checks`` mapping so that all computed properties
+        (``n_failed``, ``blocking_checks``, etc.) return correct values —
+        not the stale summary counts stored in the JSON metadata block.
+
+        Parameters
+        ----------
+        data : dict
+            The parsed JSON from ``data_validation_report.json``.
+        inventory_path : str
+            Inventory path to record on the reconstructed object.
+
+        Returns
+        -------
+        ValidationReport
+        """
+        checks: dict[str, CheckResult] = {}
+        for check_name, check_data in data.get("checks", {}).items():
+            checks[check_name] = CheckResult(
+                check_name=check_name,
+                passed=check_data.get("passed", False),
+                severity=check_data.get("severity", SEVERITY_ERROR),
+                message=check_data.get("message", ""),
+                details=check_data.get("details", {}),
+                elapsed_sec=check_data.get("elapsed_sec", 0.0),
+            )
+
+        # Recompute pipeline_can_proceed from the reconstructed checks rather
+        # than trusting the stored metadata value — the two must always agree.
+        pipeline_can_proceed = all(
+            r.passed or r.severity != SEVERITY_ERROR
+            for r in checks.values()
+        )
+
+        return cls(
+            pipeline_can_proceed=pipeline_can_proceed,
+            checks=checks,
+            per_sign_stats=data.get("per_sign_stats", {}),
+            dataset_totals=data.get("dataset_totals", {}),
+            inventory_path=inventory_path or data.get("metadata", {}).get("inventory_path", ""),
+            generated_utc=data.get("metadata", {}).get("generated_utc", ""),
+        )
+
+    @classmethod
+    def load(cls, report_path: str | Path) -> "ValidationReport":
+        """
+        Load a saved validation report from disk.
+
+        Unlike reconstructing from a plain dict with ``checks={}``, this
+        method rebuilds all ``CheckResult`` objects so that computed properties
+        such as ``n_failed`` and ``blocking_checks`` are always accurate.
+
+        Parameters
+        ----------
+        report_path : str | Path
+            Path to ``data_validation_report.json``.
+
+        Returns
+        -------
+        ValidationReport
+
+        Raises
+        ------
+        FileNotFoundError
+            If the report file does not exist.
+        ValueError
+            If the file is not valid JSON or has an unexpected structure.
+        """
+        path = Path(report_path).resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Validation report not found: {path}")
+
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "checks" not in data:
+            raise ValueError(
+                f"Validation report at {path} is missing the 'checks' key. "
+                "The file may be from an older format version or be corrupt."
+            )
+
+        report = cls.from_dict(data)
+        logger.info(
+            f"Validation report loaded: {path} | "
+            f"can_proceed={report.pipeline_can_proceed} | "
+            f"failed={report.n_failed} | "
+            f"warned={report.n_warned}",
+            extra={"stage": "validation"},
+        )
+        return report
+
 
 # ---------------------------------------------------------------------------
 # DataValidator
@@ -337,8 +439,14 @@ class DataValidator:
     imbalance_threshold : float
         Maximum acceptable ratio of max/min clips across signs. Default 3.0.
     num_classes : int
-        Expected number of distinct sign classes. Default 35.
+        Expected number of distinct sign classes. Validated against the
+        inventory; mismatch is an ERROR-severity failure. Default 35.
     """
+
+    _REQUIRED_COLUMNS = {
+        "video_id", "sign_label", "found", "signer_id",
+        "video_path", "file_size_mb",
+    }
 
     def __init__(
         self,
@@ -350,6 +458,14 @@ class DataValidator:
         imbalance_threshold: float = 3.0,
         num_classes: int = 35,
     ) -> None:
+        # Validate required columns before doing anything else
+        missing_cols = self._REQUIRED_COLUMNS - set(inventory_df.columns)
+        if missing_cols:
+            raise ValueError(
+                f"inventory_df is missing required columns: {missing_cols}. "
+                "Ensure the DataFrame was produced by WLASLResolver.build_inventory()."
+            )
+
         self._df = inventory_df.copy()
         self._raw_dir = Path(raw_dir).resolve()
         self._min_clips = min_clips_per_sign
@@ -359,14 +475,14 @@ class DataValidator:
         self._num_classes = num_classes
 
         # Only check found clips for video-level checks
-        self._found_df = self._df[self._df["found"] == True].copy()
+        self._found_df = self._df[self._df["found"].eq(True)].copy()
 
         logger.info(
             f"DataValidator initialised | "
             f"total_clips={len(self._df)} | "
             f"found={len(self._found_df)} | "
             f"missing={len(self._df) - len(self._found_df)} | "
-            f"num_classes={num_classes}",
+            f"expected_num_classes={num_classes}",
             extra={"stage": "validation"},
         )
 
@@ -397,7 +513,6 @@ class DataValidator:
             extra={"stage": "validation"},
         )
 
-        # Execute all checks and collect results
         check_methods = [
             ("all_signs_present",      self._check_all_signs_present),
             ("minimum_clips_per_sign", self._check_minimum_clips_per_sign),
@@ -440,13 +555,11 @@ class DataValidator:
                 extra={"stage": "validation"},
             )
 
-        # Determine pipeline_can_proceed
         pipeline_can_proceed = all(
             r.passed or r.severity != SEVERITY_ERROR
             for r in checks.values()
         )
 
-        # Compute aggregate statistics for the report
         per_sign_stats = self._compute_per_sign_stats()
         dataset_totals = self._compute_dataset_totals()
 
@@ -461,16 +574,18 @@ class DataValidator:
         return report
 
     # ------------------------------------------------------------------
-    # Check 1 — All 35 signs present
+    # Check 1 — All expected signs present, and class count matches
     # ------------------------------------------------------------------
 
     def _check_all_signs_present(self) -> CheckResult:
         """
-        Verify that all expected sign classes have at least one found clip.
+        Verify that all expected sign classes have at least one found clip,
+        and that the number of distinct classes equals ``num_classes``.
 
         A sign missing entirely from the found inventory means we have no
         training data for that class — the model cannot learn it. This is a
-        hard blocker.
+        hard blocker. A class count mismatch (e.g. 33 instead of 35) indicates
+        a label map / inventory synchronisation error and is also a blocker.
         """
         if self._found_df.empty:
             return CheckResult(
@@ -478,40 +593,62 @@ class DataValidator:
                 passed=False,
                 severity=SEVERITY_ERROR,
                 message="No clips found on disk at all — inventory is empty.",
-                details={"found_signs": [], "missing_signs": []},
+                details={
+                    "found_signs": [],
+                    "missing_signs": [],
+                    "expected_num_classes": self._num_classes,
+                    "actual_num_classes": 0,
+                },
             )
 
         found_signs = set(self._found_df["sign_label"].unique())
-        # We don't have label map access here, so infer expected from inventory
         expected_signs = set(self._df["sign_label"].unique())
         missing_from_disk = expected_signs - found_signs
 
-        if missing_from_disk:
+        # Class count validation: found distinct classes vs expected
+        actual_num_classes = len(found_signs)
+        class_count_mismatch = actual_num_classes != self._num_classes
+
+        details: dict[str, Any] = {
+            "found_signs": sorted(found_signs),
+            "missing_signs": sorted(missing_from_disk),
+            "expected_count": len(expected_signs),
+            "found_count": actual_num_classes,
+            "expected_num_classes": self._num_classes,
+            "actual_num_classes": actual_num_classes,
+            "class_count_matches": not class_count_mismatch,
+        }
+
+        if missing_from_disk or class_count_mismatch:
+            messages = []
+            if missing_from_disk:
+                messages.append(
+                    f"{len(missing_from_disk)} sign(s) have NO clips on disk: "
+                    f"{sorted(missing_from_disk)}"
+                )
+            if class_count_mismatch:
+                messages.append(
+                    f"Class count mismatch: expected {self._num_classes} classes, "
+                    f"found {actual_num_classes}. "
+                    "Verify label_map_v1.json is in sync with the inventory."
+                )
             return CheckResult(
                 check_name="all_signs_present",
                 passed=False,
                 severity=SEVERITY_ERROR,
-                message=(
-                    f"{len(missing_from_disk)} sign(s) have NO clips found on disk: "
-                    f"{sorted(missing_from_disk)}"
-                ),
-                details={
-                    "found_signs": sorted(found_signs),
-                    "missing_signs": sorted(missing_from_disk),
-                    "expected_count": len(expected_signs),
-                    "found_count": len(found_signs),
-                },
+                message=" | ".join(messages),
+                details=details,
             )
 
         return CheckResult(
             check_name="all_signs_present",
             passed=True,
             severity=SEVERITY_INFO,
-            message=f"All {len(found_signs)} signs present with ≥1 clip on disk.",
-            details={
-                "found_signs": sorted(found_signs),
-                "found_count": len(found_signs),
-            },
+            message=(
+                f"All {actual_num_classes} signs present with ≥1 clip on disk "
+                f"(matches expected num_classes={self._num_classes})."
+            ),
+            details=details,
         )
 
     # ------------------------------------------------------------------
@@ -527,9 +664,28 @@ class DataValidator:
         a warning, not a blocker — we can proceed but should note the
         limitation.
         """
-        clips_per_sign = (
+        if self._found_df.empty:
+            return CheckResult(
+                check_name="minimum_clips_per_sign",
+                passed=False,
+                severity=SEVERITY_ERROR,
+                message="No found clips — cannot evaluate minimum clips per sign.",
+                details={"threshold": self._min_clips, "clips_per_sign": {}},
+            )
+
+        clips_per_sign: dict[str, int] = (
             self._found_df.groupby("sign_label").size().to_dict()
         )
+
+        if not clips_per_sign:
+            return CheckResult(
+                check_name="minimum_clips_per_sign",
+                passed=False,
+                severity=SEVERITY_ERROR,
+                message="No clips found per sign — groupby produced empty result.",
+                details={"threshold": self._min_clips, "clips_per_sign": {}},
+            )
+
         below_threshold = {
             sign: count
             for sign, count in clips_per_sign.items()
@@ -548,8 +704,12 @@ class DataValidator:
                 ),
                 details={
                     "threshold": self._min_clips,
-                    "below_threshold": dict(sorted(below_threshold.items(), key=lambda x: x[1])),
+                    "below_threshold": dict(
+                        sorted(below_threshold.items(), key=lambda x: x[1])
+                    ),
                     "clips_per_sign": dict(sorted(clips_per_sign.items())),
+                    "min_clips": min(clips_per_sign.values()),
+                    "max_clips": max(clips_per_sign.values()),
                 },
             )
 
@@ -584,6 +744,10 @@ class DataValidator:
         The check also populates ``frame_count`` and ``duration_sec``
         columns in the internal found DataFrame for use by Check 4 and
         the per-sign statistics.
+
+        If OpenCV is not available, the check returns ``passed=False`` with
+        severity WARNING — the check could not be completed rather than
+        asserting all files are fine.
         """
         if not _CV2_AVAILABLE:
             logger.warning(
@@ -591,12 +755,27 @@ class DataValidator:
                 "Install: pip install opencv-python",
                 extra={"stage": "validation"},
             )
+            # passed=False / WARNING: the check was NOT completed; we cannot
+            # assert readability. The caller should treat this as a data gap,
+            # not as a green light.
             return CheckResult(
                 check_name="video_readability",
-                passed=True,
+                passed=False,
                 severity=SEVERITY_WARNING,
-                message="OpenCV not installed — readability check skipped.",
+                message=(
+                    "OpenCV not installed — video readability check could not run. "
+                    "Install opencv-python and re-validate before training."
+                ),
                 details={"opencv_available": False},
+            )
+
+        if self._found_df.empty:
+            return CheckResult(
+                check_name="video_readability",
+                passed=False,
+                severity=SEVERITY_WARNING,
+                message="No found clips to check for readability.",
+                details={"opencv_available": True, "total_checked": 0},
             )
 
         corrupt: list[dict[str, str]] = []
@@ -610,8 +789,8 @@ class DataValidator:
         )
 
         for rel_path in iterator:
-            abs_path = str(_REPO_ROOT / rel_path) if rel_path else ""
-            if not abs_path or not Path(abs_path).exists():
+            abs_path = _resolve_video_path(rel_path)
+            if abs_path is None or not abs_path.exists():
                 corrupt.append({
                     "video_path": rel_path,
                     "reason": "file_not_found_at_path",
@@ -620,7 +799,7 @@ class DataValidator:
                 durations.append(0.0)
                 continue
 
-            readable, n_frames, duration = _check_video_readable(abs_path)
+            readable, n_frames, duration = _check_video_readable(str(abs_path))
 
             if not readable:
                 corrupt.append({
@@ -634,7 +813,6 @@ class DataValidator:
                 durations.append(duration)
 
         # Attach frame_count and duration_sec to the found DataFrame
-        # so Check 4 and statistics can use them without re-reading files
         self._found_df = self._found_df.copy()
         self._found_df["frame_count"] = frame_counts
         self._found_df["duration_sec"] = durations
@@ -651,9 +829,12 @@ class DataValidator:
                 details={
                     "total_checked": len(video_paths),
                     "corrupt_count": len(corrupt),
-                    "corrupt_clips": corrupt[:50],   # cap to 50 for readability
+                    "corrupt_clips": corrupt[:50],
                 },
             )
+
+        valid_frame_counts = [fc for fc in frame_counts if fc > 0]
+        mean_fc = sum(valid_frame_counts) / len(valid_frame_counts) if valid_frame_counts else 0.0
 
         return CheckResult(
             check_name="video_readability",
@@ -661,13 +842,15 @@ class DataValidator:
             severity=SEVERITY_INFO,
             message=(
                 f"All {len(video_paths)} clips readable by OpenCV. "
-                f"Mean frame count: {sum(frame_counts)/len(frame_counts):.0f}."
+                f"Mean frame count: {mean_fc:.0f}."
             ),
             details={
                 "total_checked": len(video_paths),
                 "corrupt_count": 0,
-                "mean_frame_count": round(sum(frame_counts) / max(len(frame_counts), 1), 1),
-                "mean_duration_sec": round(sum(durations) / max(len(durations), 1), 2),
+                "mean_frame_count": round(mean_fc, 1),
+                "mean_duration_sec": round(
+                    sum(durations) / max(len(durations), 1), 2
+                ),
             },
         )
 
@@ -684,8 +867,7 @@ class DataValidator:
         aggressively, wasting compute. Both extremes are logged as warnings.
 
         Note: This check uses ``frame_count`` populated by Check 3. If
-        Check 3 was skipped (no OpenCV), this check uses an empty series
-        and reports INFO.
+        Check 3 was skipped (no OpenCV), this check is also skipped.
         """
         if "frame_count" not in self._found_df.columns:
             return CheckResult(
@@ -696,8 +878,14 @@ class DataValidator:
                 details={"skipped": True},
             )
 
-        valid_mask = self._found_df["frame_count"] > 0
-        frame_counts = self._found_df.loc[valid_mask, "frame_count"]
+        if self._found_df.empty:
+            return CheckResult(
+                check_name="frame_count_range",
+                passed=True,
+                severity=SEVERITY_INFO,
+                message="No found clips to evaluate frame count range.",
+                details={"skipped": True},
+            )
 
         too_short = self._found_df[
             (self._found_df["frame_count"] > 0) &
@@ -711,12 +899,16 @@ class DataValidator:
             too_short["video_id"].tolist() + too_long["video_id"].tolist()
         )
 
+        valid_counts = self._found_df.loc[
+            self._found_df["frame_count"] > 0, "frame_count"
+        ]
+
         details: dict[str, Any] = {
             "min_frames_threshold": self._min_frames,
             "max_frames_threshold": self._max_frames,
-            "min_frames_found": int(frame_counts.min()) if len(frame_counts) > 0 else 0,
-            "max_frames_found": int(frame_counts.max()) if len(frame_counts) > 0 else 0,
-            "mean_frames_found": round(float(frame_counts.mean()), 1) if len(frame_counts) > 0 else 0,
+            "min_frames_found": int(valid_counts.min()) if len(valid_counts) > 0 else 0,
+            "max_frames_found": int(valid_counts.max()) if len(valid_counts) > 0 else 0,
+            "mean_frames_found": round(float(valid_counts.mean()), 1) if len(valid_counts) > 0 else 0,
             "too_short_count": len(too_short),
             "too_long_count": len(too_long),
             "out_of_range_video_ids": out_of_range_ids[:50],
@@ -740,7 +932,8 @@ class DataValidator:
             passed=True,
             severity=SEVERITY_INFO,
             message=(
-                f"All clips in acceptable frame range [{self._min_frames}–{self._max_frames}]. "
+                f"All clips in acceptable frame range "
+                f"[{self._min_frames}–{self._max_frames}]. "
                 f"Range found: [{details['min_frames_found']}–{details['max_frames_found']}]."
             ),
             details=details,
@@ -808,6 +1001,15 @@ class DataValidator:
         split — assigning them to train risks their appearing in val
         under a different sign. This is a hard blocker.
         """
+        if self._found_df.empty:
+            return CheckResult(
+                check_name="signer_ids_complete",
+                passed=False,
+                severity=SEVERITY_ERROR,
+                message="No found clips — cannot validate signer IDs.",
+                details={"unknown_count": 0},
+            )
+
         unknown_signer = self._found_df[self._found_df["signer_id"] == -1]
 
         if len(unknown_signer) > 0:
@@ -857,8 +1059,9 @@ class DataValidator:
         This check always passes. It exists to surface dataset size
         information in the validation report for documentation purposes.
         """
-        total_size_mb = self._found_df["file_size_mb"].sum()
+        total_size_mb = float(self._found_df["file_size_mb"].sum()) if not self._found_df.empty else 0.0
         total_size_gb = total_size_mb / 1024
+        unique_signers = int(self._found_df["signer_id"].nunique()) if not self._found_df.empty else 0
 
         return CheckResult(
             check_name="dataset_size",
@@ -867,14 +1070,14 @@ class DataValidator:
             message=(
                 f"Dataset: {len(self._found_df)} clips | "
                 f"{total_size_mb:.1f} MB ({total_size_gb:.2f} GB) | "
-                f"{self._found_df['signer_id'].nunique()} unique signers."
+                f"{unique_signers} unique signers."
             ),
             details={
                 "total_clips_found": len(self._found_df),
                 "total_size_mb": round(total_size_mb, 2),
                 "total_size_gb": round(total_size_gb, 3),
-                "unique_signers": int(self._found_df["signer_id"].nunique()),
-                "unique_signs": int(self._found_df["sign_label"].nunique()),
+                "unique_signers": unique_signers,
+                "unique_signs": int(self._found_df["sign_label"].nunique()) if not self._found_df.empty else 0,
             },
         )
 
@@ -891,20 +1094,36 @@ class DataValidator:
         learn to favour high-frequency classes. This is a warning, not
         a blocker — class weight balancing in training can mitigate it.
         """
+        if self._found_df.empty:
+            return CheckResult(
+                check_name="class_imbalance",
+                passed=False,
+                severity=SEVERITY_ERROR,
+                message="No found clips — cannot compute class imbalance ratio.",
+                details={"imbalance_ratio": None, "threshold": self._imbalance_threshold},
+            )
+
         clips_per_sign = self._found_df.groupby("sign_label").size()
+
+        if clips_per_sign.empty:
+            return CheckResult(
+                check_name="class_imbalance",
+                passed=False,
+                severity=SEVERITY_ERROR,
+                message="No sign classes present — cannot compute imbalance ratio.",
+                details={"imbalance_ratio": None, "threshold": self._imbalance_threshold},
+            )
+
         min_clips = int(clips_per_sign.min())
         max_clips = int(clips_per_sign.max())
 
-        if min_clips == 0:
-            ratio = float("inf")
-        else:
-            ratio = max_clips / min_clips
+        ratio = float("inf") if min_clips == 0 else max_clips / min_clips
 
         min_signs = clips_per_sign[clips_per_sign == min_clips].index.tolist()
         max_signs = clips_per_sign[clips_per_sign == max_clips].index.tolist()
 
         details: dict[str, Any] = {
-            "imbalance_ratio": round(ratio, 2),
+            "imbalance_ratio": round(ratio, 2) if ratio != float("inf") else "inf",
             "threshold": self._imbalance_threshold,
             "min_clips": min_clips,
             "max_clips": max_clips,
@@ -952,6 +1171,10 @@ class DataValidator:
         Check 3. Falls back to zeros if OpenCV was not available.
         """
         stats: dict[str, dict[str, Any]] = {}
+
+        if self._found_df.empty:
+            return stats
+
         has_frame_data = "frame_count" in self._found_df.columns
 
         for sign, group in self._found_df.groupby("sign_label"):
@@ -962,7 +1185,7 @@ class DataValidator:
             }
 
             if has_frame_data:
-                valid_frames = group["frame_count"][group["frame_count"] > 0]
+                valid_frames = group.loc[group["frame_count"] > 0, "frame_count"]
                 if len(valid_frames) > 0:
                     entry["mean_frame_count"] = round(float(valid_frames.mean()), 1)
                     entry["min_frame_count"] = int(valid_frames.min())
@@ -974,7 +1197,7 @@ class DataValidator:
                         "max_frame_count": 0, "std_frame_count": 0,
                     })
 
-                valid_dur = group["duration_sec"][group["duration_sec"] > 0]
+                valid_dur = group.loc[group["duration_sec"] > 0, "duration_sec"]
                 if len(valid_dur) > 0:
                     entry["mean_duration_sec"] = round(float(valid_dur.mean()), 2)
                     entry["min_duration_sec"] = round(float(valid_dur.min()), 2)
@@ -991,7 +1214,27 @@ class DataValidator:
         return stats
 
     def _compute_dataset_totals(self) -> dict[str, Any]:
-        """Compute aggregate dataset-level statistics."""
+        """
+        Compute aggregate dataset-level statistics.
+
+        Guarded against an empty ``_found_df`` to prevent ``int(NaN)``
+        crashes when ``clips_per_sign.min()`` / ``.max()`` are called on
+        an empty Series.
+        """
+        if self._found_df.empty:
+            return {
+                "total_clips_in_inventory": len(self._df),
+                "total_clips_found": 0,
+                "total_clips_missing": len(self._df),
+                "total_size_mb": 0.0,
+                "total_unique_signers": 0,
+                "total_unique_signs": 0,
+                "mean_clips_per_sign": 0.0,
+                "min_clips_per_sign": 0,
+                "max_clips_per_sign": 0,
+                "std_clips_per_sign": 0.0,
+            }
+
         clips_per_sign = self._found_df.groupby("sign_label").size()
 
         totals: dict[str, Any] = {
@@ -1020,8 +1263,33 @@ class DataValidator:
 
 
 # ---------------------------------------------------------------------------
-# Module-level helper
+# Module-level helpers
 # ---------------------------------------------------------------------------
+
+def _resolve_video_path(rel_path: str) -> Optional[Path]:
+    """
+    Resolve a video path that may be relative or absolute.
+
+    Inventory entries store paths relative to the repository root. However,
+    if a future change stores absolute paths (e.g. on Windows:
+    ``D:\\videos\\00648.mp4``), this function handles that gracefully rather
+    than prepending the repo root and creating an invalid double path.
+
+    Parameters
+    ----------
+    rel_path : str
+        The video_path field from the inventory (relative or absolute).
+
+    Returns
+    -------
+    Path | None
+        Resolved absolute Path, or None if rel_path is empty.
+    """
+    if not rel_path:
+        return None
+    p = Path(rel_path)
+    return p if p.is_absolute() else _REPO_ROOT / p
+
 
 def _check_video_readable(video_path: str) -> tuple[bool, int, float]:
     """
@@ -1055,7 +1323,6 @@ def _check_video_readable(video_path: str) -> tuple[bool, int, float]:
         fps = cap.get(cv2.CAP_PROP_FPS)
         cap.release()
 
-        # Guard against invalid fps values (0 or negative)
         if fps is None or fps <= 0:
             fps = 30.0
 
