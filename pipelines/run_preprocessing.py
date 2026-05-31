@@ -19,6 +19,18 @@ This script orchestrates the full Stage 1 pipeline:
 Each stage is independently resumable: if the output artifact already exists,
 the stage is skipped unless ``--force`` is passed.
 
+Design notes
+------------
+All Python ``assert`` statements in production-critical paths have been
+replaced with explicit ``if ... raise RuntimeError(...)`` blocks. Python
+assertions are silently disabled when running with the ``-O`` flag, making
+them unsuitable for enforcing invariants in a production pipeline.
+
+When loading a cached validation report, the full ``checks`` mapping is
+reconstructed via ``ValidationReport.load()`` so that computed properties
+such as ``n_failed`` and ``blocking_checks`` return accurate values — not
+the stale summary counters stored in the JSON metadata block.
+
 Usage
 -----
 Full pipeline (standard run):
@@ -69,6 +81,7 @@ import json
 import sys
 import time
 from pathlib import Path
+
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -89,8 +102,9 @@ from src.utils.label_map import get_label_map
 # Data modules
 # ---------------------------------------------------------------------------
 from src.data.downloader import WLASLResolver
-from src.data.validator import DataValidator
-from src.data.splitter import SignerAwareSplitter
+from src.data.validator import DataValidator, ValidationReport
+from src.data.splitter import SignerAwareSplitter, SplitResult
+
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -103,7 +117,6 @@ _DEFAULT_REPORT_PATH    = str(_REPO_ROOT / "data" / "data_validation_report.json
 _DEFAULT_SPLITS_DIR     = str(_REPO_ROOT / "data" / "splits")
 _DEFAULT_LOG_DIR        = str(_REPO_ROOT / "logs")
 
-# Validation thresholds — can be overridden via CLI
 _MIN_CLIPS_PER_SIGN    = 20
 _MIN_FRAMES            = 10
 _MAX_FRAMES            = 300
@@ -303,7 +316,7 @@ Exit codes: 0=success, 1=validation blocked pipeline, 2=unexpected error
 # Stage functions
 # ---------------------------------------------------------------------------
 
-def run_resolve_stage(args: argparse.Namespace, logger) -> "pd.DataFrame":
+def run_resolve_stage(args: argparse.Namespace, logger) -> pd.DataFrame:
     """
     Stage 1a — Resolve local WLASL videos against the manifest.
 
@@ -314,40 +327,22 @@ def run_resolve_stage(args: argparse.Namespace, logger) -> "pd.DataFrame":
     ----------
     args : argparse.Namespace
         Parsed CLI arguments.
-    logger : StructuredAdapter
-        Active logger with stage context.
+    logger : logging.Logger
+        Active logger.
 
     Returns
     -------
     pd.DataFrame
         The full inventory (found and missing clips).
     """
-    import pandas as pd  # local import — pandas is heavy; keep top-level clean
-
     stage_start = time.time()
-    logger.info(
-        "=" * 65,
-        extra={"stage": "ingestion"},
-    )
-    logger.info(
-        "STAGE 1a — Resolve Inventory",
-        extra={"stage": "ingestion"},
-    )
-    logger.info(
-        f"  manifest   : {args.manifest}",
-        extra={"stage": "ingestion"},
-    )
-    logger.info(
-        f"  raw_dir    : {args.raw_dir}",
-        extra={"stage": "ingestion"},
-    )
-    logger.info(
-        f"  output     : {args.inventory_path}",
-        extra={"stage": "ingestion"},
-    )
+    logger.info("=" * 65, extra={"stage": "ingestion"})
+    logger.info("STAGE 1a — Resolve Inventory", extra={"stage": "ingestion"})
+    logger.info(f"  manifest   : {args.manifest}", extra={"stage": "ingestion"})
+    logger.info(f"  raw_dir    : {args.raw_dir}", extra={"stage": "ingestion"})
+    logger.info(f"  output     : {args.inventory_path}", extra={"stage": "ingestion"})
     logger.info("=" * 65, extra={"stage": "ingestion"})
 
-    # Load label map
     label_map = get_label_map(args.label_map)
     logger.info(
         f"Label map loaded | {label_map.num_classes} signs | "
@@ -355,7 +350,6 @@ def run_resolve_stage(args: argparse.Namespace, logger) -> "pd.DataFrame":
         extra={"stage": "ingestion"},
     )
 
-    # Build inventory
     resolver = WLASLResolver(
         manifest_path=args.manifest,
         raw_dir=args.raw_dir,
@@ -368,9 +362,8 @@ def run_resolve_stage(args: argparse.Namespace, logger) -> "pd.DataFrame":
         inventory_path=args.inventory_path,
     )
 
-    # Optionally attempt to download missing clips
     if args.download_missing:
-        missing_count = (~inventory_df["found"]).sum()
+        missing_count = int((~inventory_df["found"]).sum())
         if missing_count > 0:
             logger.info(
                 f"Attempting download of {missing_count} missing clips | "
@@ -386,7 +379,6 @@ def run_resolve_stage(args: argparse.Namespace, logger) -> "pd.DataFrame":
                 f"Download results: {succeeded}/{len(download_results)} clips retrieved.",
                 extra={"stage": "ingestion"},
             )
-            # Rebuild inventory to reflect newly downloaded clips
             if succeeded > 0 and not args.dry_run:
                 inventory_df = resolver.build_inventory(
                     force=True,
@@ -398,7 +390,6 @@ def run_resolve_stage(args: argparse.Namespace, logger) -> "pd.DataFrame":
                 extra={"stage": "ingestion"},
             )
 
-    # Save inventory
     resolver.save_inventory(
         output_path=args.inventory_path,
         include_per_sign_summary=True,
@@ -416,11 +407,17 @@ def run_resolve_stage(args: argparse.Namespace, logger) -> "pd.DataFrame":
 
 def run_validation_stage(
     args: argparse.Namespace,
-    inventory_df: "pd.DataFrame",
+    inventory_df: pd.DataFrame,
     logger,
-) -> "ValidationReport":
+) -> ValidationReport:
     """
     Stage 1b — Run 8 integrity checks on the inventory.
+
+    When a cached report exists and ``--force`` was not passed, the report is
+    loaded via ``ValidationReport.load()`` which fully reconstructs all
+    ``CheckResult`` objects. This ensures computed properties such as
+    ``n_failed`` and ``blocking_checks`` return accurate values rather than
+    the stale summary counts stored in the JSON metadata block.
 
     Parameters
     ----------
@@ -428,45 +425,35 @@ def run_validation_stage(
         Parsed CLI arguments.
     inventory_df : pd.DataFrame
         Inventory DataFrame from Stage 1a.
-    logger : StructuredAdapter
-        Active logger with stage context.
+    logger : logging.Logger
+        Active logger.
 
     Returns
     -------
     ValidationReport
         The complete validation report with pipeline_can_proceed flag.
     """
-    from src.data.validator import DataValidator
-
     stage_start = time.time()
     logger.info("=" * 65, extra={"stage": "validation"})
     logger.info("STAGE 1b — Validate Inventory", extra={"stage": "validation"})
     logger.info(f"  output: {args.report_path}", extra={"stage": "validation"})
     logger.info("=" * 65, extra={"stage": "validation"})
 
-    # Check resumability
+    # Resumability: load cached report with full check reconstruction
     if not args.force and Path(args.report_path).exists():
         logger.info(
             f"Validation report already exists: {args.report_path}. "
-            "Loading cached report. Pass --force to re-validate.",
+            "Loading full report (all checks reconstructed). "
+            "Pass --force to re-validate.",
             extra={"stage": "validation"},
         )
-        with open(args.report_path, encoding="utf-8") as f:
-            cached = json.load(f)
-        can_proceed = cached.get("metadata", {}).get("pipeline_can_proceed", False)
-
-        from src.data.validator import ValidationReport, CheckResult
-        # Reconstruct lightweight report object for return
-        report = ValidationReport(
-            pipeline_can_proceed=can_proceed,
-            checks={},
-            per_sign_stats=cached.get("per_sign_stats", {}),
-            dataset_totals=cached.get("dataset_totals", {}),
-            inventory_path=args.inventory_path,
-            generated_utc=cached.get("metadata", {}).get("generated_utc", ""),
-        )
+        # Use ValidationReport.load() — reconstructs CheckResult objects so
+        # n_failed / blocking_checks are computed correctly, not from stale
+        # metadata counters.
+        report = ValidationReport.load(args.report_path)
         logger.info(
-            f"Cached report: pipeline_can_proceed={can_proceed}",
+            f"Cached report: pipeline_can_proceed={report.pipeline_can_proceed} | "
+            f"failed={report.n_failed} | warned={report.n_warned}",
             extra={"stage": "validation"},
         )
         return report
@@ -499,9 +486,9 @@ def run_validation_stage(
 
 def run_split_stage(
     args: argparse.Namespace,
-    inventory_df: "pd.DataFrame",
+    inventory_df: pd.DataFrame,
     logger,
-) -> "SplitResult":
+) -> SplitResult:
     """
     Stage 1c — Create signer-aware train/val/test splits.
 
@@ -511,16 +498,14 @@ def run_split_stage(
         Parsed CLI arguments.
     inventory_df : pd.DataFrame
         Inventory DataFrame from Stage 1a (all clips, found and missing).
-    logger : StructuredAdapter
-        Active logger with stage context.
+    logger : logging.Logger
+        Active logger.
 
     Returns
     -------
     SplitResult
         Container with the three split DataFrames and summary statistics.
     """
-    from src.data.splitter import SignerAwareSplitter
-
     stage_start = time.time()
     logger.info("=" * 65, extra={"stage": "splitting"})
     logger.info("STAGE 1c — Signer-Aware Split", extra={"stage": "splitting"})
@@ -556,7 +541,7 @@ def run_split_stage(
 # Inventory loading helper (for --validate-only and --split-only modes)
 # ---------------------------------------------------------------------------
 
-def _load_inventory_from_disk(inventory_path: str, logger) -> "pd.DataFrame":
+def _load_inventory_from_disk(inventory_path: str, logger) -> pd.DataFrame:
     """
     Load the inventory DataFrame from a saved JSON file.
 
@@ -567,7 +552,7 @@ def _load_inventory_from_disk(inventory_path: str, logger) -> "pd.DataFrame":
     ----------
     inventory_path : str
         Path to raw_inventory.json.
-    logger : StructuredAdapter
+    logger : logging.Logger
         Active logger.
 
     Returns
@@ -578,10 +563,9 @@ def _load_inventory_from_disk(inventory_path: str, logger) -> "pd.DataFrame":
     Raises
     ------
     SystemExit
-        If the inventory file does not exist.
+        If the inventory file does not exist, cannot be parsed, is missing
+        the required ``clips`` key, or contains zero clip records.
     """
-    import pandas as pd
-
     path = Path(inventory_path)
     if not path.exists():
         logger.error(
@@ -595,25 +579,122 @@ def _load_inventory_from_disk(inventory_path: str, logger) -> "pd.DataFrame":
         f"Loading inventory from disk: {inventory_path}",
         extra={"stage": "ingestion"},
     )
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
 
-    clips = data.get("clips", [])
-    if not clips:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
         logger.error(
-            f"Inventory at {inventory_path} contains no clips. "
-            "The file may be empty or corrupt.",
+            f"Inventory file is not valid JSON: {inventory_path}: {exc}",
+            extra={"stage": "ingestion"},
+        )
+        sys.exit(2)
+
+    # Schema validation — the 'clips' key is non-negotiable
+    if "clips" not in data:
+        logger.error(
+            f"Inventory file is missing required key 'clips': {inventory_path}. "
+            "The file may be corrupt or from an incompatible version. "
+            "Re-run the resolve stage to regenerate it.",
+            extra={"stage": "ingestion"},
+        )
+        sys.exit(2)
+
+    clips = data["clips"]
+    if not isinstance(clips, list) or len(clips) == 0:
+        logger.error(
+            f"Inventory 'clips' list is empty or not a list: {inventory_path}. "
+            "The resolve stage produced no clip records. "
+            "Check the manifest path and raw_dir configuration.",
+            extra={"stage": "ingestion"},
+        )
+        sys.exit(2)
+
+    # Validate that clip records have the minimum expected fields
+    required_clip_fields = {"video_id", "sign_label", "found", "signer_id", "video_path"}
+    sample = clips[0]
+    if not isinstance(sample, dict):
+        logger.error(
+            f"Inventory clip records are not dicts (got {type(sample).__name__}). "
+            f"File may be corrupt: {inventory_path}",
+            extra={"stage": "ingestion"},
+        )
+        sys.exit(2)
+
+    missing_fields = required_clip_fields - set(sample.keys())
+    if missing_fields:
+        logger.error(
+            f"Inventory clip records are missing required fields: {missing_fields}. "
+            "The file may be from an incompatible version. "
+            "Re-run the resolve stage to regenerate it.",
             extra={"stage": "ingestion"},
         )
         sys.exit(2)
 
     df = pd.DataFrame(clips)
+    found_count = int(df["found"].sum()) if "found" in df.columns else 0
+
     logger.info(
-        f"Inventory loaded | clips={len(df)} | "
-        f"found={df['found'].sum() if 'found' in df.columns else '?'}",
+        f"Inventory loaded | clips={len(df)} | found={found_count}",
         extra={"stage": "ingestion"},
     )
     return df
+
+
+# ---------------------------------------------------------------------------
+# Signer overlap verification helper
+# ---------------------------------------------------------------------------
+
+def _verify_final_signer_overlap(result: SplitResult, logger) -> None:
+    """
+    Final belt-and-suspenders signer overlap check after splitting.
+
+    Uses explicit RuntimeError rather than assert so the check cannot be
+    disabled by Python's ``-O`` flag.
+
+    Parameters
+    ----------
+    result : SplitResult
+        The completed split result.
+    logger : logging.Logger
+        Active logger.
+
+    Raises
+    ------
+    RuntimeError
+        If any signer appears in more than one split.
+    """
+    train_signers = set(result.train["signer_id"].unique())
+    val_signers   = set(result.val["signer_id"].unique())
+    test_signers  = set(result.test["signer_id"].unique())
+
+    violations: list[str] = []
+    tv_overlap = train_signers & val_signers
+    tt_overlap = train_signers & test_signers
+    vt_overlap = val_signers & test_signers
+
+    if tv_overlap:
+        violations.append(f"train∩val: {len(tv_overlap)} signers — {tv_overlap}")
+    if tt_overlap:
+        violations.append(f"train∩test: {len(tt_overlap)} signers — {tt_overlap}")
+    if vt_overlap:
+        violations.append(f"val∩test: {len(vt_overlap)} signers — {vt_overlap}")
+
+    if violations:
+        for msg in violations:
+            logger.error(
+                f"POST-SPLIT SIGNER OVERLAP: {msg}",
+                extra={"stage": "pipeline"},
+            )
+        raise RuntimeError(
+            "Post-split signer overlap detected. The split is invalid.\n"
+            + "\n".join(violations)
+        )
+
+    logger.info(
+        "✓ Final signer overlap verification passed.",
+        extra={"stage": "pipeline"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -648,10 +729,7 @@ def main() -> int:
         "WLASL Gesture Recognition — Stage 1: Data Ingestion & Validation",
         extra={"stage": "pipeline"},
     )
-    logger.info(
-        f"Log file: {log_file}",
-        extra={"stage": "pipeline"},
-    )
+    logger.info(f"Log file: {log_file}", extra={"stage": "pipeline"})
 
     # ----------------------------------------------------------------
     # Reproducibility — seed before any data operations
@@ -665,8 +743,8 @@ def main() -> int:
         train_r, val_r, test_r = args.split_targets
         if abs(train_r + val_r + test_r - 1.0) > 1e-6:
             logger.error(
-                f"--split-targets must sum to 1.0. Got: {train_r}+{val_r}+{test_r}"
-                f"={train_r + val_r + test_r:.6f}",
+                f"--split-targets must sum to 1.0. "
+                f"Got: {train_r}+{val_r}+{test_r}={train_r + val_r + test_r:.6f}",
                 extra={"stage": "pipeline"},
             )
             return 2
@@ -678,7 +756,7 @@ def main() -> int:
         return 2
 
     pipeline_start = time.time()
-    inventory_df = None
+    inventory_df: pd.DataFrame
 
     try:
         # ----------------------------------------------------------------
@@ -687,7 +765,6 @@ def main() -> int:
         if not args.validate_only and not args.split_only:
             inventory_df = run_resolve_stage(args, logger)
         else:
-            # Load from disk for skipped resolve stage
             inventory_df = _load_inventory_from_disk(args.inventory_path, logger)
 
         # ----------------------------------------------------------------
@@ -708,29 +785,37 @@ def main() -> int:
                 )
                 return 1
         else:
-            # Split-only mode: verify existing report allows proceeding
+            # Split-only mode: verify existing report allows proceeding.
+            # Use ValidationReport.load() to get an accurate pipeline_can_proceed
+            # value from fully-reconstructed checks, not stale metadata counters.
             report_path = Path(args.report_path)
             if report_path.exists():
-                with open(report_path, encoding="utf-8") as f:
-                    cached_report = json.load(f)
-                can_proceed = cached_report.get("metadata", {}).get(
-                    "pipeline_can_proceed", True
-                )
-                if not can_proceed:
-                    logger.error(
-                        "Existing validation report shows pipeline_can_proceed=False. "
-                        "Resolve validation errors before splitting.",
+                try:
+                    cached_report = ValidationReport.load(args.report_path)
+                    if not cached_report.pipeline_can_proceed:
+                        logger.error(
+                            f"Existing validation report shows pipeline_can_proceed=False "
+                            f"({cached_report.n_failed} blocking error(s)). "
+                            "Resolve validation errors before splitting. "
+                            f"Blocking checks: {cached_report.blocking_checks}",
+                            extra={"stage": "pipeline"},
+                        )
+                        return 1
+                    logger.info(
+                        "Validation report: pipeline_can_proceed=True. Proceeding to split.",
                         extra={"stage": "pipeline"},
                     )
-                    return 1
-                logger.info(
-                    "Validation report: pipeline_can_proceed=True. Proceeding to split.",
-                    extra={"stage": "pipeline"},
-                )
+                except (FileNotFoundError, ValueError) as exc:
+                    logger.error(
+                        f"Could not load validation report: {exc}",
+                        extra={"stage": "pipeline"},
+                    )
+                    return 2
             else:
                 logger.warning(
                     f"Validation report not found at {args.report_path}. "
-                    "Proceeding to split without validation — not recommended.",
+                    "Proceeding to split without validation — not recommended. "
+                    "Run without --split-only to generate the report first.",
                     extra={"stage": "pipeline"},
                 )
 
@@ -740,25 +825,16 @@ def main() -> int:
         if not args.validate_only:
             split_result = run_split_stage(args, inventory_df, logger)
 
-            # Final integrity check — zero signer overlap confirmed by splitter,
-            # but re-verify here for belt-and-suspenders logging.
-            train_signers = set(split_result.train["signer_id"].unique())
-            val_signers   = set(split_result.val["signer_id"].unique())
-            test_signers  = set(split_result.test["signer_id"].unique())
-            assert len(train_signers & val_signers) == 0, "Train/val signer overlap!"
-            assert len(train_signers & test_signers) == 0, "Train/test signer overlap!"
-            assert len(val_signers & test_signers) == 0, "Val/test signer overlap!"
-            logger.info(
-                "✓ Final signer overlap verification passed.",
-                extra={"stage": "pipeline"},
-            )
+            # Final integrity check using explicit RuntimeError (not assert)
+            _verify_final_signer_overlap(split_result, logger)
 
     except SystemExit:
         raise
 
-    except AssertionError as exc:
+    except RuntimeError as exc:
+        # RuntimeError covers: signer overlap, missing train classes, bad split
         logger.error(
-            f"Integrity assertion failed: {exc}",
+            f"Pipeline integrity failure: {exc}",
             extra={"stage": "pipeline"},
         )
         return 2
@@ -786,18 +862,17 @@ def main() -> int:
     logger.info("=" * 65, extra={"stage": "pipeline"})
     logger.info("STAGE 1 COMPLETE", extra={"stage": "pipeline"})
     logger.info(f"  Total elapsed: {elapsed:.1f}s", extra={"stage": "pipeline"})
-    logger.info(
-        f"  Artifacts produced:",
-        extra={"stage": "pipeline"},
-    )
-    for artifact in [
+    logger.info("  Artifacts produced:", extra={"stage": "pipeline"})
+
+    candidate_artifacts = [
         args.inventory_path,
         args.report_path,
         str(Path(args.splits_dir) / "train.csv"),
         str(Path(args.splits_dir) / "val.csv"),
         str(Path(args.splits_dir) / "test.csv"),
         str(Path(args.splits_dir) / "split_summary.json"),
-    ]:
+    ]
+    for artifact in candidate_artifacts:
         p = Path(artifact)
         exists = "✓" if p.exists() else "✗"
         size = f"({p.stat().st_size / 1024:.1f} KB)" if p.exists() else "(not found)"
@@ -805,10 +880,11 @@ def main() -> int:
             f"  {exists} {artifact} {size}",
             extra={"stage": "pipeline"},
         )
+
     logger.info("=" * 65, extra={"stage": "pipeline"})
     logger.info(
-        "Next step: Stage 2 — Run notebooks/02_landmark_inspection.ipynb "
-        "after completing Stage 3 preprocessing on a sample.",
+        "Next step: Stage 3 — run pipelines/run_preprocessing.py on the full "
+        "dataset to extract landmarks (Stage 2 notebook runs after a sample extract).",
         extra={"stage": "pipeline"},
     )
     return 0
