@@ -1,0 +1,37 @@
+[
+  {
+    "id": "F1",
+    "category": "Class Imbalance",
+    "severity": "HIGH",
+    "finding": "Imbalance ratio is 3.20x (Gini=0.171).",
+    "decision": "Activate class_weight_balancing=True in TrainingConfig if ratio > 2.5x. Monitor per-class F1 \u2014 overall accuracy will mask poor performance on rare signs."
+  },
+  {
+    "id": "F2",
+    "category": "Signer Dominance",
+    "severity": "LOW",
+    "finding": "0 signs have a single signer contributing >50% of clips.",
+    "decision": "No critical signer dominance detected."
+  },
+  {
+    "id": "F3",
+    "category": "Split Integrity",
+    "severity": "LOW",
+    "finding": "Signer-aware split: zero overlap across all pairs. Train 245 | Val 53 | Test 52 clips. Actual ratios: 70.0%/15.1%/14.9% vs targets 70%/15%/15%.",
+    "decision": "Split is methodologically sound. Validation accuracy in Stage 5 is the honest estimate of generalisation to unseen signers. Report this prominently \u2014 it is the differentiating methodological choice of this project."
+  },
+  {
+    "id": "F4",
+    "category": "Sequence Length",
+    "severity": "LOW",
+    "finding": "Mean clip frame count: 65.7. Default sequence length: 30 frames.",
+    "decision": "Default seq_len=30 is the primary configuration. Ablation over seq_len \u2208 {20, 30, 40} in Stage 5 Group 3 will quantify the accuracy/latency trade-off empirically."
+  },
+  {
+    "id": "F5",
+    "category": "Data Completeness",
+    "severity": "HIGH",
+    "finding": "401 clips missing from disk (53.4% of inventory).",
+    "decision": "Missing clips are excluded from all splits. Document in LIMITATIONS.md. If any sign drops below 20 clips after exclusion, attempt download via run_preprocessing.py --download-missing."
+  }
+]
