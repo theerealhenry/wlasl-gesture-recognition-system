@@ -26,78 +26,63 @@ The deliberate split between extraction (Stage 3) and feature engineering
 - Normalisation is applied at read time by FeaturePipeline, not baked into
   the .npy files, so normalisation strategies can be changed without disk I/O.
 
+Circular import prevention
+--------------------------
+Feature layout constants live in ``src.features.constants`` — a standalone,
+dependency-free module. Both this ``__init__.py`` and ``extractor.py`` import
+from ``constants`` directly, so there is no circular dependency:
+
+    __init__.py  →  constants.py   (safe)
+    extractor.py →  constants.py   (safe)
+
 Import surface
 --------------
 Everything a downstream module needs is importable directly from src.features:
 
     from src.features import (
-        LandmarkExtractor,
-        ExtractionResult,
-        ExtractionStats,
-        FEATURE_SIZE,
-        LEFT_HAND_SLICE,
-        RIGHT_HAND_SLICE,
-        POSE_SLICE,
-        N_HAND_LANDMARKS,
-        N_POSE_LANDMARKS,
+        # Layout constants
+        FEATURE_SIZE, LEFT_HAND_SLICE, RIGHT_HAND_SLICE, POSE_SLICE,
+        N_HAND_LANDMARKS, N_POSE_LANDMARKS, N_COORDS_PER_LANDMARK,
+        N_HAND_FEATURES, N_POSE_FEATURES,
+        WRIST_LANDMARK_INDEX, EXTRACTOR_SCHEMA_VERSION,
+        # Stage 3
+        LandmarkExtractor, ExtractionResult, ExtractionStats,
     )
 
 FeaturePipeline and augmentation utilities are exported here once Stage 4
-is implemented (augmentation.py, pipeline.py). Their symbols are pre-declared
-as __all__ entries so imports fail fast with a clear error rather than
-silently returning None.
+is implemented. Their symbols are pre-declared in __all__ so imports fail
+fast with a clear ImportError rather than a silent AttributeError.
 """
 
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Feature layout constants — single source of truth
-#
-# These constants are imported throughout the codebase wherever code needs to
-# index into the 225-element feature vector. Using named slices prevents
-# off-by-one errors and makes the code self-documenting.
+# Feature layout constants — re-exported from the dependency-free constants
+# module so that downstream code can do ``from src.features import FEATURE_SIZE``
+# without worrying about which sub-module owns the definition.
 # ---------------------------------------------------------------------------
 
-#: Number of landmarks per hand (MediaPipe Hands model)
-N_HAND_LANDMARKS: int = 21
-
-#: Number of pose landmarks (MediaPipe Pose model)
-N_POSE_LANDMARKS: int = 33
-
-#: Values per landmark (x, y, z)
-N_COORDS_PER_LANDMARK: int = 3
-
-#: Flattened feature count for one hand (21 × 3 = 63)
-N_HAND_FEATURES: int = N_HAND_LANDMARKS * N_COORDS_PER_LANDMARK   # 63
-
-#: Flattened feature count for pose (33 × 3 = 99)
-N_POSE_FEATURES: int = N_POSE_LANDMARKS * N_COORDS_PER_LANDMARK   # 99
-
-#: Total feature vector length per frame (63 + 63 + 99 = 225)
-FEATURE_SIZE: int = N_HAND_FEATURES + N_HAND_FEATURES + N_POSE_FEATURES  # 225
-
-# Slice objects for indexing into the 225-element feature vector.
-# Usage:  frame_vec[LEFT_HAND_SLICE]  →  shape (63,)
-#         frame_vec[RIGHT_HAND_SLICE] →  shape (63,)
-#         frame_vec[POSE_SLICE]       →  shape (99,)
-
-LEFT_HAND_SLICE  = slice(0,                  N_HAND_FEATURES)                       # [0:63]
-RIGHT_HAND_SLICE = slice(N_HAND_FEATURES,    N_HAND_FEATURES * 2)                   # [63:126]
-POSE_SLICE       = slice(N_HAND_FEATURES * 2, N_HAND_FEATURES * 2 + N_POSE_FEATURES)  # [126:225]
-
-# Wrist landmark index within the MediaPipe Hands landmark list.
-# Used by FeaturePipeline for wrist-relative normalisation.
-WRIST_LANDMARK_INDEX: int = 0
-
-# Pose landmark index for the nose (used as a pose anchor if needed).
-NOSE_LANDMARK_INDEX: int = 0
-
+from src.features.constants import (  # noqa: F401
+    N_HAND_LANDMARKS,
+    N_POSE_LANDMARKS,
+    N_COORDS_PER_LANDMARK,
+    N_HAND_FEATURES,
+    N_POSE_FEATURES,
+    FEATURE_SIZE,
+    LEFT_HAND_SLICE,
+    RIGHT_HAND_SLICE,
+    POSE_SLICE,
+    WRIST_LANDMARK_INDEX,
+    NOSE_LANDMARK_INDEX,
+    EXTRACTOR_SCHEMA_VERSION,
+)
 
 # ---------------------------------------------------------------------------
 # Stage 3 exports — LandmarkExtractor
+# (Imported after constants to guarantee no circular dependency)
 # ---------------------------------------------------------------------------
 
-from src.features.extractor import (  # noqa: E402
+from src.features.extractor import (  # noqa: F401
     LandmarkExtractor,
     ExtractionResult,
     ExtractionStats,
@@ -105,7 +90,8 @@ from src.features.extractor import (  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Stage 4 exports — FeaturePipeline, augmentation
-# (imported lazily so Stage 3 can be used without Stage 4 being built yet)
+# Lazy import: raises ImportError with a clear, actionable message if the
+# Stage 4 modules have not been built yet, rather than failing silently.
 # ---------------------------------------------------------------------------
 
 def __getattr__(name: str):
@@ -113,8 +99,6 @@ def __getattr__(name: str):
     Lazy imports for Stage 4 symbols.
 
     Raises ImportError with a clear message if Stage 4 has not been built.
-    This prevents silent AttributeError failures and provides actionable
-    guidance to the developer.
     """
     _stage4_symbols = {
         "FeaturePipeline":       "src.features.pipeline",
@@ -155,6 +139,7 @@ __all__ = [
     "POSE_SLICE",
     "WRIST_LANDMARK_INDEX",
     "NOSE_LANDMARK_INDEX",
+    "EXTRACTOR_SCHEMA_VERSION",
 
     # Stage 3 — Landmark Extraction
     "LandmarkExtractor",
