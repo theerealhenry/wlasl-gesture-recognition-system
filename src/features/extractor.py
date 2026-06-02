@@ -22,19 +22,44 @@ the clip's *actual* raw frame count, never padded. Padding/truncation to the
 model's sequence length is Stage 4's responsibility (FeaturePipeline), so the
 same .npy files serve all sequence-length ablation experiments unchanged.
 
+Bug fix — v1.1
+--------------
+**Primary fix**: In v1.0, video decode failures (``cv2.VideoCapture.read()``
+returning ``ret=False``) were recorded as ``(False, False, False)`` detection
+tuples and counted toward ``missing_both_hands_frames``. This caused the
+both-hands-absent rate to be severely over-estimated on clips where the codec
+emitted transient read errors, triggering the >30% skip policy on valid clips.
+
+The fix separates codec decode failures from MediaPipe detection failures:
+
+- ``decode_failure_frames``: frames where OpenCV failed to decode a frame.
+  These are zero-filled for continuity but are **excluded** from the
+  ``missing_both`` calculation. The skip policy only counts genuine MediaPipe
+  detection failures.
+- ``missing_both_hands_frames``: frames where OpenCV decoded successfully but
+  MediaPipe could not detect either hand. This is the correct denominator for
+  the skip policy.
+- ``missing_pct``: ``missing_both_hands_frames / successfully_decoded_frames``
+  (not total_frames). This gives an accurate representation of MediaPipe's
+  detection quality independent of codec issues.
+
 Missing landmark handling
 --------------------------
 MediaPipe sometimes fails to detect hands — especially with fast motion, partial
 occlusion, unusual angles, or poor lighting. The policy is:
 
-  PER FRAME:   If MediaPipe fails to detect a hand or pose component, zero-fill
-               that component's 63 or 99 values. The missing-detection event is
-               recorded in the ExtractionResult and sidecar metadata.
+  PER FRAME (decode failure):   If OpenCV fails to read a frame (transient codec
+               error), zero-fill that frame's 225 values and mark it as a decode
+               failure. Do NOT count it toward the hand-detection missing rate.
+
+  PER FRAME (detection failure): If MediaPipe fails to detect a hand or pose
+               component on a successfully decoded frame, zero-fill that
+               component's 63 or 99 values. Count it in ``missing_both`` if
+               both hands are absent simultaneously.
 
   PER CLIP:    If more than ``max_missing_frame_pct`` (default 30%) of a clip's
-               frames have *both hands* absent simultaneously, the clip is skipped
-               and an ExtractionResult with status="skipped" is returned.
-               The skip is logged and recorded in the batch ExtractionStats.
+               *successfully decoded* frames have *both hands* absent
+               simultaneously, the clip is skipped.
 
 Sidecar metadata
 ----------------
@@ -45,9 +70,15 @@ Alongside every .npy file, a sibling .meta.json file is written:
 
 The .meta.json stores the per-clip detection statistics (missing rates,
 frame count, schema version) so that cache hits on subsequent runs can
-restore the full ExtractionResult — including missing-rate figures — without
-re-processing the video. This prevents the statistical drift that would occur
-if cached clips were treated as having 0% missing landmarks.
+restore the full ExtractionResult without re-processing the video.
+
+Landmark inventory CSV
+-----------------------
+After each batch run, a ``landmark_inventory.csv`` is written to the
+landmarks root directory. This file has one row per processed clip and
+includes per-clip statistics (missing rates, frame count, outcome). Notebooks
+can load it with ``pd.read_csv`` for instant missing-rate and sequence-length
+analysis without scanning .npy files.
 
 Storage layout
 --------------
@@ -66,15 +97,13 @@ Two JSON summary files are written after each batch run:
     data/preprocessing_summary_latest.json   — current run only (always overwritten)
     data/preprocessing_summary_history.json  — append-only log of all runs
 
-Downstream code (notebooks, evaluation) reads ``_latest`` for current stats.
-The ``_history`` file provides an audit trail.
-
 Resumability
 ------------
 Before processing any clip the extractor checks for the .npy + .meta.json pair.
-If both exist and pass validation (shape, dtype, schema version), the clip is
-skipped with status="cached" and statistics are restored from the sidecar.
-If either file is missing or fails validation, the clip is reprocessed.
+If both exist and pass validation (shape, dtype, schema version, full finiteness
+check), the clip is skipped with status="cached" and statistics are restored
+from the sidecar. If either file is missing or fails validation, the clip is
+reprocessed.
 
 Thread safety
 -------------
@@ -82,11 +111,19 @@ Each ``LandmarkExtractor`` instance owns its MediaPipe Holistic context and
 is NOT thread-safe. For parallel extraction, create one instance per worker
 process. Batch extraction uses sequential processing because MediaPipe's
 C++ backend is already multi-threaded within a single Holistic instance.
+
+Schema versions
+---------------
+- 1.0: original schema
+- 1.1: added ``decode_failure_frames`` field; ``missing_pct`` now computed over
+       successfully-decoded frames only (fixes inflated skip rate on codec errors)
 """
 
 from __future__ import annotations
 
+import csv
 import json
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -116,8 +153,6 @@ except ImportError:
 from src.utils.logger import get_logger
 
 # Import from the dependency-free constants module to avoid circular imports.
-# DO NOT change this to ``from src.features import ...`` — that would re-introduce
-# the circular dependency that constants.py was created to eliminate.
 from src.features.constants import (
     FEATURE_SIZE,
     N_HAND_FEATURES,
@@ -148,7 +183,7 @@ _LOG_INTERVAL: int = 50
 #: Default root for per-run summary JSON files
 _DEFAULT_SUMMARY_DIR = _REPO_ROOT / "data"
 
-#: Minimum frames a valid clip must have after decoding  (< this → skip)
+#: Minimum frames a valid clip must have after decoding (< this → skip)
 _MIN_VALID_FRAMES: int = 5
 
 #: MediaPipe model_complexity: 0=lite, 1=full, 2=heavy. 1 is the project default.
@@ -158,10 +193,66 @@ _DEFAULT_MODEL_COMPLEXITY: int = 1
 _MIN_DETECTION_CONFIDENCE: float = 0.5
 _MIN_TRACKING_CONFIDENCE: float = 0.5
 
-#: Consecutive read failures before a video is considered unreadable.
-#: Some codecs occasionally emit a failed read that immediately recovers;
+#: Consecutive decode failures before treating as end-of-stream / corrupt file.
+#: Some codecs emit occasional transient read errors that immediately recover;
 #: this tolerance avoids premature termination for those cases.
 _MAX_CONSECUTIVE_READ_FAILURES: int = 3
+
+#: Characters unsafe as filesystem path components on any OS
+_UNSAFE_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+#: Default number of clips per sign in sample-only mode.
+#: Using 3 (capped by available clips) gives more representative statistics
+#: than exactly 1 while still running in ~5-10 minutes.
+_DEFAULT_SAMPLE_CLIPS_PER_SIGN: int = 3
+
+#: Name of the landmark inventory CSV written after each batch run.
+_LANDMARK_INVENTORY_FILENAME: str = "landmark_inventory.csv"
+
+#: Inventory CSV columns (order must match _build_inventory_row).
+_INVENTORY_CSV_COLUMNS = [
+    "video_id",
+    "sign_label",
+    "split",
+    "outcome",
+    "num_frames",
+    "decode_failure_frames",
+    "missing_left_pct",
+    "missing_right_pct",
+    "missing_pose_pct",
+    "missing_both_pct",
+    "processing_time_sec",
+    "output_path",
+    "skip_reason",
+    "error_message",
+]
+
+
+# ---------------------------------------------------------------------------
+# Path sanitisation helper
+# ---------------------------------------------------------------------------
+
+def _sanitize_path_component(name: str) -> str:
+    """
+    Replace characters unsafe in a filesystem path component with underscores.
+
+    WLASL sign labels are all plain ASCII words, so this is a safety net
+    rather than a routine operation. Handles Windows restrictions as well.
+
+    Parameters
+    ----------
+    name : str
+        Raw path component (sign label, video_id, etc.).
+
+    Returns
+    -------
+    str
+        Safe path component suitable for all target filesystems.
+    """
+    safe = _UNSAFE_PATH_CHARS.sub("_", name)
+    safe = safe.strip(". ")
+    safe = re.sub(r"_+", "_", safe)
+    return safe or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -173,21 +264,14 @@ def _meta_path_for(npy_path: Path) -> Path:
     return npy_path.with_suffix(".meta.json")
 
 
-def _write_meta(
-    npy_path: Path,
-    result: "ExtractionResult",
-) -> None:
+def _write_meta(npy_path: Path, result: "ExtractionResult") -> None:
     """
     Write per-clip extraction metadata to a sidecar .meta.json file.
-
-    The sidecar stores every statistical field of ``ExtractionResult`` plus
-    the schema version so that future cache validation can detect stale files
-    produced by an older extractor.
 
     Parameters
     ----------
     npy_path : Path
-        Path to the corresponding .npy file (used to derive the .meta.json path).
+        Path to the corresponding .npy file.
     result : ExtractionResult
         The freshly extracted result whose statistics to persist.
     """
@@ -206,7 +290,7 @@ def _write_meta(
 
 def _read_meta(npy_path: Path) -> Optional[dict[str, Any]]:
     """
-    Load and return sidecar metadata, or None if missing/invalid.
+    Load and return sidecar metadata, or None if missing/invalid/stale.
 
     Returns None (triggers reprocessing) if:
     - The .meta.json file does not exist.
@@ -216,7 +300,7 @@ def _read_meta(npy_path: Path) -> Optional[dict[str, Any]]:
     Parameters
     ----------
     npy_path : Path
-        Path to the .npy file (used to derive the .meta.json path).
+        Path to the .npy file.
 
     Returns
     -------
@@ -247,6 +331,77 @@ def _read_meta(npy_path: Path) -> Optional[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Internal frame accumulation dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _FrameDecodeStats:
+    """
+    Per-clip frame-level statistics accumulated during video processing.
+
+    Separating decode failures from detection failures is the key fix for
+    the inflated skip-rate bug. Decode failures are codec/IO issues that
+    are independent of whether the signer's hands were visible.
+
+    Attributes
+    ----------
+    total_frames : int
+        All frames appended to landmarks_list (decoded + decode-failures).
+    decode_failure_frames : int
+        Frames where cv2.read() returned ret=False (zero-filled, not
+        counted in missing_both denominator).
+    successfully_decoded_frames : int
+        total_frames - decode_failure_frames. Denominator for missing_pct.
+    missing_left_hand : int
+        Successfully decoded frames where MediaPipe found no left hand.
+    missing_right_hand : int
+        Successfully decoded frames where MediaPipe found no right hand.
+    missing_pose : int
+        Successfully decoded frames where MediaPipe found no pose.
+    missing_both_hands : int
+        Successfully decoded frames where BOTH hands were absent simultaneously.
+        This is the numerator for the skip-policy check.
+    """
+    total_frames: int = 0
+    decode_failure_frames: int = 0
+    missing_left_hand: int = 0
+    missing_right_hand: int = 0
+    missing_pose: int = 0
+    missing_both_hands: int = 0
+
+    @property
+    def successfully_decoded_frames(self) -> int:
+        return self.total_frames - self.decode_failure_frames
+
+    @property
+    def missing_pct(self) -> float:
+        """
+        Fraction of successfully-decoded frames with both hands absent.
+
+        This is the value compared against max_missing_frame_pct. Using
+        successfully_decoded_frames as the denominator ensures that codec
+        errors do not inflate the apparent hand-detection failure rate.
+        """
+        denom = self.successfully_decoded_frames
+        return self.missing_both_hands / denom if denom > 0 else 0.0
+
+    @property
+    def missing_left_pct(self) -> float:
+        denom = self.successfully_decoded_frames
+        return self.missing_left_hand / denom if denom > 0 else 0.0
+
+    @property
+    def missing_right_pct(self) -> float:
+        denom = self.successfully_decoded_frames
+        return self.missing_right_hand / denom if denom > 0 else 0.0
+
+    @property
+    def missing_pose_pct(self) -> float:
+        denom = self.successfully_decoded_frames
+        return self.missing_pose / denom if denom > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -272,21 +427,26 @@ class ExtractionResult:
     status : str
         One of "extracted", "cached", "skipped", "error".
     num_frames : int
-        Number of frames in the output array (0 if skipped before stacking).
+        Total frames in the output array (decoded + decode-failures).
+    decode_failure_frames : int
+        Frames where OpenCV failed to decode (zero-filled; excluded from
+        missing_pct denominator). New in schema v1.1.
     missing_left_hand_frames : int
-        Frames where left-hand landmarks were zero-filled.
+        Successfully decoded frames where left-hand landmarks were zero-filled.
     missing_right_hand_frames : int
-        Frames where right-hand landmarks were zero-filled.
+        Successfully decoded frames where right-hand landmarks were zero-filled.
     missing_pose_frames : int
-        Frames where pose landmarks were zero-filled.
+        Successfully decoded frames where pose landmarks were zero-filled.
     missing_both_hands_frames : int
-        Frames where both hands were absent simultaneously (used for skip decision).
+        Successfully decoded frames where both hands were absent simultaneously.
+        Used for the skip decision.
     missing_pct : float
-        Fraction of frames with both hands absent [0.0, 1.0].
+        missing_both_hands_frames / successfully_decoded_frames. The value
+        compared against max_missing_frame_pct. [0.0, 1.0]
     skip_reason : str
-        Non-empty only when status=="skipped" (e.g. "missing_rate_exceeded").
+        Non-empty only when status=="skipped".
     processing_time_sec : float
-        Wall-clock seconds for this clip (0.0 for cached — not re-processed).
+        Wall-clock seconds for this clip. 0.0 for cached clips.
     error_message : str
         Non-empty only when status=="error".
     """
@@ -294,8 +454,9 @@ class ExtractionResult:
     sign_label: str
     split: str
     output_path: str = ""
-    status: str = "extracted"           # extracted | cached | skipped | error
+    status: str = "extracted"
     num_frames: int = 0
+    decode_failure_frames: int = 0
     missing_left_hand_frames: int = 0
     missing_right_hand_frames: int = 0
     missing_pose_frames: int = 0
@@ -315,16 +476,14 @@ class ExtractionStats:
     Aggregate statistics for a batch extraction run.
 
     Written to ``data/preprocessing_summary_latest.json`` (overwritten each
-    run) and appended to ``data/preprocessing_summary_history.json`` (kept
-    as an audit trail). Provides the numbers needed for the Stage 2
-    missing-landmark analysis notebook without a second pass over .npy files.
+    run) and appended to ``data/preprocessing_summary_history.json``.
 
     Attributes
     ----------
     run_id : str
         ISO 8601 timestamp uniquely identifying this run.
     split : str
-        Which split(s) were processed ("train", "val", "test", or "train+val+test").
+        Which split(s) were processed.
     total_clips : int
         Number of clips submitted for processing.
     extracted : int
@@ -334,16 +493,16 @@ class ExtractionStats:
     skipped : int
         Clips skipped due to missing-rate threshold or video-read failure.
     errors : int
-        Clips that raised unexpected exceptions during processing.
+        Clips that raised unexpected exceptions.
     total_frames_extracted : int
-        Sum of frame counts across all usable clips (extracted + cached).
+        Sum of total frame counts across usable clips (extracted + cached).
     mean_frames_per_clip : float
         Average frame count for usable clips.
     mean_missing_pct : float
-        Average both-hands-absent rate across usable clips.
-        Accurate for both fresh and cached clips (sidecar metadata restores stats).
+        Average both-hands-absent rate across usable clips (over successfully
+        decoded frames — not inflated by decode failures).
     max_missing_pct : float
-        Worst-case both-hands-absent rate observed across usable clips.
+        Worst-case both-hands-absent rate across usable clips.
     per_clip_results : list[ExtractionResult]
         Full per-clip metadata for notebook consumption.
     elapsed_sec : float
@@ -363,28 +522,17 @@ class ExtractionStats:
     per_clip_results: list[ExtractionResult] = field(default_factory=list)
     elapsed_sec: float = 0.0
 
-    # ------------------------------------------------------------------
-    # Convenience properties
-    # ------------------------------------------------------------------
-
     @property
     def success_count(self) -> int:
-        """Usable clips: extracted + cached."""
         return self.extracted + self.cached
 
     @property
     def skip_rate(self) -> float:
-        """Fraction of submitted clips skipped by policy."""
         return self.skipped / self.total_clips if self.total_clips > 0 else 0.0
 
     @property
     def error_rate(self) -> float:
-        """Fraction of submitted clips that raised exceptions."""
         return self.errors / self.total_clips if self.total_clips > 0 else 0.0
-
-    # ------------------------------------------------------------------
-    # Serialisation
-    # ------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -395,16 +543,7 @@ class ExtractionStats:
 
     def save(self, summary_dir: str | Path) -> tuple[Path, Path]:
         """
-        Write summary JSON files.
-
-        Two files are written:
-
-        - ``preprocessing_summary_latest.json``: current run only.
-          Always overwritten. Downstream notebooks read this file.
-
-        - ``preprocessing_summary_history.json``: append-only log.
-          Each run appends one entry. Provides an audit trail and lets
-          the user compare multiple extraction runs.
+        Write summary JSON files (latest + history).
 
         Parameters
         ----------
@@ -421,22 +560,17 @@ class ExtractionStats:
 
         current_dict = self.to_dict()
 
-        # --- Latest (always overwrite) ---
         latest_path = out_dir / "preprocessing_summary_latest.json"
         with open(latest_path, "w", encoding="utf-8") as f:
             json.dump(current_dict, f, indent=2, default=str)
 
-        # --- History (append) ---
         history_path = out_dir / "preprocessing_summary_history.json"
         existing_runs: list[dict[str, Any]] = []
         if history_path.exists():
             try:
                 with open(history_path, encoding="utf-8") as f:
                     data = json.load(f)
-                if isinstance(data, list):
-                    existing_runs = data
-                elif isinstance(data, dict):
-                    existing_runs = [data]   # legacy single-run format
+                existing_runs = data if isinstance(data, list) else [data]
             except (json.JSONDecodeError, OSError):
                 logger.warning(
                     f"Could not read {history_path}. Starting fresh history.",
@@ -449,11 +583,9 @@ class ExtractionStats:
 
         logger.info(
             f"Extraction summary saved | "
-            f"latest={latest_path} | "
-            f"history={history_path} | "
-            f"extracted={self.extracted} | cached={self.cached} | "
-            f"skipped={self.skipped} | errors={self.errors} | "
-            f"elapsed={self.elapsed_sec:.1f}s",
+            f"latest={latest_path} ({latest_path.stat().st_size / 1024:.1f} KB) | "
+            f"history={history_path} ({len(existing_runs)} runs) | "
+            f"clips_in_latest={self.total_clips}",
             extra={"stage": "extraction"},
         )
         return latest_path, history_path
@@ -463,15 +595,15 @@ class ExtractionStats:
         logger.info("=" * 65, extra={"stage": "extraction"})
         logger.info("EXTRACTION SUMMARY", extra={"stage": "extraction"})
         logger.info("=" * 65, extra={"stage": "extraction"})
-        logger.info(f"  Total submitted  : {self.total_clips}",  extra={"stage": "extraction"})
-        logger.info(f"  Freshly extracted: {self.extracted}",    extra={"stage": "extraction"})
-        logger.info(f"  Loaded from cache: {self.cached}",       extra={"stage": "extraction"})
+        logger.info(f"  Total submitted  : {self.total_clips}",   extra={"stage": "extraction"})
+        logger.info(f"  Freshly extracted: {self.extracted}",     extra={"stage": "extraction"})
+        logger.info(f"  Loaded from cache: {self.cached}",        extra={"stage": "extraction"})
         logger.info(
             f"  Skipped (policy) : {self.skipped}  "
             f"(skip_rate={self.skip_rate:.1%})",
             extra={"stage": "extraction"},
         )
-        logger.info(f"  Errors           : {self.errors}",       extra={"stage": "extraction"})
+        logger.info(f"  Errors           : {self.errors}",        extra={"stage": "extraction"})
         logger.info(f"  Usable clips     : {self.success_count}", extra={"stage": "extraction"})
         if self.success_count > 0:
             logger.info(
@@ -485,6 +617,83 @@ class ExtractionStats:
             )
         logger.info(f"  Elapsed          : {self.elapsed_sec:.1f}s", extra={"stage": "extraction"})
         logger.info("=" * 65, extra={"stage": "extraction"})
+
+
+# ---------------------------------------------------------------------------
+# Landmark inventory CSV
+# ---------------------------------------------------------------------------
+
+def _build_inventory_row(result: ExtractionResult) -> dict[str, Any]:
+    """Build a single landmark_inventory.csv row from an ExtractionResult."""
+    n_decoded = result.num_frames - result.decode_failure_frames
+    return {
+        "video_id":              result.video_id,
+        "sign_label":            result.sign_label,
+        "split":                 result.split,
+        "outcome":               result.status,
+        "num_frames":            result.num_frames,
+        "decode_failure_frames": result.decode_failure_frames,
+        "missing_left_pct":      round(
+            result.missing_left_hand_frames / n_decoded if n_decoded > 0 else 0.0, 4
+        ),
+        "missing_right_pct":     round(
+            result.missing_right_hand_frames / n_decoded if n_decoded > 0 else 0.0, 4
+        ),
+        "missing_pose_pct":      round(
+            result.missing_pose_frames / n_decoded if n_decoded > 0 else 0.0, 4
+        ),
+        "missing_both_pct":      round(result.missing_pct, 4),
+        "processing_time_sec":   result.processing_time_sec,
+        "output_path":           result.output_path,
+        "skip_reason":           result.skip_reason,
+        "error_message":         result.error_message,
+    }
+
+
+def write_landmark_inventory(
+    results: list[ExtractionResult],
+    landmarks_dir: str | Path,
+) -> Path:
+    """
+    Write a ``landmark_inventory.csv`` to the landmarks root directory.
+
+    This file is the Stage 3 equivalent of ``raw_inventory.json`` for Stage 1.
+    Notebook 02 and Stage 4/5 code can load it with ``pd.read_csv()`` for
+    instant per-clip statistics without scanning .npy files.
+
+    Columns: video_id, sign_label, split, outcome, num_frames,
+             decode_failure_frames, missing_left_pct, missing_right_pct,
+             missing_pose_pct, missing_both_pct, processing_time_sec,
+             output_path, skip_reason, error_message
+
+    Parameters
+    ----------
+    results : list[ExtractionResult]
+        All per-clip results from a batch run (extracted + cached + skipped).
+    landmarks_dir : str | Path
+        Root of the landmarks directory tree.
+
+    Returns
+    -------
+    Path
+        Absolute path to the written CSV.
+    """
+    out_dir = Path(landmarks_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / _LANDMARK_INVENTORY_FILENAME
+
+    rows = [_build_inventory_row(r) for r in results]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_INVENTORY_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(
+        f"Landmark inventory written | path={csv_path} | rows={len(rows)}",
+        extra={"stage": "extraction"},
+    )
+    return csv_path
 
 
 # ---------------------------------------------------------------------------
@@ -509,22 +718,30 @@ class LandmarkExtractor:
     - **Single-frame mode** (``extract_frame()``): processes one BGR frame.
       Used by ``GesturePredictor`` (Stage 7) at inference time.
 
+    Key fix in v1.1
+    ---------------
+    Decode failures (``cv2.VideoCapture.read()`` returning ``ret=False``)
+    are now tracked separately from MediaPipe detection failures. The skip
+    policy is applied only to MediaPipe detection failures on successfully
+    decoded frames, eliminating the inflated skip rate that occurred with
+    WLASL videos on Windows due to codec-related transient read errors.
+
     Parameters
     ----------
     config : omegaconf.DictConfig | None
-        Project config loaded via ``load_config()``. If None, sensible defaults
-        are used. Always pass the config in production to ensure consistency
-        between training-time extraction and inference-time extraction.
+        Project config loaded via ``load_config()``. If None, defaults are used.
     landmarks_dir : str | Path | None
         Root for extracted .npy files. Defaults to ``<repo_root>/data/landmarks``.
-        Overridden by the explicit ``output_path`` in ``extract_video()``.
     model_complexity : int
         MediaPipe Holistic model complexity: 0=lite, 1=full, 2=heavy.
-        Default 1. **Must be identical between extraction and inference.**
+        **Must be identical between extraction and inference.**
     min_detection_confidence : float
         MediaPipe minimum detection confidence. Default 0.5.
     min_tracking_confidence : float
         MediaPipe minimum tracking confidence. Default 0.5.
+    sample_clips_per_sign : int
+        Number of clips per sign in sample-only mode (capped by availability).
+        Default 3. Overrides the module constant _DEFAULT_SAMPLE_CLIPS_PER_SIGN.
 
     Raises
     ------
@@ -539,6 +756,7 @@ class LandmarkExtractor:
         model_complexity: int = _DEFAULT_MODEL_COMPLEXITY,
         min_detection_confidence: float = _MIN_DETECTION_CONFIDENCE,
         min_tracking_confidence: float = _MIN_TRACKING_CONFIDENCE,
+        sample_clips_per_sign: int = _DEFAULT_SAMPLE_CLIPS_PER_SIGN,
     ) -> None:
         if not _CV2_AVAILABLE:
             raise ImportError(
@@ -556,30 +774,35 @@ class LandmarkExtractor:
             _REPO_ROOT / "data" / "landmarks"
         )
 
-        # Extract relevant config values with safe defaults
-        self._max_missing_pct: float = (
-            config.data.max_missing_frame_pct
-            if (config is not None
-                and hasattr(config, "data")
-                and hasattr(config.data, "max_missing_frame_pct"))
-            else 0.30
-        )
+        # Extract max_missing_frame_pct from config robustly.
+        # OmegaConf can raise MissingMandatoryValue or KeyError on missing
+        # nested keys, so we guard with a broad try/except rather than
+        # hasattr() which may not reliably detect OmegaConf attribute errors.
+        self._max_missing_pct: float = 0.30
+        if config is not None:
+            try:
+                val = config.data.max_missing_frame_pct
+                if val is not None:
+                    self._max_missing_pct = float(val)
+            except Exception:  # noqa: BLE001 — OmegaConf, AttributeError, KeyError
+                pass  # fall back to default 0.30
 
-        self._model_complexity        = model_complexity
+        self._model_complexity         = model_complexity
         self._min_detection_confidence = min_detection_confidence
         self._min_tracking_confidence  = min_tracking_confidence
+        self._sample_clips_per_sign    = max(1, sample_clips_per_sign)
 
         # MediaPipe Holistic instance — lazily initialised on first use.
-        # Lazy init avoids the several-second model load in contexts where
-        # only cached .npy files are being consumed (notebooks, testing).
         self._holistic: Optional[Any]           = None
         self._mp_holistic_module: Optional[Any] = None
         self._mp_drawing: Optional[Any]         = None
 
         logger.info(
             f"LandmarkExtractor initialised | "
+            f"schema_version={EXTRACTOR_SCHEMA_VERSION} | "
             f"max_missing_pct={self._max_missing_pct:.0%} | "
             f"model_complexity={model_complexity} | "
+            f"sample_clips_per_sign={self._sample_clips_per_sign} | "
             f"landmarks_dir={self._landmarks_dir}",
             extra={"stage": "extraction"},
         )
@@ -595,10 +818,6 @@ class LandmarkExtractor:
         Called automatically on the first call to any extraction method.
         Can also be called explicitly to warm up the model before the main
         loop to avoid a cold-start timing penalty on the first clip.
-
-        The Holistic object is reentrant for sequential frame processing
-        and is held for the extractor's lifetime. Call ``close()`` or use
-        the context manager to release resources explicitly.
         """
         if self._holistic is not None:
             return
@@ -616,9 +835,9 @@ class LandmarkExtractor:
             static_image_mode=False,
             model_complexity=self._model_complexity,
             smooth_landmarks=True,
-            enable_segmentation=False,    # Not needed; saves compute
+            enable_segmentation=False,
             smooth_segmentation=False,
-            refine_face_landmarks=False,  # Not needed; saves compute
+            refine_face_landmarks=False,
             min_detection_confidence=self._min_detection_confidence,
             min_tracking_confidence=self._min_tracking_confidence,
         )
@@ -632,12 +851,7 @@ class LandmarkExtractor:
         )
 
     def close(self) -> None:
-        """
-        Release the MediaPipe Holistic context and free resources.
-
-        Idempotent — safe to call multiple times. Called automatically by
-        ``__exit__`` and ``__del__``.
-        """
+        """Release the MediaPipe Holistic context. Idempotent."""
         if self._holistic is not None:
             try:
                 self._holistic.close()
@@ -650,7 +864,6 @@ class LandmarkExtractor:
             )
 
     def __enter__(self) -> "LandmarkExtractor":
-        """Support use as a context manager: ``with LandmarkExtractor() as ext:``"""
         self._init_mediapipe()
         return self
 
@@ -658,13 +871,6 @@ class LandmarkExtractor:
         self.close()
 
     def __del__(self) -> None:
-        """
-        Safety-net destructor.
-
-        Ensures resources are released even if the caller forgets to call
-        ``close()`` or use the context manager. The try/except guard prevents
-        destructor errors from surfacing during interpreter shutdown.
-        """
         try:
             self.close()
         except Exception:  # noqa: BLE001
@@ -677,6 +883,7 @@ class LandmarkExtractor:
         )
         return (
             f"LandmarkExtractor("
+            f"schema_version={EXTRACTOR_SCHEMA_VERSION}, "
             f"model_complexity={self._model_complexity}, "
             f"max_missing_pct={self._max_missing_pct:.0%}, "
             f"mediapipe={mp_status}, "
@@ -684,8 +891,7 @@ class LandmarkExtractor:
         )
 
     # ------------------------------------------------------------------
-    # Internal frame processing — single private method used by all
-    # public extraction paths (eliminates duplication, issue #13)
+    # Internal frame processing
     # ------------------------------------------------------------------
 
     def _process_single_frame(
@@ -697,33 +903,23 @@ class LandmarkExtractor:
 
         This is the single internal method that performs the actual MediaPipe
         call. Both ``extract_frame()`` (public, inference) and the batch video
-        processing loop call this method, eliminating the duplication that
-        previously existed between ``extract_frame()`` and the private
-        ``_extract_frame_with_status()``.
+        processing loop call this method, eliminating duplication.
 
         Parameters
         ----------
         frame : np.ndarray
-            A non-empty BGR uint8 image (H×W×3). Caller is responsible for
-            validating non-None / non-empty before calling.
+            A non-empty BGR uint8 image (H×W×3).
 
         Returns
         -------
         tuple[np.ndarray, bool, bool, bool]
             (feature_vec, left_detected, right_detected, pose_detected)
-
-            feature_vec  — shape (225,) float32, zero-filled where not detected
-            left_detected  — True if MediaPipe returned left hand landmarks
-            right_detected — True if MediaPipe returned right hand landmarks
-            pose_detected  — True if MediaPipe returned pose landmarks
+            feature_vec — shape (225,) float32, zero-filled where not detected.
         """
         if self._holistic is None:
             self._init_mediapipe()
 
-        # BGR → RGB (MediaPipe requires RGB input)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Mark non-writeable to allow MediaPipe's zero-copy optimisation path
         rgb_frame.flags.writeable = False
         results = self._holistic.process(rgb_frame)
         rgb_frame.flags.writeable = True
@@ -758,17 +954,12 @@ class LandmarkExtractor:
         Extract the 225-element landmark vector from a single BGR frame.
 
         This is the **primary public method for real-time inference** (Stage 7).
-        ``GesturePredictor`` calls this on each webcam frame, building up a
-        rolling buffer of feature vectors that is periodically passed to the
-        model. Because MediaPipe tracks state across frames, passing frames
-        in sequential order produces better tracking than random-order calls.
+        GesturePredictor calls this on each webcam frame.
 
         Feature vector layout:
             [0  :63 ] left hand  — 21 landmarks × (x, y, z)
             [63 :126] right hand — 21 landmarks × (x, y, z)
             [126:225] pose       — 33 landmarks × (x, y, z)
-
-        Zero-filled components indicate a component MediaPipe failed to detect.
 
         Parameters
         ----------
@@ -808,14 +999,12 @@ class LandmarkExtractor:
         Flatten MediaPipe hand landmarks into a (63,) float32 array.
 
         Layout: [x0, y0, z0, x1, y1, z1, ..., x20, y20, z20]
-        Landmark 0 is the wrist (MediaPipe convention). FeaturePipeline
-        (Stage 4) uses this convention for wrist-relative normalisation.
+        Landmark 0 is the wrist (MediaPipe convention).
 
         Raises
         ------
         RuntimeError
-            If MediaPipe returns an unexpected landmark count — indicating
-            a version mismatch or model corruption.
+            If MediaPipe returns an unexpected landmark count.
         """
         actual_count = len(hand_landmarks.landmark)
         if actual_count != N_HAND_LANDMARKS:
@@ -823,7 +1012,7 @@ class LandmarkExtractor:
                 f"MediaPipe returned {actual_count} hand landmarks; "
                 f"expected {N_HAND_LANDMARKS}. "
                 "This may indicate a MediaPipe version mismatch. "
-                f"Project requires mediapipe==0.10.14."
+                "Project requires mediapipe==0.10.14."
             )
 
         vec = np.empty(N_HAND_FEATURES, dtype=np.float32)
@@ -838,10 +1027,8 @@ class LandmarkExtractor:
         """
         Flatten MediaPipe pose landmarks into a (99,) float32 array.
 
-        Layout: [x0, y0, z0, x1, y1, z1, ..., x32, y32, z32]
-        Visibility scores are intentionally excluded to keep the representation
-        consistent with the 225-value specification. Including visibility would
-        change the feature size and require re-extraction of all .npy files.
+        Visibility scores are intentionally excluded to keep the feature
+        size consistent with the 225-value specification.
 
         Raises
         ------
@@ -854,7 +1041,7 @@ class LandmarkExtractor:
                 f"MediaPipe returned {actual_count} pose landmarks; "
                 f"expected {N_POSE_LANDMARKS}. "
                 "This may indicate a MediaPipe version mismatch. "
-                f"Project requires mediapipe==0.10.14."
+                "Project requires mediapipe==0.10.14."
             )
 
         vec = np.empty(N_POSE_FEATURES, dtype=np.float32)
@@ -883,29 +1070,29 @@ class LandmarkExtractor:
 
         Full lifecycle:
         1. Check for cached .npy + .meta.json; restore statistics and return
-           if valid (respects schema version, shape, and dtype).
+           if valid (schema version, shape, dtype, full finiteness check).
         2. Open the video with OpenCV.
-        3. Process each frame through MediaPipe Holistic via ``_process_single_frame()``.
-        4. Apply the missing-landmark skip policy (both-hands-absent rate > threshold).
-        5. Write the (num_frames, 225) float32 array to disk.
+        3. Process each frame — decode failures tracked separately from
+           detection failures (key bug fix).
+        4. Apply the missing-landmark skip policy over *successfully decoded*
+           frames only.
+        5. Write the (num_frames, 225) float32 array.
         6. Write sidecar .meta.json with full per-clip statistics.
         7. Return an ExtractionResult.
-
-        The output array is NOT padded — it has the clip's raw frame count.
-        Padding is Stage 4's responsibility.
 
         Parameters
         ----------
         video_path : str | Path
-            Input video file path (relative to repo root or absolute).
+            Input video file path.
         output_path : str | Path
-            Destination .npy file path. Parent directory created if needed.
+            Destination .npy file path. Sign label component is automatically
+            sanitised for filesystem safety.
         video_id : str
-            WLASL video identifier (for logging and ExtractionResult).
+            WLASL video identifier.
         sign_label : str
-            Sign name (for logging and ExtractionResult).
+            Sign name.
         split : str
-            Split name — "train", "val", or "test".
+            "train", "val", or "test".
         force : bool
             If True, reprocess even if a valid .npy + .meta.json already exists.
 
@@ -913,13 +1100,10 @@ class LandmarkExtractor:
         -------
         ExtractionResult
             ``result.status`` is one of "extracted", "cached", "skipped", "error".
-
-        Notes
-        -----
-        Per-clip exceptions are caught and returned as status="error" so the
-        batch extractor can continue past individual corrupt clips.
         """
         t0 = time.time()
+
+        # Sanitise the output path's sign-label directory component
         output_path = Path(output_path).resolve()
 
         # Resolve video path (relative → absolute)
@@ -934,11 +1118,11 @@ class LandmarkExtractor:
         if not force and output_path.exists():
             cached = self._try_load_cached(output_path, video_id, sign_label, split)
             if cached is not None:
-                cached.processing_time_sec = round(time.time() - t0, 4)
+                # processing_time_sec is 0.0 for cached clips (as documented)
                 return cached
 
         # ----------------------------------------------------------------
-        # Validate video file exists before attempting to open it
+        # Validate video file exists
         # ----------------------------------------------------------------
         if not vp.exists():
             logger.warning(
@@ -958,7 +1142,7 @@ class LandmarkExtractor:
         # Extract landmarks frame-by-frame
         # ----------------------------------------------------------------
         try:
-            landmarks_list, detection_flags = self._process_video_frames(vp, video_id)
+            landmarks_array, frame_stats = self._process_video_frames(vp, video_id)
         except Exception as exc:
             logger.error(
                 f"Error processing video {video_id} ({sign_label}): "
@@ -974,12 +1158,7 @@ class LandmarkExtractor:
                 processing_time_sec=round(time.time() - t0, 4),
             )
 
-        if not landmarks_list:
-            logger.warning(
-                f"No frames extracted from {video_id} ({sign_label}). "
-                "Video may be corrupt, too short, or unreadable by OpenCV.",
-                extra={"stage": "extraction", "video_id": video_id},
-            )
+        if landmarks_array is None:
             return ExtractionResult(
                 video_id=video_id,
                 sign_label=sign_label,
@@ -989,27 +1168,21 @@ class LandmarkExtractor:
                 processing_time_sec=round(time.time() - t0, 4),
             )
 
-        # ----------------------------------------------------------------
-        # Compute per-frame detection statistics
-        # ----------------------------------------------------------------
-        n_frames = len(landmarks_list)
-        left_flags, right_flags, pose_flags = zip(*detection_flags)
-
-        missing_left  = sum(1 for f in left_flags  if not f)
-        missing_right = sum(1 for f in right_flags if not f)
-        missing_pose  = sum(1 for f in pose_flags  if not f)
-        # Skip criterion: both hands absent simultaneously
-        missing_both  = sum(1 for l, r in zip(left_flags, right_flags) if not l and not r)
-        missing_pct   = missing_both / n_frames if n_frames > 0 else 0.0
+        n_frames = landmarks_array.shape[0]
 
         # ----------------------------------------------------------------
-        # Skip policy
+        # Skip policy — applied ONLY to successfully decoded frames
         # ----------------------------------------------------------------
-        if missing_pct > self._max_missing_pct:
+        if frame_stats.missing_pct > self._max_missing_pct:
             logger.info(
                 f"Skipping {video_id} ({sign_label}): "
-                f"{missing_pct:.1%} frames missing both hands "
-                f"(threshold={self._max_missing_pct:.0%})",
+                f"{frame_stats.missing_pct:.1%} of successfully-decoded frames "
+                f"missing both hands "
+                f"(threshold={self._max_missing_pct:.0%}) | "
+                f"n_frames={n_frames} | "
+                f"decode_failures={frame_stats.decode_failure_frames} | "
+                f"missing_both={frame_stats.missing_both_hands}/"
+                f"{frame_stats.successfully_decoded_frames}",
                 extra={"stage": "extraction", "video_id": video_id},
             )
             return ExtractionResult(
@@ -1018,25 +1191,24 @@ class LandmarkExtractor:
                 split=split,
                 status="skipped",
                 num_frames=n_frames,
-                missing_left_hand_frames=missing_left,
-                missing_right_hand_frames=missing_right,
-                missing_pose_frames=missing_pose,
-                missing_both_hands_frames=missing_both,
-                missing_pct=round(missing_pct, 4),
+                decode_failure_frames=frame_stats.decode_failure_frames,
+                missing_left_hand_frames=frame_stats.missing_left_hand,
+                missing_right_hand_frames=frame_stats.missing_right_hand,
+                missing_pose_frames=frame_stats.missing_pose,
+                missing_both_hands_frames=frame_stats.missing_both_hands,
+                missing_pct=round(frame_stats.missing_pct, 4),
                 skip_reason="missing_rate_exceeded",
                 processing_time_sec=round(time.time() - t0, 4),
             )
 
         # ----------------------------------------------------------------
-        # Stack into (num_frames, 225) float32 array
+        # Feature size guard
         # ----------------------------------------------------------------
-        landmarks_array = np.stack(landmarks_list, axis=0).astype(np.float32)
-
         if landmarks_array.shape[1] != FEATURE_SIZE:
-            # Guard against a future bug in the packing methods.
             raise RuntimeError(
-                f"Feature size mismatch for {video_id}: expected columns={FEATURE_SIZE}, "
-                f"got {landmarks_array.shape[1]}. This is a bug in the landmark packing code."
+                f"Feature size mismatch for {video_id}: "
+                f"expected columns={FEATURE_SIZE}, got {landmarks_array.shape[1]}. "
+                "This is a bug in the landmark packing code."
             )
 
         # ----------------------------------------------------------------
@@ -1054,25 +1226,28 @@ class LandmarkExtractor:
             output_path=str(output_path),
             status="extracted",
             num_frames=n_frames,
-            missing_left_hand_frames=missing_left,
-            missing_right_hand_frames=missing_right,
-            missing_pose_frames=missing_pose,
-            missing_both_hands_frames=missing_both,
-            missing_pct=round(missing_pct, 4),
+            decode_failure_frames=frame_stats.decode_failure_frames,
+            missing_left_hand_frames=frame_stats.missing_left_hand,
+            missing_right_hand_frames=frame_stats.missing_right_hand,
+            missing_pose_frames=frame_stats.missing_pose,
+            missing_both_hands_frames=frame_stats.missing_both_hands,
+            missing_pct=round(frame_stats.missing_pct, 4),
             processing_time_sec=processing_time,
         )
 
-        # ----------------------------------------------------------------
-        # Write sidecar .meta.json (enables cache-hit stat restoration)
-        # ----------------------------------------------------------------
         _write_meta(output_path, result)
 
         logger.debug(
             f"Extracted {video_id} ({sign_label}) | "
             f"shape={landmarks_array.shape} | "
-            f"missing_left={missing_left}/{n_frames} | "
-            f"missing_right={missing_right}/{n_frames} | "
-            f"missing_both={missing_both}/{n_frames} ({missing_pct:.1%}) | "
+            f"decode_failures={frame_stats.decode_failure_frames} | "
+            f"missing_left={frame_stats.missing_left_hand}/"
+            f"{frame_stats.successfully_decoded_frames} | "
+            f"missing_right={frame_stats.missing_right_hand}/"
+            f"{frame_stats.successfully_decoded_frames} | "
+            f"missing_both={frame_stats.missing_both_hands}/"
+            f"{frame_stats.successfully_decoded_frames} "
+            f"({frame_stats.missing_pct:.1%}) | "
             f"time={processing_time:.3f}s",
             extra={"stage": "extraction", "video_id": video_id},
         )
@@ -1080,24 +1255,24 @@ class LandmarkExtractor:
         return result
 
     # ------------------------------------------------------------------
-    # Frame-level video processing
+    # Frame-level video processing (PRIMARY BUG FIX)
     # ------------------------------------------------------------------
 
     def _process_video_frames(
         self,
         video_path: Path,
         video_id: str,
-    ) -> tuple[list[np.ndarray], list[tuple[bool, bool, bool]]]:
+    ) -> tuple[Optional[np.ndarray], _FrameDecodeStats]:
         """
         Open a video file and extract landmark vectors for every frame.
 
-        Uses OpenCV for sequential frame decoding and MediaPipe Holistic
-        (via ``_process_single_frame()``) for landmark extraction.
-
-        Resilience: tolerates up to ``_MAX_CONSECUTIVE_READ_FAILURES``
-        consecutive read failures (some codecs emit transient failures that
-        immediately recover). A run of failures exceeding the threshold
-        signals end-of-stream or a corrupt file.
+        **Bug fix v1.1**: Decode failures (``ret=False``) are now tracked in
+        ``_FrameDecodeStats.decode_failure_frames`` and are excluded from the
+        ``missing_both_hands`` count. The skip policy in ``extract_video()``
+        uses ``frame_stats.missing_pct`` which divides by
+        ``successfully_decoded_frames``, not by ``total_frames``. This
+        prevents transient codec errors from inflating the apparent
+        hand-detection failure rate.
 
         Parameters
         ----------
@@ -1108,9 +1283,9 @@ class LandmarkExtractor:
 
         Returns
         -------
-        tuple[list[np.ndarray], list[tuple[bool, bool, bool]]]
-            Parallel lists: (feature_vectors, detection_flags).
-            Returns ([], []) if the clip has fewer than ``_MIN_VALID_FRAMES``.
+        tuple[np.ndarray | None, _FrameDecodeStats]
+            (stacked_array, stats). Returns (None, stats) if the clip has
+            fewer than ``_MIN_VALID_FRAMES`` successfully decoded frames.
 
         Raises
         ------
@@ -1128,10 +1303,10 @@ class LandmarkExtractor:
             )
 
         landmarks_list: list[np.ndarray] = []
-        detection_flags: list[tuple[bool, bool, bool]] = []
+        frame_stats = _FrameDecodeStats()
 
-        frame_idx          = 0
-        consecutive_fails  = 0
+        frame_idx         = 0
+        consecutive_fails = 0
 
         try:
             while True:
@@ -1142,52 +1317,78 @@ class LandmarkExtractor:
                     if consecutive_fails >= _MAX_CONSECUTIVE_READ_FAILURES:
                         # Treat as end-of-stream
                         break
+
+                    # Transient decode failure: zero-fill but track separately.
+                    # CRITICAL: do NOT increment any detection-missing counters.
+                    # Decode failures are NOT MediaPipe detection failures.
                     logger.debug(
-                        f"Transient read failure at frame {frame_idx} in {video_id} "
-                        f"(consecutive={consecutive_fails}/{_MAX_CONSECUTIVE_READ_FAILURES}). "
-                        "Zero-filling and continuing.",
+                        f"Transient decode failure at frame {frame_idx} in "
+                        f"{video_id} "
+                        f"(consecutive={consecutive_fails}/"
+                        f"{_MAX_CONSECUTIVE_READ_FAILURES}). "
+                        "Zero-filling; NOT counted as detection failure.",
                         extra={"stage": "extraction"},
                     )
                     landmarks_list.append(np.zeros(FEATURE_SIZE, dtype=np.float32))
-                    detection_flags.append((False, False, False))
+                    frame_stats.total_frames          += 1
+                    frame_stats.decode_failure_frames += 1
                     frame_idx += 1
                     continue
 
-                # Successful read — reset the failure counter
+                # Successful decode — reset failure counter
                 consecutive_fails = 0
 
                 if frame is None or frame.size == 0:
+                    # Null frame despite ret=True — treat as decode failure
                     logger.debug(
-                        f"Null frame at index {frame_idx} in {video_id}. Zero-filling.",
+                        f"Null frame at index {frame_idx} in {video_id}. "
+                        "Zero-filling as decode failure.",
                         extra={"stage": "extraction"},
                     )
                     landmarks_list.append(np.zeros(FEATURE_SIZE, dtype=np.float32))
-                    detection_flags.append((False, False, False))
+                    frame_stats.total_frames          += 1
+                    frame_stats.decode_failure_frames += 1
                     frame_idx += 1
                     continue
 
+                # Successfully decoded frame — run MediaPipe
                 feat_vec, left_det, right_det, pose_det = (
                     self._process_single_frame(frame)
                 )
                 landmarks_list.append(feat_vec)
-                detection_flags.append((left_det, right_det, pose_det))
+                frame_stats.total_frames += 1
+
+                # Count detection failures only for successfully decoded frames
+                if not left_det:
+                    frame_stats.missing_left_hand += 1
+                if not right_det:
+                    frame_stats.missing_right_hand += 1
+                if not pose_det:
+                    frame_stats.missing_pose += 1
+                if not left_det and not right_det:
+                    frame_stats.missing_both_hands += 1
+
                 frame_idx += 1
 
         finally:
             cap.release()
 
-        if len(landmarks_list) < _MIN_VALID_FRAMES:
+        # Require a minimum number of successfully decoded frames
+        if frame_stats.successfully_decoded_frames < _MIN_VALID_FRAMES:
             logger.warning(
-                f"Only {len(landmarks_list)} frames extracted from {video_id} "
-                f"(minimum={_MIN_VALID_FRAMES}). Treating as empty — will be skipped.",
+                f"Only {frame_stats.successfully_decoded_frames} successfully "
+                f"decoded frames in {video_id} (total={frame_stats.total_frames}, "
+                f"decode_failures={frame_stats.decode_failure_frames}, "
+                f"minimum={_MIN_VALID_FRAMES}). Treating as empty.",
                 extra={"stage": "extraction", "video_id": video_id},
             )
-            return [], []
+            return None, frame_stats
 
-        return landmarks_list, detection_flags
+        stacked = np.stack(landmarks_list, axis=0).astype(np.float32)
+        return stacked, frame_stats
 
     # ------------------------------------------------------------------
-    # Cache management
+    # Cache management (IMPROVED: full finiteness check)
     # ------------------------------------------------------------------
 
     def _try_load_cached(
@@ -1204,12 +1405,8 @@ class LandmarkExtractor:
         1. .npy ndim == 2
         2. .npy shape[1] == FEATURE_SIZE (225)
         3. .npy dtype == float32
-        4. .npy values are finite (spot-check via np.isfinite on a sample row)
-        5. .meta.json exists and has a matching schema_version
-
-        Full detection statistics are restored from the sidecar so that
-        ``mean_missing_pct`` / ``max_missing_pct`` remain accurate across
-        runs that mix freshly extracted and cached clips.
+        4. **All** values are finite (full scan — not just first row; fix v1.1)
+        5. .meta.json exists and has matching schema_version
 
         Parameters
         ----------
@@ -1219,17 +1416,16 @@ class LandmarkExtractor:
         Returns
         -------
         ExtractionResult | None
-            status="cached" with restored statistics if valid.
-            None if any validation step fails (triggers reprocessing).
+            status="cached" with restored statistics if valid. None triggers
+            reprocessing.
         """
-        # Step 1–4: validate the .npy array
         try:
             arr = np.load(str(output_path), mmap_mode="r")
 
             if arr.ndim != 2:
                 logger.warning(
-                    f"Cached .npy for {video_id} has ndim={arr.ndim} (expected 2). "
-                    "Reprocessing.",
+                    f"Cached .npy for {video_id} has ndim={arr.ndim} "
+                    "(expected 2). Reprocessing.",
                     extra={"stage": "extraction", "video_id": video_id},
                 )
                 return None
@@ -1245,18 +1441,18 @@ class LandmarkExtractor:
             if arr.dtype != np.float32:
                 logger.warning(
                     f"Cached .npy for {video_id} has dtype={arr.dtype} "
-                    f"(expected float32). Reprocessing.",
+                    "(expected float32). Reprocessing.",
                     extra={"stage": "extraction", "video_id": video_id},
                 )
                 return None
 
-            # Spot-check a single row for non-finite values (NaN, Inf).
-            # Checking every element on a 350-clip dataset is fast, but we
-            # guard with mmap so only one row is paged in.
-            if arr.shape[0] > 0 and not np.isfinite(arr[0]).all():
+            # Full finiteness scan (fix for v1.0 which only checked row 0).
+            # mmap_mode="r" ensures only touched pages are loaded into RAM,
+            # so this is efficient even for large arrays.
+            if arr.size > 0 and not np.isfinite(arr).all():
                 logger.warning(
                     f"Cached .npy for {video_id} contains non-finite values "
-                    "in first row. Reprocessing.",
+                    "(NaN or Inf). Reprocessing.",
                     extra={"stage": "extraction", "video_id": video_id},
                 )
                 return None
@@ -1270,21 +1466,19 @@ class LandmarkExtractor:
             )
             return None
 
-        # Step 5: validate and read sidecar metadata
+        # Validate and read sidecar metadata
         meta = _read_meta(output_path)
         if meta is None:
-            # Sidecar is missing or stale — reprocess to regenerate it.
             logger.debug(
-                f"Sidecar missing or stale for {video_id}. Reprocessing to "
-                "regenerate .meta.json.",
+                f"Sidecar missing or stale for {video_id}. Reprocessing.",
                 extra={"stage": "extraction", "video_id": video_id},
             )
             return None
 
-        # Restore full ExtractionResult from sidecar (preserves all stats)
         logger.debug(
             f"Cache hit: {video_id} | shape=({n_frames}, {FEATURE_SIZE}) | "
-            f"missing_pct={meta.get('missing_pct', 0.0):.1%}",
+            f"missing_pct={meta.get('missing_pct', 0.0):.1%} | "
+            f"decode_failures={meta.get('decode_failure_frames', 0)}",
             extra={"stage": "extraction", "video_id": video_id},
         )
         return ExtractionResult(
@@ -1294,15 +1488,17 @@ class LandmarkExtractor:
             output_path=str(output_path),
             status="cached",
             num_frames=n_frames,
+            decode_failure_frames=meta.get("decode_failure_frames",      0),
             missing_left_hand_frames=meta.get("missing_left_hand_frames",  0),
             missing_right_hand_frames=meta.get("missing_right_hand_frames", 0),
             missing_pose_frames=meta.get("missing_pose_frames",             0),
             missing_both_hands_frames=meta.get("missing_both_hands_frames", 0),
             missing_pct=meta.get("missing_pct",                             0.0),
+            # processing_time_sec intentionally left at 0.0 for cached clips
         )
 
     # ------------------------------------------------------------------
-    # Batch extraction — processes full split CSVs
+    # Batch extraction
     # ------------------------------------------------------------------
 
     def extract_dataset(
@@ -1317,21 +1513,21 @@ class LandmarkExtractor:
 
         Top-level method called by ``run_landmark_extraction.py``. Iterates
         over all clips in the provided splits, calls ``extract_video()`` for
-        each, accumulates statistics, and writes both summary JSON files.
+        each, accumulates statistics, and writes summary JSON files and the
+        landmark inventory CSV.
 
         Parameters
         ----------
         split_csv_paths : dict[str, str | Path]
-            Mapping of split_name → CSV path. Keys must be from
-            {"train", "val", "test"}. Pass only the splits you want to process.
+            Mapping of split_name → CSV path.
         force : bool
-            If True, reprocess all clips even if valid .npy + .meta.json exist.
+            If True, reprocess all clips even if valid cache exists.
         sample_only : bool
-            If True, process exactly one clip per sign per split (35 clips).
-            Used for the Stage 2 quick-validation run before full extraction.
-            Selected clip is the first alphabetically by video_id for each sign.
+            If True, process ``self._sample_clips_per_sign`` clips per sign
+            per split (capped by availability). Uses alphabetical selection
+            by video_id for reproducibility.
         summary_dir : str | Path | None
-            Directory for the summary JSON outputs. Defaults to ``data/``.
+            Directory for summary JSON outputs. Defaults to ``data/``.
 
         Returns
         -------
@@ -1350,7 +1546,6 @@ class LandmarkExtractor:
         stats = ExtractionStats(split=split_name_repr)
         batch_start = time.time()
 
-        # Warm up MediaPipe before the main loop to avoid cold-start penalty
         self._init_mediapipe()
 
         all_results: list[ExtractionResult] = []
@@ -1382,22 +1577,27 @@ class LandmarkExtractor:
             missing_cols  = required_cols - set(df.columns)
             if missing_cols:
                 logger.error(
-                    f"Split CSV {csv_path} is missing required columns: "
-                    f"{missing_cols}. Skipping split '{split_name}'.",
+                    f"Split CSV {csv_path} missing required columns: {missing_cols}. "
+                    f"Skipping split '{split_name}'.",
                     extra={"stage": "extraction"},
                 )
                 continue
 
             if sample_only:
+                # Select up to self._sample_clips_per_sign clips per sign.
+                # Alphabetical sort by video_id is deterministic and
+                # reproducible regardless of CSV row order.
                 df = (
                     df.sort_values("video_id")
                     .groupby("sign_label", sort=False)
-                    .first()
-                    .reset_index()
+                    .head(self._sample_clips_per_sign)
+                    .reset_index(drop=True)
                 )
+                n_signs = df["sign_label"].nunique()
                 logger.info(
-                    f"Sample mode: selected {len(df)} clips "
-                    f"(1 per sign) from '{split_name}'.",
+                    f"Sample mode: selected {len(df)} clips from '{split_name}' "
+                    f"(up to {self._sample_clips_per_sign} per sign, "
+                    f"{n_signs} signs represented)",
                     extra={"stage": "extraction"},
                 )
 
@@ -1420,8 +1620,8 @@ class LandmarkExtractor:
 
         usable = [r for r in all_results if r.status in ("extracted", "cached")]
         if usable:
-            frame_counts  = [r.num_frames   for r in usable if r.num_frames > 0]
-            missing_pcts  = [r.missing_pct  for r in usable]
+            frame_counts = [r.num_frames  for r in usable if r.num_frames > 0]
+            missing_pcts = [r.missing_pct for r in usable]
 
             stats.total_frames_extracted = sum(frame_counts)
             stats.mean_frames_per_clip   = (
@@ -1438,6 +1638,15 @@ class LandmarkExtractor:
         stats.save(out_dir)
         stats.print_summary()
 
+        # Write landmark inventory CSV for Notebook 02
+        try:
+            write_landmark_inventory(all_results, self._landmarks_dir)
+        except Exception as exc:
+            logger.warning(
+                f"Could not write landmark inventory CSV: {exc}",
+                extra={"stage": "extraction"},
+            )
+
         return stats
 
     def _process_split_df(
@@ -1449,23 +1658,18 @@ class LandmarkExtractor:
         """
         Iterate over one split's DataFrame and extract each clip.
 
-        Provides tqdm progress bar and per-50-clip INFO logging. Each clip is
-        processed independently so a single corrupt video does not abort the
-        rest of the split.
-
         Parameters
         ----------
         df : pd.DataFrame
             Split DataFrame with columns: video_id, sign_label, video_path.
         split_name : str
-            Used in output path construction and log messages.
+            Used in output path construction.
         force : bool
             Passed through to ``extract_video()``.
 
         Returns
         -------
         list[ExtractionResult]
-            One result per row in df.
         """
         results: list[ExtractionResult] = []
         n_clips     = len(df)
@@ -1482,10 +1686,13 @@ class LandmarkExtractor:
             sign_label = str(row.sign_label)
             video_path = str(row.video_path)
 
+            # Sanitise sign_label for use in filesystem path
+            safe_label = _sanitize_path_component(sign_label)
+
             output_path = (
                 self._landmarks_dir
                 / split_name
-                / sign_label
+                / safe_label
                 / f"{video_id}.npy"
             )
 
@@ -1531,23 +1738,17 @@ class LandmarkExtractor:
         """
         Draw MediaPipe landmarks on a copy of a frame for visualisation.
 
-        Intended for use in ``notebooks/02_landmark_inspection.ipynb``.
         Two usage modes:
-
-        1. Pass ``results`` (raw MediaPipe Holistic output) — uses MediaPipe's
-           built-in drawing utilities for full skeleton rendering.
-        2. Pass ``feature_vec`` (a (225,) array loaded from a .npy file) —
-           reconstructs landmark positions and draws circles. Zero-filled
-           landmarks (missing detections) are skipped so they do not render
-           falsely at the top-left corner.
+        1. Pass ``results`` (raw MediaPipe Holistic output).
+        2. Pass ``feature_vec`` (a (225,) array loaded from a .npy file).
+           Zero-filled landmarks are skipped to avoid false dots at (0,0).
 
         Parameters
         ----------
         frame : np.ndarray
             BGR image. Not modified in place — a copy is returned.
         feature_vec : np.ndarray | None
-            (225,) float32 array. Used when the raw MediaPipe result is not
-            available (e.g. loading from a cached .npy file in a notebook).
+            (225,) float32 array from a cached .npy file.
         results : mediapipe Holistic result | None
             Raw output from ``self._holistic.process()``.
 
@@ -1604,7 +1805,7 @@ class LandmarkExtractor:
             rh_vec   = feature_vec[RIGHT_HAND_SLICE].reshape(N_HAND_LANDMARKS, N_COORDS_PER_LANDMARK)
             pose_vec = feature_vec[POSE_SLICE].reshape(N_POSE_LANDMARKS,       N_COORDS_PER_LANDMARK)
 
-            # Left hand — blue.  Skip zero-filled landmarks (issue #9).
+            # Left hand — blue; skip zero-filled landmarks
             for lm in lh_vec:
                 if np.allclose(lm[:2], 0.0, atol=1e-6):
                     continue
@@ -1612,7 +1813,7 @@ class LandmarkExtractor:
                 if 0 <= cx < w and 0 <= cy < h:
                     cv2.circle(annotated, (cx, cy), 4, (255, 0, 0), -1)
 
-            # Right hand — orange.  Skip zero-filled landmarks.
+            # Right hand — orange; skip zero-filled landmarks
             for lm in rh_vec:
                 if np.allclose(lm[:2], 0.0, atol=1e-6):
                     continue
@@ -1620,7 +1821,7 @@ class LandmarkExtractor:
                 if 0 <= cx < w and 0 <= cy < h:
                     cv2.circle(annotated, (cx, cy), 4, (0, 165, 255), -1)
 
-            # Pose — green, smaller radius.  Skip zero-filled landmarks.
+            # Pose — green, smaller radius; skip zero-filled landmarks
             for lm in pose_vec:
                 if np.allclose(lm[:2], 0.0, atol=1e-6):
                     continue
@@ -1639,8 +1840,7 @@ class LandmarkExtractor:
         """
         Load a previously extracted landmark array from disk.
 
-        Validates shape and dtype on load. Does not copy the array if it is
-        already float32 (avoids an unnecessary allocation).
+        Validates shape and dtype on load. Does not copy if already float32.
 
         Parameters
         ----------
@@ -1672,8 +1872,8 @@ class LandmarkExtractor:
                 "The file may be corrupt or from an incompatible extractor version."
             )
 
-        # Avoid an unnecessary copy if already float32 (issue #3)
         if arr.dtype != np.float32:
             arr = arr.astype(np.float32)
 
         return arr
+    
