@@ -106,4 +106,4 @@ NOSE_LANDMARK_INDEX: int = 0
 #: .meta.json file so that stale cached files can be detected when the
 #: feature layout changes (e.g. adding visibility scores, swapping left/right
 #: hand order, or switching from Holistic to a newer MediaPipe model).
-EXTRACTOR_SCHEMA_VERSION: str = "1.0"
+EXTRACTOR_SCHEMA_VERSION: str = "1.1"
