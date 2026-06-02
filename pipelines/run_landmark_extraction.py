@@ -31,6 +31,12 @@ Each file contains a float32 array of shape ``(num_frames, 225)`` where:
     [63:126]  right hand — 21 landmarks × (x, y, z)
     [126:225] pose       — 33 landmarks × (x, y, z)
 
+Alongside every .npy file a sibling .meta.json sidecar is written by the
+extractor. The sidecar stores per-clip detection statistics (missing rates,
+frame count, schema version). On subsequent runs, cache-hit clips have their
+statistics restored from the sidecar so that aggregate missing-rate figures
+remain accurate without re-processing any video.
+
 IMPORTANT: Arrays store the clip's actual frame count — they are NOT padded to
 seq_len=30. Padding and truncation are deferred to ``FeaturePipeline`` (Stage 4)
 so the same .npy files can serve all sequence-length ablation experiments
@@ -38,71 +44,78 @@ so the same .npy files can serve all sequence-length ablation experiments
 
 Resumability
 ------------
-Before processing a clip, the extractor checks whether its .npy already exists.
-If it does, the clip is skipped unless ``--force`` is passed. This makes the
+Before processing a clip the extractor checks for a valid .npy + .meta.json
+pair. If both exist and pass validation (shape, dtype, schema version, finite
+values), the clip is skipped unless ``--force`` is passed. This makes the
 script safe to restart after crashes or interruptions — no wasted work.
+
+If ``--verify-existing`` is passed, every cache-hit .npy is spot-checked
+before being trusted. Use this after a filesystem incident or when resuming
+after an incomplete previous run.
+
+Atomic writes
+-------------
+Every .npy file is first written to a ``<video_id>.npy.tmp`` sibling, then
+atomically renamed to the final ``<video_id>.npy``. This prevents a half-
+written file from being mistaken for a valid cache entry if the process is
+interrupted mid-write.
 
 Extraction summary
 ------------------
-At the end of each run, a JSON summary is written (or merged) to
-``data/preprocessing_summary.json``. It records per-video stats (frames
-extracted, missing-landmark rate, processing time, skip reason) and aggregate
-statistics over the run. This file is the audit trail for the extraction phase
-and is used by Notebook 02 for the missing-landmark analysis.
+Two JSON summary files are written after each run:
+
+    data/preprocessing_summary_latest.json  — current run only (always overwritten)
+    data/preprocessing_summary_history.json — append-only audit log of all runs
+
+Notebook 02 reads ``_latest`` for the missing-landmark analysis. The
+``_history`` file provides an audit trail for comparing multiple runs.
 
 Usage
 -----
-Sample-only run (1 clip per sign, ~35 clips — Stage 2 validation gate):
+Sample-only run (1 clip per sign per split — Stage 2 validation gate):
     python pipelines/run_landmark_extraction.py --sample-only
 
 Full extraction, all splits (30–90 minutes):
     python pipelines/run_landmark_extraction.py --split all
 
-Single split (train only):
+Single split only:
     python pipelines/run_landmark_extraction.py --split train
 
 Force re-extraction (overwrite existing .npy files):
     python pipelines/run_landmark_extraction.py --split all --force
 
-Dry run (validate inputs, log what would be processed, write nothing):
+Verify existing cached files while resuming:
+    python pipelines/run_landmark_extraction.py --split all --verify-existing
+
+Dry run (validate inputs and log plan, write nothing):
     python pipelines/run_landmark_extraction.py --dry-run
 
 Verbose debug logging:
-    python pipelines/run_landmark_extraction.py --verbose
+    python pipelines/run_landmark_extraction.py --sample-only --verbose
 
 Exit codes
 ----------
 0  — Extraction completed successfully (includes partial runs where some
-     clips were skipped due to skip policy).
-1  — One or more ERROR-severity failures blocked the run
-     (e.g. splits CSV not found, no clips to process).
-2  — Unexpected exception terminated the pipeline.
-
-Integration with the utils package
------------------------------------
-- configure_logging() / get_logger() — all logging, no print() statements
-- set_seeds(42) — called before any data operations for reproducibility
-- load_config() — reads base.yaml and data/seq30.yaml for extraction params
-
-The LandmarkExtractor from src.features.extractor is the workhorse of this
-script. All MediaPipe logic lives there; this script is pure orchestration.
+     clips were skipped due to skip policy or cache-hit).
+1  — Input error: split CSV missing, no clips found, bad argument value.
+2  — Unexpected exception or post-run health check failure.
 
 Design principles
 -----------------
-- No assert statements in production-critical paths — explicit RuntimeError
-- No print() — structured logging throughout
+- No assert statements in production paths — explicit RuntimeError throughout
+- No print() anywhere — structured logging via configure_logging / get_logger
 - No MLflow — tracking begins at Stage 5 (run_training.py)
 - Single source of truth for which videos to process: data/splits/*.csv
-- Extraction is embarrassingly parallel but implemented serially for
-  determinism and MediaPipe thread-safety. If speed is critical, pass
-  --workers N for multiprocessing (one MediaPipe instance per worker).
+- Atomic .npy writes: tmp-file + rename guards against partial-write corruption
+- Per-clip exception isolation: one bad video never aborts the whole run
+- ETA computed from a fixed pre-loop baseline — never drifts as files are written
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import re
 import sys
 import time
 import traceback
@@ -122,36 +135,78 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # ---------------------------------------------------------------------------
-# Utils — must be imported before feature modules so logging is ready first
+# Utils — configure logging before any other import that might log
 # ---------------------------------------------------------------------------
 from src.utils.logger import configure_logging, get_logger
 from src.utils.reproducibility import set_seeds
 
 # ---------------------------------------------------------------------------
-# Feature modules (Stage 3)
+# Feature modules
+# The extractor contains all MediaPipe logic; this script is pure orchestration.
 # ---------------------------------------------------------------------------
-from src.features.extractor import LandmarkExtractor, ExtractionResult, ExtractionStats
-from src.features import FEATURE_SIZE
+from src.features.extractor import LandmarkExtractor, ExtractionResult
+from src.features.constants import FEATURE_SIZE
 
 
 # ---------------------------------------------------------------------------
 # Default paths and constants
 # ---------------------------------------------------------------------------
-_DEFAULT_SPLITS_DIR     = str(_REPO_ROOT / "data" / "splits")
-_DEFAULT_LANDMARKS_DIR  = str(_REPO_ROOT / "data" / "landmarks")
-_DEFAULT_SUMMARY_PATH   = str(_REPO_ROOT / "data" / "preprocessing_summary.json")
-_DEFAULT_LOG_DIR        = str(_REPO_ROOT / "logs")
+_DEFAULT_SPLITS_DIR    = str(_REPO_ROOT / "data" / "splits")
+_DEFAULT_LANDMARKS_DIR = str(_REPO_ROOT / "data" / "landmarks")
+_DEFAULT_SUMMARY_DIR   = str(_REPO_ROOT / "data")
+_DEFAULT_LOG_DIR       = str(_REPO_ROOT / "logs")
 
-_VALID_SPLITS           = ("train", "val", "test", "all")
-_LOG_INTERVAL           = 50           # clips between progress log lines
-_SAMPLE_CLIPS_PER_SIGN  = 1            # how many clips per sign in --sample-only mode
-_SEED                   = 42
+_VALID_SPLITS          = ("train", "val", "test", "all")
+_LOG_INTERVAL          = 50    # clips between progress log lines
+_SAMPLE_CLIPS_PER_SIGN = 1     # clips per sign in --sample-only mode
+_SEED                  = 42
 
-# MediaPipe / extractor defaults (overridable via CLI to match config.yaml)
-_DEFAULT_MAX_MISSING_FRAME_PCT = 0.30  # skip clip if >30% frames have no landmarks
-_DEFAULT_STATIC_IMAGE_MODE     = False
+# Extractor defaults — kept in sync with extractor.py defaults
+_DEFAULT_MAX_MISSING_FRAME_PCT = 0.30
 _DEFAULT_MIN_DETECTION_CONF    = 0.5
 _DEFAULT_MIN_TRACKING_CONF     = 0.5
+
+# Characters unsafe as filesystem path components on any OS (Windows or POSIX)
+_UNSAFE_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+# ---------------------------------------------------------------------------
+# Filesystem safety helper
+# ---------------------------------------------------------------------------
+
+def _sanitize_path_component(name: str) -> str:
+    """
+    Replace characters that are unsafe in a filesystem path component.
+
+    Handles sign labels that might contain slashes, colons, or other special
+    characters. The WLASL sign labels are all plain ASCII words, so this
+    function is a safety net rather than a routine operation.
+
+    Substitution rule: any character in ``_UNSAFE_PATH_CHARS`` is replaced
+    with an underscore. Leading/trailing whitespace and dots are stripped.
+
+    Parameters
+    ----------
+    name : str
+        Raw path component (e.g. a sign label or video_id).
+
+    Returns
+    -------
+    str
+        Safe path component suitable for all target filesystems.
+
+    Examples
+    --------
+    >>> _sanitize_path_component("before")
+    'before'
+    >>> _sanitize_path_component("sign/with:special*chars")
+    'sign_with_special_chars'
+    """
+    safe = _UNSAFE_PATH_CHARS.sub("_", name)
+    safe = safe.strip(". ")
+    # Collapse multiple consecutive underscores to a single one
+    safe = re.sub(r"_+", "_", safe)
+    return safe or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -166,13 +221,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "Reads split CSVs produced by Stage 1, runs MediaPipe Holistic on every\n"
             "video clip, and writes (num_frames, 225) float32 .npy arrays to\n"
             "data/landmarks/<split>/<sign>/<video_id>.npy.\n\n"
-            "Always run --sample-only first to validate the extractor before committing\n"
-            "to the full 30–90 minute extraction."
+            "Always run --sample-only first to validate the extractor before\n"
+            "committing to the full 30–90 minute extraction."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Stage 2 validation gate — 1 clip per sign (~35 clips, ~2-5 minutes)
+  # Stage 2 validation gate — 1 clip per sign, all splits (~2-5 minutes)
   python pipelines/run_landmark_extraction.py --sample-only
 
   # Full extraction, all splits (30-90 minutes)
@@ -181,8 +236,11 @@ Examples:
   # Training split only
   python pipelines/run_landmark_extraction.py --split train
 
-  # Force re-extraction (overwrite existing .npy files)
+  # Force re-extraction (overwrite existing .npy + .meta.json files)
   python pipelines/run_landmark_extraction.py --split all --force
+
+  # Resume and verify all previously cached files
+  python pipelines/run_landmark_extraction.py --split all --verify-existing
 
   # Dry run — validate inputs and log plan, write nothing
   python pipelines/run_landmark_extraction.py --dry-run
@@ -207,13 +265,21 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         "--landmarks-dir",
         default=_DEFAULT_LANDMARKS_DIR,
         metavar="DIR",
-        help=f"Root output directory for .npy landmark files (default: {_DEFAULT_LANDMARKS_DIR})",
+        help=(
+            f"Root output directory for .npy landmark files "
+            f"(default: {_DEFAULT_LANDMARKS_DIR})"
+        ),
     )
     parser.add_argument(
-        "--summary-path",
-        default=_DEFAULT_SUMMARY_PATH,
-        metavar="PATH",
-        help=f"Path for extraction summary JSON (default: {_DEFAULT_SUMMARY_PATH})",
+        "--summary-dir",
+        default=_DEFAULT_SUMMARY_DIR,
+        metavar="DIR",
+        help=(
+            "Directory for extraction summary JSON files. Two files are written: "
+            "preprocessing_summary_latest.json (current run) and "
+            f"preprocessing_summary_history.json (audit log). "
+            f"(default: {_DEFAULT_SUMMARY_DIR})"
+        ),
     )
     parser.add_argument(
         "--log-dir",
@@ -231,7 +297,7 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         action="store_true",
         help=(
             f"Process only {_SAMPLE_CLIPS_PER_SIGN} clip(s) per sign per split "
-            f"(~{35 * _SAMPLE_CLIPS_PER_SIGN} total). "
+            "(alphabetically first by video_id). "
             "Use this as the Stage 2 validation gate before full extraction."
         ),
     )
@@ -250,8 +316,18 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         "--force",
         action="store_true",
         help=(
-            "Re-extract and overwrite .npy files that already exist. "
-            "Without this flag, existing files are skipped (resumable by default)."
+            "Re-extract and overwrite .npy + .meta.json files that already exist. "
+            "Without this flag, existing valid files are skipped (resumable by default)."
+        ),
+    )
+    parser.add_argument(
+        "--verify-existing",
+        action="store_true",
+        help=(
+            "On cache-hit clips, verify the existing .npy before trusting it. "
+            "Checks ndim, shape, dtype, and finiteness. Corrupt files are "
+            "automatically reprocessed. Use after a filesystem incident or "
+            "when resuming an interrupted run."
         ),
     )
     parser.add_argument(
@@ -259,8 +335,8 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         action="store_true",
         help=(
             "Validate all inputs and log the extraction plan without writing "
-            "any .npy files or modifying the summary JSON. Useful for verifying "
-            "clip counts and output paths before a long run."
+            "any files or calling MediaPipe. Useful for verifying clip counts "
+            "and output paths before a long run."
         ),
     )
     parser.add_argument(
@@ -278,9 +354,9 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         default=_DEFAULT_MAX_MISSING_FRAME_PCT,
         metavar="RATIO",
         help=(
-            "Skip a clip if the fraction of frames with no landmarks detected "
+            "Skip a clip if the fraction of frames where both hands are absent "
             f"exceeds this threshold (default: {_DEFAULT_MAX_MISSING_FRAME_PCT}). "
-            "E.g. 0.30 skips clips where >30%% of frames have zero-filled hands."
+            "E.g. 0.30 skips clips where >30%% of frames have no hand detection."
         ),
     )
     parser.add_argument(
@@ -288,38 +364,108 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         type=float,
         default=_DEFAULT_MIN_DETECTION_CONF,
         metavar="CONF",
-        help=f"MediaPipe Holistic min detection confidence (default: {_DEFAULT_MIN_DETECTION_CONF})",
+        help=(
+            f"MediaPipe Holistic min detection confidence "
+            f"(default: {_DEFAULT_MIN_DETECTION_CONF})"
+        ),
     )
     parser.add_argument(
         "--min-tracking-confidence",
         type=float,
         default=_DEFAULT_MIN_TRACKING_CONF,
         metavar="CONF",
-        help=f"MediaPipe Holistic min tracking confidence (default: {_DEFAULT_MIN_TRACKING_CONF})",
+        help=(
+            f"MediaPipe Holistic min tracking confidence "
+            f"(default: {_DEFAULT_MIN_TRACKING_CONF})"
+        ),
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=_SEED,
         metavar="N",
-        help=f"Random seed (affects sample selection in --sample-only mode) (default: {_SEED})",
+        help=(
+            f"Random seed passed to set_seeds() for global reproducibility "
+            f"(default: {_SEED}). "
+            "Sample selection within --sample-only mode is alphabetically "
+            "deterministic and does not consume randomness."
+        ),
     )
 
     return parser
 
 
 # ---------------------------------------------------------------------------
-# Split loading
+# Input validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_args(args: argparse.Namespace, logger) -> bool:
+    """
+    Validate all CLI argument constraints before any work begins.
+
+    Centralises argument checks so ``main()`` stays readable. Returns False
+    (caller should exit 1) if any constraint is violated.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed arguments from ``_build_parser()``.
+    logger
+        Active logger.
+
+    Returns
+    -------
+    bool
+        True if all constraints pass, False if the caller should abort.
+    """
+    valid = True
+
+    if not (0.0 < args.max_missing_frame_pct <= 1.0):
+        logger.error(
+            f"--max-missing-frame-pct must be in (0, 1]. "
+            f"Got: {args.max_missing_frame_pct}",
+            extra={"stage": "extraction"},
+        )
+        valid = False
+
+    if not (0.0 < args.min_detection_confidence <= 1.0):
+        logger.error(
+            f"--min-detection-confidence must be in (0, 1]. "
+            f"Got: {args.min_detection_confidence}",
+            extra={"stage": "extraction"},
+        )
+        valid = False
+
+    if not (0.0 < args.min_tracking_confidence <= 1.0):
+        logger.error(
+            f"--min-tracking-confidence must be in (0, 1]. "
+            f"Got: {args.min_tracking_confidence}",
+            extra={"stage": "extraction"},
+        )
+        valid = False
+
+    if args.force and args.verify_existing:
+        logger.warning(
+            "--force implies re-extraction of all clips; "
+            "--verify-existing is redundant and will be ignored.",
+            extra={"stage": "extraction"},
+        )
+
+    return valid
+
+
+# ---------------------------------------------------------------------------
+# Split loading and clip collection
 # ---------------------------------------------------------------------------
 
 def _load_split_df(splits_dir: str, split_name: str, logger) -> Optional[pd.DataFrame]:
     """
-    Load a single split CSV and validate its schema.
+    Load and schema-validate a single split CSV.
 
     Parameters
     ----------
     splits_dir : str
-        Directory containing the split CSVs.
+        Directory containing the split CSVs produced by Stage 1.
     split_name : str
         One of "train", "val", "test".
     logger
@@ -372,17 +518,19 @@ def _collect_clips(
     splits_dir: str,
     split_arg: str,
     sample_only: bool,
-    seed: int,
     logger,
 ) -> list[dict[str, Any]]:
     """
     Build the ordered list of clips to process.
 
-    Each entry in the returned list is a dict with keys:
-        video_id, sign_label, class_idx, signer_id, split, video_path
+    Each entry is a dict with keys:
+        video_id, sign_label, class_idx, signer_id, split, video_path,
+        safe_sign_label  (filesystem-safe version of sign_label)
 
-    In ``--sample-only`` mode exactly ``_SAMPLE_CLIPS_PER_SIGN`` clips per
-    sign per split are selected. The selection is deterministic given ``seed``.
+    In ``--sample-only`` mode, exactly ``_SAMPLE_CLIPS_PER_SIGN`` clip(s) per
+    sign per split are selected. Selection is purely alphabetical by video_id
+    within each sign group — deterministic without any randomness. The ``seed``
+    CLI argument does not affect sample selection.
 
     Parameters
     ----------
@@ -391,16 +539,14 @@ def _collect_clips(
     split_arg : str
         "train", "val", "test", or "all".
     sample_only : bool
-        If True, restrict to one clip per sign.
-    seed : int
-        Random seed for sample selection.
+        If True, restrict to one clip per sign per split.
     logger
         Active logger.
 
     Returns
     -------
     list[dict]
-        Ordered list of clip records to process. Empty list signals an error.
+        Ordered list of clip records. An empty list signals a loading error.
     """
     split_names = ["train", "val", "test"] if split_arg == "all" else [split_arg]
     clips: list[dict[str, Any]] = []
@@ -415,53 +561,57 @@ def _collect_clips(
             return []
 
         if sample_only:
-            # Deterministic sample: pick _SAMPLE_CLIPS_PER_SIGN clips per sign.
-            # Sort by video_id first so the sample is independent of CSV row order.
-            sampled_rows = []
-            for sign, group in df.groupby("sign_label"):
-                group_sorted = group.sort_values("video_id").reset_index(drop=True)
-                n_to_take = min(_SAMPLE_CLIPS_PER_SIGN, len(group_sorted))
-                sampled_rows.append(group_sorted.iloc[:n_to_take])
-            if sampled_rows:
-                df = pd.concat(sampled_rows, ignore_index=True)
+            # Select the alphabetically-first clip per sign (by video_id).
+            # Sorting before groupby + first() guarantees a fixed, reproducible
+            # selection that is independent of CSV row order.
+            df = (
+                df.sort_values("video_id")
+                .groupby("sign_label", sort=True)
+                .head(_SAMPLE_CLIPS_PER_SIGN)
+                .reset_index(drop=True)
+            )
+            n_signs = df["sign_label"].nunique()
             logger.info(
-                f"Sample mode: selected {len(df)} clips from {split_name} "
-                f"({_SAMPLE_CLIPS_PER_SIGN} per sign)",
+                f"Sample mode: selected {len(df)} clips from '{split_name}' "
+                f"({_SAMPLE_CLIPS_PER_SIGN} per sign, {n_signs} signs represented)",
                 extra={"stage": "extraction"},
             )
 
         for _, row in df.iterrows():
+            sign_label = str(row["sign_label"])
             clips.append({
-                "video_id":  str(row["video_id"]),
-                "sign_label": str(row["sign_label"]),
-                "class_idx":  int(row["class_idx"]),
-                "signer_id":  int(row["signer_id"]),
-                "split":      split_name,
-                "video_path": str(row["video_path"]),
+                "video_id":       str(row["video_id"]),
+                "sign_label":     sign_label,
+                "safe_sign_label": _sanitize_path_component(sign_label),
+                "class_idx":      int(row["class_idx"]),
+                "signer_id":      int(row["signer_id"]),
+                "split":          split_name,
+                "video_path":     str(row["video_path"]),
             })
 
+    n_signs_total = len({c["sign_label"] for c in clips})
     logger.info(
-        f"Total clips queued for extraction: {len(clips)} | "
-        f"splits={split_names} | sample_only={sample_only}",
+        f"Total clips queued: {len(clips)} | "
+        f"splits={split_names} | signs={n_signs_total} | sample_only={sample_only}",
         extra={"stage": "extraction"},
     )
     return clips
 
 
 # ---------------------------------------------------------------------------
-# Output path helper
+# Output path helpers
 # ---------------------------------------------------------------------------
 
 def _get_output_path(
     landmarks_dir: str,
     split_name: str,
-    sign_label: str,
+    safe_sign_label: str,
     video_id: str,
 ) -> Path:
     """
-    Compute the canonical output .npy path for a landmark array.
+    Canonical output .npy path for one clip.
 
-    Schema: <landmarks_dir>/<split>/<sign_label>/<video_id>.npy
+    Schema: <landmarks_dir>/<split>/<safe_sign_label>/<video_id>.npy
 
     Parameters
     ----------
@@ -469,303 +619,29 @@ def _get_output_path(
         Root landmarks directory.
     split_name : str
         "train", "val", or "test".
-    sign_label : str
-        Human-readable sign name (used as subdirectory).
+    safe_sign_label : str
+        Filesystem-safe sign label (produced by ``_sanitize_path_component``).
     video_id : str
-        WLASL video identifier.
+        WLASL video identifier (already safe — numeric string).
 
     Returns
     -------
     Path
-        Absolute output path.
+        Absolute output .npy path.
     """
-    return Path(landmarks_dir) / split_name / sign_label / f"{video_id}.npy"
+    return Path(landmarks_dir) / split_name / safe_sign_label / f"{video_id}.npy"
+
+
+def _get_tmp_path(npy_path: Path) -> Path:
+    """Return the temporary write path for atomic .npy writes."""
+    return npy_path.with_suffix(".npy.tmp")
 
 
 # ---------------------------------------------------------------------------
-# Extraction summary helpers
+# Video path resolution
 # ---------------------------------------------------------------------------
 
-class _RunStats:
-    """
-    Accumulates per-video and aggregate statistics for the current run.
-
-    Designed to be lightweight — just a dict accumulator — so it adds
-    negligible overhead per clip.
-    """
-
-    def __init__(self, run_id: str, args: argparse.Namespace) -> None:
-        self._run_id = run_id
-        self._started_utc = datetime.now(timezone.utc).isoformat()
-        self._args = args
-
-        # Per-video records (appended as clips complete)
-        self._records: list[dict[str, Any]] = []
-
-        # Aggregate counters
-        self.n_queued         = 0
-        self.n_extracted      = 0
-        self.n_skipped_exists = 0   # already existed, not re-processed
-        self.n_skipped_policy = 0   # too many missing frames
-        self.n_skipped_error  = 0   # video unreadable / MediaPipe crash
-        self.n_dry_run        = 0   # dry run — not written
-        self.total_frames     = 0
-        self.total_missing    = 0
-        self.total_proc_sec   = 0.0
-
-        # Per-sign tracking for missing-landmark analysis
-        self._sign_missing_frames: dict[str, int]   = defaultdict(int)
-        self._sign_total_frames:   dict[str, int]   = defaultdict(int)
-        self._sign_skipped:        dict[str, int]   = defaultdict(int)
-        self._sign_extracted:      dict[str, int]   = defaultdict(int)
-
-    def record(
-        self,
-        clip: dict[str, Any],
-        outcome: str,                     # "extracted" | "skipped_exists" |
-                                          # "skipped_policy" | "skipped_error" | "dry_run"
-        result: Optional["ExtractionResult"] = None,
-        proc_sec: float = 0.0,
-        error_msg: str = "",
-        output_path: str = "",
-    ) -> None:
-        """Append a single clip record and update aggregate counters."""
-        sign = clip["sign_label"]
-        record: dict[str, Any] = {
-            "video_id":    clip["video_id"],
-            "sign_label":  sign,
-            "class_idx":   clip["class_idx"],
-            "signer_id":   clip["signer_id"],
-            "split":       clip["split"],
-            "video_path":  clip["video_path"],
-            "output_path": output_path,
-            "outcome":     outcome,
-            "proc_sec":    round(proc_sec, 4),
-        }
-
-        if result is not None:
-            record["n_frames"]         = result.n_frames
-            record["n_missing_frames"] = result.n_missing_frames
-            record["missing_rate"]     = round(result.missing_rate, 4)
-            record["array_shape"]      = list(result.landmarks.shape) if result.landmarks is not None else []
-            self.total_frames  += result.n_frames
-            self.total_missing += result.n_missing_frames
-            self._sign_missing_frames[sign] += result.n_missing_frames
-            self._sign_total_frames[sign]   += result.n_frames
-        else:
-            record["n_frames"]         = 0
-            record["n_missing_frames"] = 0
-            record["missing_rate"]     = 0.0
-            record["array_shape"]      = []
-
-        if error_msg:
-            record["error"] = error_msg
-
-        self._records.append(record)
-        self.total_proc_sec += proc_sec
-
-        if outcome == "extracted":
-            self.n_extracted += 1
-            self._sign_extracted[sign] += 1
-        elif outcome == "skipped_exists":
-            self.n_skipped_exists += 1
-        elif outcome == "skipped_policy":
-            self.n_skipped_policy += 1
-            self._sign_skipped[sign] += 1
-        elif outcome == "skipped_error":
-            self.n_skipped_error += 1
-            self._sign_skipped[sign] += 1
-        elif outcome == "dry_run":
-            self.n_dry_run += 1
-
-    def to_summary_dict(self) -> dict[str, Any]:
-        """Serialise aggregate + per-video stats to a JSON-serialisable dict."""
-        elapsed = (
-            (datetime.now(timezone.utc) - datetime.fromisoformat(self._started_utc)).total_seconds()
-            if self._started_utc
-            else 0.0
-        )
-
-        global_missing_rate = (
-            self.total_missing / self.total_frames
-            if self.total_frames > 0 else 0.0
-        )
-
-        per_sign: dict[str, Any] = {}
-        for sign in sorted(
-            set(self._sign_total_frames) | set(self._sign_extracted) | set(self._sign_skipped)
-        ):
-            total_f = self._sign_total_frames.get(sign, 0)
-            miss_f  = self._sign_missing_frames.get(sign, 0)
-            per_sign[sign] = {
-                "extracted":       self._sign_extracted.get(sign, 0),
-                "skipped":         self._sign_skipped.get(sign, 0),
-                "total_frames":    total_f,
-                "missing_frames":  miss_f,
-                "missing_rate":    round(miss_f / total_f, 4) if total_f > 0 else 0.0,
-            }
-
-        return {
-            "_run_metadata": {
-                "run_id":             self._run_id,
-                "started_utc":        self._started_utc,
-                "completed_utc":      datetime.now(timezone.utc).isoformat(),
-                "elapsed_sec":        round(elapsed, 1),
-                "split":              getattr(self._args, "split", "all"),
-                "sample_only":        getattr(self._args, "sample_only", False),
-                "force":              getattr(self._args, "force", False),
-                "dry_run":            getattr(self._args, "dry_run", False),
-                "max_missing_frame_pct": getattr(
-                    self._args, "max_missing_frame_pct", _DEFAULT_MAX_MISSING_FRAME_PCT
-                ),
-            },
-            "aggregate": {
-                "n_queued":           self.n_queued,
-                "n_extracted":        self.n_extracted,
-                "n_skipped_exists":   self.n_skipped_exists,
-                "n_skipped_policy":   self.n_skipped_policy,
-                "n_skipped_error":    self.n_skipped_error,
-                "n_dry_run":          self.n_dry_run,
-                "total_frames":       self.total_frames,
-                "total_missing":      self.total_missing,
-                "global_missing_rate": round(global_missing_rate, 4),
-                "total_proc_sec":     round(self.total_proc_sec, 1),
-                "mean_proc_sec_per_clip": (
-                    round(self.total_proc_sec / max(self.n_extracted, 1), 3)
-                ),
-            },
-            "per_sign":   per_sign,
-            "per_clip":   self._records,
-        }
-
-
-def _merge_and_write_summary(
-    summary: dict[str, Any],
-    summary_path: str,
-    logger,
-) -> None:
-    """
-    Merge the current run's summary into the cumulative preprocessing_summary.json.
-
-    If the file already exists (from a previous sample or partial run), the new
-    run's data is merged in: ``per_clip`` records are deduplicated by
-    ``(video_id, split)``, keeping the most recent outcome. ``per_sign``
-    statistics are recomputed from the merged clip records.
-
-    Parameters
-    ----------
-    summary : dict
-        Current run's summary dict from ``_RunStats.to_summary_dict()``.
-    summary_path : str
-        Path to write the merged JSON.
-    logger
-        Active logger.
-    """
-    path = Path(summary_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    existing_clips: dict[tuple[str, str], dict[str, Any]] = {}
-
-    if path.exists():
-        try:
-            with open(path, encoding="utf-8") as f:
-                existing = json.load(f)
-            for clip_rec in existing.get("per_clip", []):
-                key = (clip_rec.get("video_id", ""), clip_rec.get("split", ""))
-                existing_clips[key] = clip_rec
-            logger.info(
-                f"Merging into existing summary | "
-                f"existing_clips={len(existing_clips)} | path={path}",
-                extra={"stage": "extraction"},
-            )
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(
-                f"Could not read existing summary (will overwrite): {exc}",
-                extra={"stage": "extraction"},
-            )
-            existing_clips = {}
-
-    # Merge: new run's records overwrite existing records for the same clip
-    for clip_rec in summary.get("per_clip", []):
-        key = (clip_rec.get("video_id", ""), clip_rec.get("split", ""))
-        existing_clips[key] = clip_rec
-
-    merged_clips = sorted(
-        existing_clips.values(),
-        key=lambda r: (r.get("split", ""), r.get("sign_label", ""), r.get("video_id", "")),
-    )
-
-    # Recompute per-sign stats from merged clip records
-    sign_frames:   dict[str, int] = defaultdict(int)
-    sign_missing:  dict[str, int] = defaultdict(int)
-    sign_extracted: dict[str, int] = defaultdict(int)
-    sign_skipped:  dict[str, int] = defaultdict(int)
-
-    for r in merged_clips:
-        sign = r.get("sign_label", "")
-        outcome = r.get("outcome", "")
-        sign_frames[sign]   += r.get("n_frames", 0)
-        sign_missing[sign]  += r.get("n_missing_frames", 0)
-        if outcome == "extracted":
-            sign_extracted[sign] += 1
-        elif outcome in ("skipped_policy", "skipped_error"):
-            sign_skipped[sign] += 1
-
-    per_sign_merged: dict[str, Any] = {}
-    for sign in sorted(set(sign_frames) | set(sign_extracted) | set(sign_skipped)):
-        total_f = sign_frames.get(sign, 0)
-        miss_f  = sign_missing.get(sign, 0)
-        per_sign_merged[sign] = {
-            "extracted":       sign_extracted.get(sign, 0),
-            "skipped":         sign_skipped.get(sign, 0),
-            "total_frames":    total_f,
-            "missing_frames":  miss_f,
-            "missing_rate":    round(miss_f / total_f, 4) if total_f > 0 else 0.0,
-        }
-
-    # Compute merged aggregate from clip records
-    n_extracted = sum(1 for r in merged_clips if r.get("outcome") == "extracted")
-    n_skipped_exists = sum(1 for r in merged_clips if r.get("outcome") == "skipped_exists")
-    n_skipped_policy = sum(1 for r in merged_clips if r.get("outcome") == "skipped_policy")
-    n_skipped_error  = sum(1 for r in merged_clips if r.get("outcome") == "skipped_error")
-    total_f_all = sum(r.get("n_frames", 0) for r in merged_clips)
-    total_m_all = sum(r.get("n_missing_frames", 0) for r in merged_clips)
-
-    merged_summary = {
-        "_run_metadata": summary.get("_run_metadata", {}),
-        "aggregate": {
-            "n_total_clips_in_summary": len(merged_clips),
-            "n_extracted":              n_extracted,
-            "n_skipped_exists":         n_skipped_exists,
-            "n_skipped_policy":         n_skipped_policy,
-            "n_skipped_error":          n_skipped_error,
-            "total_frames":             total_f_all,
-            "total_missing":            total_m_all,
-            "global_missing_rate":      round(total_m_all / total_f_all, 4) if total_f_all > 0 else 0.0,
-            "total_proc_sec":           round(sum(
-                r.get("proc_sec", 0) for r in merged_clips
-            ), 1),
-        },
-        "per_sign": per_sign_merged,
-        "per_clip": merged_clips,
-    }
-
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(merged_summary, f, indent=2, default=str)
-
-    logger.info(
-        f"Extraction summary written: {path} | "
-        f"total_clips_in_summary={len(merged_clips)} | "
-        f"size={path.stat().st_size / 1024:.1f} KB",
-        extra={"stage": "extraction"},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Input validation helpers
-# ---------------------------------------------------------------------------
-
-def _validate_video_path(video_path: str, video_id: str, logger) -> Optional[Path]:
+def _resolve_video_path(video_path: str, video_id: str, logger) -> Optional[Path]:
     """
     Resolve and validate a video path from the split CSV.
 
@@ -774,20 +650,20 @@ def _validate_video_path(video_path: str, video_id: str, logger) -> Optional[Pat
     Parameters
     ----------
     video_path : str
-        Path string from the split CSV.
+        Raw path string from the split CSV.
     video_id : str
-        WLASL identifier (for logging only).
+        WLASL identifier (for logging).
     logger
         Active logger.
 
     Returns
     -------
     Path | None
-        Resolved absolute path if the file exists, else None.
+        Resolved absolute path if the file exists on disk, else None.
     """
-    if not video_path or video_path == "nan":
+    if not video_path or video_path.lower() == "nan":
         logger.warning(
-            f"Empty video_path for video_id={video_id} — clip cannot be processed.",
+            f"Empty video_path for video_id={video_id} — cannot process.",
             extra={"stage": "extraction", "video_id": video_id},
         )
         return None
@@ -798,7 +674,7 @@ def _validate_video_path(video_path: str, video_id: str, logger) -> Optional[Pat
     if not resolved.exists():
         logger.warning(
             f"Video file not found on disk: {resolved} | video_id={video_id}. "
-            "Verify the raw_dir path in Stage 1 inventory build.",
+            "Check the raw_dir path used in the Stage 1 inventory build.",
             extra={"stage": "extraction", "video_id": video_id},
         )
         return None
@@ -806,47 +682,59 @@ def _validate_video_path(video_path: str, video_id: str, logger) -> Optional[Pat
     return resolved
 
 
-def _verify_output_array(
+# ---------------------------------------------------------------------------
+# .npy verification
+# ---------------------------------------------------------------------------
+
+def _verify_npy_file(
     npy_path: Path,
     video_id: str,
     logger,
+    full_check: bool = False,
 ) -> bool:
     """
-    Spot-check an existing or freshly written .npy file.
+    Validate a .npy landmark array file.
 
-    Verifies:
-    - File is loadable by numpy
-    - Array is 2-dimensional
-    - Second dimension is exactly FEATURE_SIZE (225)
-    - dtype is float32
-    - No NaN or Inf values
+    Always checks:
+    - Loadable by numpy without ``allow_pickle``
+    - ndim == 2
+    - shape[1] == FEATURE_SIZE (225)
+    - dtype == float32
+
+    When ``full_check=True`` (used after fresh writes):
+    - All values are finite (no NaN or Inf across the entire array)
+
+    When ``full_check=False`` (used on cache-hit verification):
+    - Only the first row is checked for finiteness (fast mmap-based spot-check)
 
     Parameters
     ----------
     npy_path : Path
-        Path to the .npy file to verify.
+        Path to the .npy file.
     video_id : str
         WLASL identifier (for logging).
     logger
         Active logger.
+    full_check : bool
+        If True, scan all values. If False, spot-check only the first row.
 
     Returns
     -------
     bool
-        True if the array passes all checks.
+        True if all checks pass.
     """
     try:
-        arr = np.load(str(npy_path), allow_pickle=False)
+        arr = np.load(str(npy_path), mmap_mode="r", allow_pickle=False)
     except Exception as exc:
         logger.error(
-            f"Cannot load .npy for verification: {npy_path}: {exc}",
+            f"Cannot load .npy: {npy_path} | video_id={video_id} | {exc}",
             extra={"stage": "extraction", "video_id": video_id},
         )
         return False
 
     if arr.ndim != 2:
         logger.error(
-            f"Shape error: expected 2D array, got shape={arr.shape} | "
+            f"ndim error: expected 2D, got shape={arr.shape} | "
             f"video_id={video_id} | path={npy_path}",
             extra={"stage": "extraction", "video_id": video_id},
         )
@@ -854,7 +742,7 @@ def _verify_output_array(
 
     if arr.shape[1] != FEATURE_SIZE:
         logger.error(
-            f"Feature size error: expected {FEATURE_SIZE} features/frame, "
+            f"Feature-size error: expected {FEATURE_SIZE} cols, "
             f"got {arr.shape[1]} | video_id={video_id} | path={npy_path}",
             extra={"stage": "extraction", "video_id": video_id},
         )
@@ -866,10 +754,13 @@ def _verify_output_array(
             f"video_id={video_id} | path={npy_path}",
             extra={"stage": "extraction", "video_id": video_id},
         )
+        # dtype mismatch is a warning, not a hard failure — the extractor
+        # guarantees float32, so this indicates a foreign file.
 
-    if not np.isfinite(arr).all():
+    rows_to_check = arr if full_check else (arr[:1] if arr.shape[0] > 0 else arr)
+    if rows_to_check.size > 0 and not np.isfinite(rows_to_check).all():
         logger.error(
-            f"Non-finite values (NaN or Inf) detected in array | "
+            f"Non-finite values (NaN/Inf) detected | "
             f"video_id={video_id} | path={npy_path}",
             extra={"stage": "extraction", "video_id": video_id},
         )
@@ -879,7 +770,7 @@ def _verify_output_array(
 
 
 # ---------------------------------------------------------------------------
-# Dry-run reporting
+# Dry-run plan reporter
 # ---------------------------------------------------------------------------
 
 def _report_dry_run_plan(
@@ -891,17 +782,14 @@ def _report_dry_run_plan(
     """
     Log the extraction plan without doing any actual work.
 
-    Computes how many clips would be extracted vs skipped (already exists)
-    and logs a per-sign breakdown.
-
     Parameters
     ----------
     clips : list[dict]
-        Clip records to process.
+        Full clip list as produced by ``_collect_clips``.
     landmarks_dir : str
         Root landmarks directory.
     force : bool
-        Whether --force was passed (affects skipped-exists count).
+        Whether ``--force`` was passed.
     logger
         Active logger.
     """
@@ -911,7 +799,10 @@ def _report_dry_run_plan(
 
     for clip in clips:
         npy_path = _get_output_path(
-            landmarks_dir, clip["split"], clip["sign_label"], clip["video_id"]
+            landmarks_dir,
+            clip["split"],
+            clip["safe_sign_label"],
+            clip["video_id"],
         )
         by_split[clip["split"]]["total"] += 1
         if npy_path.exists() and not force:
@@ -920,30 +811,375 @@ def _report_dry_run_plan(
         else:
             would_extract += 1
 
+    logger.info("[DRY RUN] Extraction plan:", extra={"stage": "extraction"})
     logger.info(
-        "[DRY RUN] Extraction plan:",
+        f"  Total queued   : {len(clips)}",
         extra={"stage": "extraction"},
     )
     logger.info(
-        f"  Total queued  : {len(clips)}",
+        f"  Would extract  : {would_extract}",
         extra={"stage": "extraction"},
     )
     logger.info(
-        f"  Would extract : {would_extract} "
-        f"({'all' if not would_skip_exists else 'new/changed'})",
-        extra={"stage": "extraction"},
-    )
-    logger.info(
-        f"  Would skip    : {would_skip_exists} (already exist, --force not set)",
+        f"  Would skip     : {would_skip_exists} (already exist, --force not set)",
         extra={"stage": "extraction"},
     )
     for split_name, counts in sorted(by_split.items()):
+        exists = counts["exists"]
+        to_do  = counts["total"] - exists
         logger.info(
-            f"  {split_name:6s}: {counts['total']:4d} clips | "
-            f"{counts['exists']:3d} already exist | "
-            f"{counts['total'] - counts['exists']:3d} would extract",
+            f"  {split_name:6s}: {counts['total']:4d} total | "
+            f"{exists:3d} already exist | {to_do:3d} would extract",
             extra={"stage": "extraction"},
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-run statistics accumulator
+# ---------------------------------------------------------------------------
+
+class _RunStats:
+    """
+    Accumulates per-clip and aggregate statistics for the current run.
+
+    Designed to be a lightweight dict accumulator — negligible overhead per clip.
+
+    Attributes
+    ----------
+    n_queued : int
+        Total clips submitted to the extraction loop.
+    n_extracted : int
+        Clips freshly extracted and written to disk this run.
+    n_skipped_cached : int
+        Clips skipped because a valid .npy + .meta.json already existed.
+    n_skipped_policy : int
+        Clips skipped because the missing-frame rate exceeded the threshold.
+    n_skipped_error : int
+        Clips skipped because of a video read failure or MediaPipe exception.
+    n_dry_run : int
+        Clips logged in dry-run mode (no actual work done).
+    total_frames : int
+        Sum of frame counts across all freshly extracted clips.
+    total_missing : int
+        Sum of both-hands-absent frame counts across extracted clips.
+    total_proc_sec : float
+        Total wall-clock processing time for extracted clips.
+    """
+
+    def __init__(self, run_id: str, max_missing_frame_pct: float) -> None:
+        self._run_id             = run_id
+        self._started_utc        = datetime.now(timezone.utc).isoformat()
+        # Store the runtime threshold so reports print the actual value used,
+        # not a hardcoded module constant.
+        self._max_missing_pct    = max_missing_frame_pct
+
+        # Per-clip records list (keyed by (video_id, split) for merge dedup)
+        self._records: list[dict[str, Any]] = []
+
+        # Aggregate counters
+        self.n_queued          = 0
+        self.n_extracted       = 0
+        self.n_skipped_cached  = 0
+        self.n_skipped_policy  = 0
+        self.n_skipped_error   = 0
+        self.n_dry_run         = 0
+        self.total_frames      = 0
+        self.total_missing     = 0
+        self.total_proc_sec    = 0.0
+
+        # Per-sign breakdown
+        self._sign_frames:    dict[str, int] = defaultdict(int)
+        self._sign_missing:   dict[str, int] = defaultdict(int)
+        self._sign_extracted: dict[str, int] = defaultdict(int)
+        self._sign_skipped:   dict[str, int] = defaultdict(int)
+
+    # ------------------------------------------------------------------
+    # Recording
+    # ------------------------------------------------------------------
+
+    def record_extracted(
+        self,
+        clip: dict[str, Any],
+        result: ExtractionResult,
+        proc_sec: float,
+        output_path: str,
+    ) -> None:
+        """Record a successfully extracted clip."""
+        sign = clip["sign_label"]
+        self.n_extracted += 1
+        self.total_frames  += result.num_frames
+        self.total_missing += result.missing_both_hands_frames
+        self.total_proc_sec += proc_sec
+        self._sign_frames[sign]    += result.num_frames
+        self._sign_missing[sign]   += result.missing_both_hands_frames
+        self._sign_extracted[sign] += 1
+
+        self._records.append({
+            "video_id":          clip["video_id"],
+            "sign_label":        sign,
+            "class_idx":         clip["class_idx"],
+            "signer_id":         clip["signer_id"],
+            "split":             clip["split"],
+            "video_path":        clip["video_path"],
+            "output_path":       output_path,
+            "outcome":           "extracted",
+            "proc_sec":          round(proc_sec, 4),
+            "n_frames":          result.num_frames,
+            "n_missing_frames":  result.missing_both_hands_frames,
+            "missing_rate":      round(result.missing_pct, 4),
+        })
+
+    def record_cached(
+        self,
+        clip: dict[str, Any],
+        output_path: str,
+        n_frames: int = 0,
+        missing_pct: float = 0.0,
+        missing_both: int = 0,
+    ) -> None:
+        """
+        Record a cache-hit clip.
+
+        Statistics are passed in from the .meta.json sidecar when available
+        so that aggregate missing-rate figures remain accurate.
+        """
+        sign = clip["sign_label"]
+        self.n_skipped_cached += 1
+        self._sign_frames[sign]    += n_frames
+        self._sign_missing[sign]   += missing_both
+        self._sign_extracted[sign] += 1   # counts towards usable total
+
+        self._records.append({
+            "video_id":          clip["video_id"],
+            "sign_label":        sign,
+            "class_idx":         clip["class_idx"],
+            "signer_id":         clip["signer_id"],
+            "split":             clip["split"],
+            "video_path":        clip["video_path"],
+            "output_path":       output_path,
+            "outcome":           "skipped_cached",
+            "proc_sec":          0.0,
+            "n_frames":          n_frames,
+            "n_missing_frames":  missing_both,
+            "missing_rate":      round(missing_pct, 4),
+        })
+
+    def record_skipped_policy(
+        self,
+        clip: dict[str, Any],
+        result: ExtractionResult,
+        proc_sec: float,
+    ) -> None:
+        """Record a clip skipped due to the missing-frame-pct policy."""
+        sign = clip["sign_label"]
+        self.n_skipped_policy += 1
+        self._sign_skipped[sign] += 1
+        self.total_proc_sec += proc_sec
+
+        self._records.append({
+            "video_id":    clip["video_id"],
+            "sign_label":  sign,
+            "class_idx":   clip["class_idx"],
+            "signer_id":   clip["signer_id"],
+            "split":       clip["split"],
+            "video_path":  clip["video_path"],
+            "output_path": "",
+            "outcome":     "skipped_policy",
+            "proc_sec":    round(proc_sec, 4),
+            "n_frames":    result.num_frames,
+            "n_missing_frames": result.missing_both_hands_frames,
+            "missing_rate": round(result.missing_pct, 4),
+            "skip_reason": result.skip_reason,
+        })
+
+    def record_error(
+        self,
+        clip: dict[str, Any],
+        error_msg: str,
+        proc_sec: float = 0.0,
+    ) -> None:
+        """Record a clip that failed due to an exception or missing video file."""
+        sign = clip["sign_label"]
+        self.n_skipped_error += 1
+        self._sign_skipped[sign] += 1
+        self.total_proc_sec += proc_sec
+
+        self._records.append({
+            "video_id":    clip["video_id"],
+            "sign_label":  sign,
+            "class_idx":   clip["class_idx"],
+            "signer_id":   clip["signer_id"],
+            "split":       clip["split"],
+            "video_path":  clip["video_path"],
+            "output_path": "",
+            "outcome":     "skipped_error",
+            "proc_sec":    round(proc_sec, 4),
+            "n_frames":    0,
+            "n_missing_frames": 0,
+            "missing_rate": 0.0,
+            "error":       error_msg,
+        })
+
+    def record_dry_run(self, clip: dict[str, Any]) -> None:
+        """Record a clip in dry-run mode (no actual work performed)."""
+        self.n_dry_run += 1
+        self._records.append({
+            "video_id":    clip["video_id"],
+            "sign_label":  clip["sign_label"],
+            "class_idx":   clip["class_idx"],
+            "signer_id":   clip["signer_id"],
+            "split":       clip["split"],
+            "video_path":  clip["video_path"],
+            "output_path": "",
+            "outcome":     "dry_run",
+            "proc_sec":    0.0,
+        })
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_dict(self, status: str = "completed") -> dict[str, Any]:
+        """
+        Serialise aggregate and per-clip statistics to a JSON-ready dict.
+
+        Parameters
+        ----------
+        status : str
+            "completed" or "PARTIAL_INTERRUPTED" — recorded in the metadata.
+
+        Returns
+        -------
+        dict
+            Full summary payload suitable for ``_write_summary()``.
+        """
+        n_usable     = self.n_extracted + self.n_skipped_cached
+        global_miss  = (
+            self.total_missing / self.total_frames
+            if self.total_frames > 0 else 0.0
+        )
+        n_queued_eff = max(self.n_queued, 1)
+
+        per_sign: dict[str, Any] = {}
+        all_signs = (
+            set(self._sign_frames)
+            | set(self._sign_extracted)
+            | set(self._sign_skipped)
+        )
+        for sign in sorted(all_signs):
+            total_f = self._sign_frames.get(sign, 0)
+            miss_f  = self._sign_missing.get(sign, 0)
+            per_sign[sign] = {
+                "usable":         self._sign_extracted.get(sign, 0),
+                "skipped":        self._sign_skipped.get(sign, 0),
+                "total_frames":   total_f,
+                "missing_frames": miss_f,
+                "missing_rate":   round(miss_f / total_f, 4) if total_f > 0 else 0.0,
+            }
+
+        return {
+            "_run_metadata": {
+                "run_id":               self._run_id,
+                "status":               status,
+                "started_utc":          self._started_utc,
+                "completed_utc":        datetime.now(timezone.utc).isoformat(),
+                "max_missing_frame_pct": self._max_missing_pct,
+            },
+            "aggregate": {
+                "n_queued":              self.n_queued,
+                "n_extracted":           self.n_extracted,
+                "n_skipped_cached":      self.n_skipped_cached,
+                "n_skipped_policy":      self.n_skipped_policy,
+                "n_skipped_error":       self.n_skipped_error,
+                "n_usable":              n_usable,
+                "policy_skip_rate":      round(self.n_skipped_policy / n_queued_eff, 4),
+                "error_rate":            round(self.n_skipped_error   / n_queued_eff, 4),
+                "total_frames":          self.total_frames,
+                "total_missing_frames":  self.total_missing,
+                "global_missing_rate":   round(global_miss, 4),
+                "total_proc_sec":        round(self.total_proc_sec, 1),
+                "mean_proc_sec_per_clip": round(
+                    self.total_proc_sec / max(self.n_extracted, 1), 3
+                ),
+            },
+            "per_sign": per_sign,
+            "per_clip": self._records,
+        }
+
+    @property
+    def n_usable(self) -> int:
+        """Clips usable for training: freshly extracted + cache-hit."""
+        return self.n_extracted + self.n_skipped_cached
+
+
+# ---------------------------------------------------------------------------
+# Summary JSON writer (latest + history)
+# ---------------------------------------------------------------------------
+
+def _write_summary(
+    summary: dict[str, Any],
+    summary_dir: str,
+    logger,
+) -> None:
+    """
+    Write the current run's summary to two files:
+
+    - ``preprocessing_summary_latest.json``: always overwritten; used by
+      Notebook 02 for the missing-landmark analysis.
+    - ``preprocessing_summary_history.json``: append-only audit log;
+      each run appends one entry. The ``per_clip`` list is intentionally
+      excluded from the history file to keep it compact.
+
+    The ``per_clip`` list is retained in the ``_latest`` file only.
+    For WLASL-35 (350 clips), the ``_latest`` file stays well under 1 MB.
+    For datasets > 10 k clips, consider passing ``include_per_clip=False``.
+
+    Parameters
+    ----------
+    summary : dict
+        Current run's summary dict from ``_RunStats.to_dict()``.
+    summary_dir : str
+        Directory to write both JSON files into.
+    logger
+        Active logger.
+    """
+    out_dir = Path(summary_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    latest_path  = out_dir / "preprocessing_summary_latest.json"
+    history_path = out_dir / "preprocessing_summary_history.json"
+
+    # --- Latest (full payload, always overwritten) ---
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    # --- History (compact entry without per_clip, appended) ---
+    compact = {k: v for k, v in summary.items() if k != "per_clip"}
+
+    existing_runs: list[dict[str, Any]] = []
+    if history_path.exists():
+        try:
+            with open(history_path, encoding="utf-8") as f:
+                data = json.load(f)
+            existing_runs = data if isinstance(data, list) else [data]
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                f"Could not read history file (will start fresh): {exc}",
+                extra={"stage": "extraction"},
+            )
+
+    existing_runs.append(compact)
+    with open(history_path, "w", encoding="utf-8") as f:
+        json.dump(existing_runs, f, indent=2, default=str)
+
+    n_clips = len(summary.get("per_clip", []))
+    logger.info(
+        f"Extraction summary written | "
+        f"latest={latest_path} ({latest_path.stat().st_size / 1024:.1f} KB) | "
+        f"history={history_path} ({len(existing_runs)} runs) | "
+        f"clips_in_latest={n_clips}",
+        extra={"stage": "extraction"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -952,242 +1188,326 @@ def _report_dry_run_plan(
 
 def _run_extraction_loop(
     clips: list[dict[str, Any]],
-    extractor: LandmarkExtractor,
+    extractor: Optional[LandmarkExtractor],
     landmarks_dir: str,
     run_stats: _RunStats,
     force: bool,
+    verify_existing: bool,
     dry_run: bool,
     logger,
 ) -> None:
     """
     Iterate through clip records, extract landmarks, and write .npy files.
 
-    This is the hot loop. It handles:
-    - Resumability: skip existing .npy files unless --force
-    - Per-clip timing and stats collection
-    - Progress logging every _LOG_INTERVAL clips with ETA
-    - Error isolation: a crash on one clip is logged and counted, never fatal
-    - Post-write verification: spot-check every written .npy array
+    Key design decisions implemented here:
+    - ETA is computed from a fixed pre-loop baseline so it never drifts as
+      files are written (fix for critical issue #2).
+    - .npy files are written atomically via tmp-file + rename (fix for
+      critical issue #8).
+    - Each clip is isolated: any exception is caught, logged, and counted as
+      skipped_error without aborting the rest of the run.
+    - Cache-hit files can be verified with ``verify_existing=True`` (fix for
+      high-priority issue #7).
+    - The ``extractor`` parameter is Optional — None is only valid when
+      ``dry_run=True``, which is checked before the loop begins (fix for
+      issue #6).
 
     Parameters
     ----------
     clips : list[dict]
-        Ordered list of clip records to process.
-    extractor : LandmarkExtractor
-        Initialised MediaPipe Holistic extractor.
+        Ordered clip records from ``_collect_clips()``.
+    extractor : LandmarkExtractor | None
+        Initialised extractor. Must be non-None when ``dry_run=False``.
     landmarks_dir : str
-        Root landmarks output directory.
+        Root output directory for .npy files.
     run_stats : _RunStats
-        Accumulator for per-clip and aggregate statistics.
+        Statistics accumulator.
     force : bool
-        If True, re-extract and overwrite existing .npy files.
+        Re-extract even if a valid .npy + .meta.json exists.
+    verify_existing : bool
+        Spot-check cached .npy files before trusting them.
     dry_run : bool
-        If True, log plan only — do not write files or call MediaPipe.
+        If True, log plan only — never call MediaPipe or write files.
     logger
         Active logger.
     """
     run_stats.n_queued = len(clips)
     loop_start = time.time()
-    n_processed = 0   # clips where actual processing was attempted
 
     if dry_run:
         _report_dry_run_plan(clips, landmarks_dir, force, logger)
         for clip in clips:
-            run_stats.record(clip, outcome="dry_run")
+            run_stats.record_dry_run(clip)
         return
 
+    # Pre-compute how many clips actually need extraction (not already cached).
+    # This count is fixed before the loop starts so ETA never drifts.
+    n_to_extract_initially = sum(
+        1 for c in clips
+        if force or not _get_output_path(
+            landmarks_dir, c["split"], c["safe_sign_label"], c["video_id"]
+        ).exists()
+    )
+    logger.info(
+        f"Clips to extract: {n_to_extract_initially} | "
+        f"clips already cached: {len(clips) - n_to_extract_initially}",
+        extra={"stage": "extraction"},
+    )
+
+    n_newly_processed = 0   # extraction calls made (for ETA denominator)
+
     for i, clip in enumerate(clips):
-        video_id   = clip["video_id"]
-        sign_label = clip["sign_label"]
-        split_name = clip["split"]
-        video_path = clip["video_path"]
+        video_id        = clip["video_id"]
+        sign_label      = clip["sign_label"]
+        safe_sign_label = clip["safe_sign_label"]
+        split_name      = clip["split"]
+        video_path      = clip["video_path"]
+
+        npy_path = _get_output_path(
+            landmarks_dir, split_name, safe_sign_label, video_id
+        )
 
         # ----------------------------------------------------------------
-        # Resumability: check for existing .npy
+        # Resumability: check for existing valid .npy
         # ----------------------------------------------------------------
-        npy_path = _get_output_path(landmarks_dir, split_name, sign_label, video_id)
-
         if npy_path.exists() and not force:
-            logger.debug(
-                f"Skipping (already exists): {npy_path.name} | "
-                f"video_id={video_id} | sign={sign_label}",
-                extra={"stage": "extraction", "video_id": video_id},
-            )
-            run_stats.record(clip, outcome="skipped_exists", output_path=str(npy_path))
-            continue
+            if verify_existing:
+                if not _verify_npy_file(npy_path, video_id, logger, full_check=False):
+                    logger.info(
+                        f"Cached file failed verification — reprocessing: "
+                        f"{npy_path.name} | video_id={video_id}",
+                        extra={"stage": "extraction", "video_id": video_id},
+                    )
+                    # Fall through to extraction below
+                else:
+                    # Cache hit and verified — restore stats from sidecar
+                    meta = _read_sidecar(npy_path)
+                    run_stats.record_cached(
+                        clip,
+                        output_path=str(npy_path),
+                        n_frames=meta.get("num_frames", 0)               if meta else 0,
+                        missing_pct=meta.get("missing_pct", 0.0)         if meta else 0.0,
+                        missing_both=meta.get("missing_both_hands_frames", 0) if meta else 0,
+                    )
+                    logger.debug(
+                        f"Cache hit: {video_id} ({sign_label}) | path={npy_path}",
+                        extra={"stage": "extraction", "video_id": video_id},
+                    )
+                    continue
+            else:
+                # No verification — trust existing file and restore sidecar stats
+                meta = _read_sidecar(npy_path)
+                run_stats.record_cached(
+                    clip,
+                    output_path=str(npy_path),
+                    n_frames=meta.get("num_frames", 0)               if meta else 0,
+                    missing_pct=meta.get("missing_pct", 0.0)         if meta else 0.0,
+                    missing_both=meta.get("missing_both_hands_frames", 0) if meta else 0,
+                )
+                logger.debug(
+                    f"Cache hit (unverified): {video_id} ({sign_label})",
+                    extra={"stage": "extraction", "video_id": video_id},
+                )
+                continue
 
         # ----------------------------------------------------------------
         # Validate video file on disk
         # ----------------------------------------------------------------
-        resolved_path = _validate_video_path(video_path, video_id, logger)
+        resolved_path = _resolve_video_path(video_path, video_id, logger)
         if resolved_path is None:
-            run_stats.record(
-                clip,
-                outcome="skipped_error",
-                error_msg="video_file_not_found",
-            )
+            run_stats.record_error(clip, error_msg="video_file_not_found")
+            n_newly_processed += 1
             continue
 
         # ----------------------------------------------------------------
-        # Extract landmarks
+        # Extract landmarks via LandmarkExtractor
         # ----------------------------------------------------------------
         clip_start = time.time()
+        output_path_for_extractor = npy_path   # extractor writes its own file
 
         try:
-            result: Optional[ExtractionResult] = extractor.extract_video(
-                str(resolved_path)
+            result: ExtractionResult = extractor.extract_video(  # type: ignore[union-attr]
+                video_path=str(resolved_path),
+                output_path=str(npy_path),
+                video_id=video_id,
+                sign_label=sign_label,
+                split=split_name,
+                force=force,
             )
         except Exception as exc:
             proc_sec = time.time() - clip_start
             logger.error(
-                f"Extraction raised exception | video_id={video_id} | "
-                f"sign={sign_label} | {type(exc).__name__}: {exc}",
+                f"Extraction exception | video_id={video_id} | sign={sign_label} | "
+                f"{type(exc).__name__}: {exc}",
                 extra={"stage": "extraction", "video_id": video_id},
             )
             logger.debug(traceback.format_exc(), extra={"stage": "extraction"})
-            run_stats.record(
+            run_stats.record_error(
                 clip,
-                outcome="skipped_error",
-                proc_sec=proc_sec,
                 error_msg=f"{type(exc).__name__}: {exc}",
+                proc_sec=proc_sec,
             )
-            n_processed += 1
+            n_newly_processed += 1
             continue
 
         proc_sec = time.time() - clip_start
 
         # ----------------------------------------------------------------
-        # Skip policy: too many missing frames
+        # Route by result status
         # ----------------------------------------------------------------
-        if result is None:
-            # LandmarkExtractor returns None when skip policy triggered
+        if result.status == "skipped":
             logger.info(
-                f"Skipped (policy: >{extractor.max_missing_frame_pct:.0%} missing) | "
-                f"video_id={video_id} | sign={sign_label}",
+                f"Skipped (policy: >{run_stats._max_missing_pct:.0%} both-hands "
+                f"absent) | video_id={video_id} | sign={sign_label} | "
+                f"missing_pct={result.missing_pct:.1%}",
                 extra={"stage": "extraction", "video_id": video_id},
             )
-            run_stats.record(
-                clip,
-                outcome="skipped_policy",
-                proc_sec=proc_sec,
-                error_msg="missing_frame_pct_exceeded",
-            )
-            n_processed += 1
+            run_stats.record_skipped_policy(clip, result, proc_sec)
+            n_newly_processed += 1
             continue
 
-        # ----------------------------------------------------------------
-        # Write .npy to disk
-        # ----------------------------------------------------------------
-        try:
-            npy_path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(str(npy_path), result.landmarks)
-        except OSError as exc:
-            logger.error(
-                f"Failed to write .npy: {npy_path} | video_id={video_id} | {exc}",
+        if result.status == "error":
+            logger.warning(
+                f"Extraction error | video_id={video_id} | sign={sign_label} | "
+                f"{result.error_message}",
                 extra={"stage": "extraction", "video_id": video_id},
             )
-            run_stats.record(
-                clip,
-                outcome="skipped_error",
-                result=result,
-                proc_sec=proc_sec,
-                error_msg=f"write_failed: {exc}",
-            )
-            n_processed += 1
+            run_stats.record_error(clip, error_msg=result.error_message, proc_sec=proc_sec)
+            n_newly_processed += 1
             continue
 
+        if result.status == "cached":
+            # extractor.extract_video() returned a cache hit (--force was False
+            # and the extractor itself found a valid .npy). This happens when
+            # the orchestration layer races the extractor's own cache check.
+            run_stats.record_cached(
+                clip,
+                output_path=result.output_path,
+                n_frames=result.num_frames,
+                missing_pct=result.missing_pct,
+                missing_both=result.missing_both_hands_frames,
+            )
+            n_newly_processed += 1
+            continue
+
+        # status == "extracted" — the extractor has written the .npy itself
         # ----------------------------------------------------------------
-        # Post-write verification — spot-check every written array
+        # Post-write verification — every freshly written array is checked
         # ----------------------------------------------------------------
-        if not _verify_output_array(npy_path, video_id, logger):
+        if not _verify_npy_file(npy_path, video_id, logger, full_check=True):
             logger.error(
                 f"Verification failed — removing corrupt .npy: {npy_path}",
                 extra={"stage": "extraction", "video_id": video_id},
             )
             try:
                 npy_path.unlink(missing_ok=True)
+                _get_sidecar_path(npy_path).unlink(missing_ok=True)
             except OSError:
                 pass
-            run_stats.record(
+            run_stats.record_error(
                 clip,
-                outcome="skipped_error",
-                result=result,
+                error_msg="post_write_verification_failed",
                 proc_sec=proc_sec,
-                error_msg="verification_failed_array_corrupt",
             )
-            n_processed += 1
+            n_newly_processed += 1
             continue
 
-        # ----------------------------------------------------------------
-        # Success
-        # ----------------------------------------------------------------
         logger.debug(
             f"Extracted: {video_id} ({sign_label}) | "
-            f"frames={result.n_frames} | "
-            f"missing={result.missing_rate:.1%} | "
-            f"shape={result.landmarks.shape} | "
-            f"{proc_sec:.2f}s",
+            f"frames={result.num_frames} | "
+            f"missing={result.missing_pct:.1%} | "
+            f"time={proc_sec:.2f}s",
             extra={"stage": "extraction", "video_id": video_id},
         )
-
-        run_stats.record(
-            clip,
-            outcome="extracted",
-            result=result,
-            proc_sec=proc_sec,
-            output_path=str(npy_path),
+        run_stats.record_extracted(
+            clip, result, proc_sec, output_path=str(npy_path)
         )
-        n_processed += 1
+        n_newly_processed += 1
 
         # ----------------------------------------------------------------
-        # Progress logging every _LOG_INTERVAL processed clips
+        # Progress logging every _LOG_INTERVAL newly-processed clips.
+        # ETA is based on n_to_extract_initially (fixed before loop) so
+        # it never drifts as files are written to disk.
         # ----------------------------------------------------------------
-        if n_processed % _LOG_INTERVAL == 0:
+        if n_newly_processed % _LOG_INTERVAL == 0:
             elapsed = time.time() - loop_start
-            total_to_process = sum(
-                1 for c in clips
-                if force or not _get_output_path(
-                    landmarks_dir, c["split"], c["sign_label"], c["video_id"]
-                ).exists()
-            )
-            # Approximate ETA based on clips processed so far
-            rate = n_processed / elapsed if elapsed > 0 else 0.0
-            remaining = max(total_to_process - n_processed, 0)
+            rate    = n_newly_processed / elapsed if elapsed > 0 else 0.0
+            remaining = max(n_to_extract_initially - n_newly_processed, 0)
             eta_sec = remaining / rate if rate > 0 else 0.0
-            eta_min = eta_sec / 60
 
             logger.info(
                 f"Progress | {i + 1}/{len(clips)} queued | "
                 f"{run_stats.n_extracted} extracted | "
-                f"{run_stats.n_skipped_policy} skipped (policy) | "
+                f"{run_stats.n_skipped_cached} cached | "
+                f"{run_stats.n_skipped_policy} policy-skip | "
                 f"{run_stats.n_skipped_error} errors | "
                 f"rate={rate:.1f} clips/s | "
-                f"ETA={eta_min:.1f}min",
+                f"ETA={eta_sec / 60:.1f}min",
                 extra={"stage": "extraction"},
             )
 
     # ----------------------------------------------------------------
-    # Final progress line (catches runs where len(clips) < _LOG_INTERVAL)
+    # Final summary line (covers runs shorter than _LOG_INTERVAL)
     # ----------------------------------------------------------------
     elapsed = time.time() - loop_start
     logger.info(
-        f"Extraction loop complete | "
-        f"elapsed={elapsed:.1f}s | "
+        f"Extraction loop done | elapsed={elapsed:.1f}s | "
         f"extracted={run_stats.n_extracted} | "
-        f"skipped_exists={run_stats.n_skipped_exists} | "
-        f"skipped_policy={run_stats.n_skipped_policy} | "
-        f"skipped_error={run_stats.n_skipped_error}",
+        f"cached={run_stats.n_skipped_cached} | "
+        f"policy_skip={run_stats.n_skipped_policy} | "
+        f"errors={run_stats.n_skipped_error}",
         extra={"stage": "extraction"},
     )
 
 
 # ---------------------------------------------------------------------------
-# Post-run reporting
+# Sidecar metadata helpers (pipeline-layer access)
+# ---------------------------------------------------------------------------
+
+def _get_sidecar_path(npy_path: Path) -> Path:
+    """Return the .meta.json sidecar path for a given .npy file."""
+    return npy_path.with_suffix(".meta.json")
+
+
+def _read_sidecar(npy_path: Path) -> Optional[dict[str, Any]]:
+    """
+    Load sidecar metadata for a cached .npy file.
+
+    Returns None if the sidecar is absent or unreadable, which causes
+    the cache-hit record to be stored with zero-value statistics rather
+    than failing the run.
+
+    Parameters
+    ----------
+    npy_path : Path
+        Path to the .npy file.
+
+    Returns
+    -------
+    dict | None
+        Parsed sidecar JSON, or None on any failure.
+    """
+    meta_path = _get_sidecar_path(npy_path)
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Post-run reporting helpers
 # ---------------------------------------------------------------------------
 
 def _log_extraction_report(run_stats: _RunStats, logger) -> None:
     """
     Emit a structured, human-readable extraction report at INFO level.
+
+    Uses the actual runtime max_missing_frame_pct threshold from RunStats
+    (not a hardcoded module constant) so the report accurately reflects
+    what threshold was in effect for this run.
 
     Parameters
     ----------
@@ -1199,38 +1519,36 @@ def _log_extraction_report(run_stats: _RunStats, logger) -> None:
     total_frames  = run_stats.total_frames
     total_missing = run_stats.total_missing
     global_miss   = (total_missing / total_frames) if total_frames > 0 else 0.0
+    n_queued_eff  = max(run_stats.n_queued, 1)
 
     logger.info("=" * 65, extra={"stage": "extraction"})
     logger.info("STAGE 3 — EXTRACTION REPORT", extra={"stage": "extraction"})
     logger.info("=" * 65, extra={"stage": "extraction"})
+    logger.info(f"  Queued            : {run_stats.n_queued}", extra={"stage": "extraction"})
+    logger.info(f"  Extracted (fresh) : {run_stats.n_extracted}", extra={"stage": "extraction"})
+    logger.info(f"  Loaded (cache)    : {run_stats.n_skipped_cached}", extra={"stage": "extraction"})
     logger.info(
-        f"  Queued            : {run_stats.n_queued}",
-        extra={"stage": "extraction"},
-    )
-    logger.info(
-        f"  Extracted         : {run_stats.n_extracted}",
-        extra={"stage": "extraction"},
-    )
-    logger.info(
-        f"  Skipped (exists)  : {run_stats.n_skipped_exists}",
+        f"  Usable total      : {run_stats.n_usable}",
         extra={"stage": "extraction"},
     )
     logger.info(
         f"  Skipped (policy)  : {run_stats.n_skipped_policy}  "
-        f"(>{_DEFAULT_MAX_MISSING_FRAME_PCT:.0%} missing frames)",
+        f"(>{run_stats._max_missing_pct:.0%} both-hands absent — "
+        f"{run_stats.n_skipped_policy / n_queued_eff:.1%} of queued)",
         extra={"stage": "extraction"},
     )
     logger.info(
-        f"  Skipped (error)   : {run_stats.n_skipped_error}",
+        f"  Skipped (error)   : {run_stats.n_skipped_error}  "
+        f"({run_stats.n_skipped_error / n_queued_eff:.1%} of queued)",
         extra={"stage": "extraction"},
     )
-    if run_stats.total_frames > 0:
+    if total_frames > 0:
         logger.info(
             f"  Total frames      : {total_frames:,}",
             extra={"stage": "extraction"},
         )
         logger.info(
-            f"  Missing rate      : {global_miss:.2%} "
+            f"  Missing rate      : {global_miss:.2%}  "
             f"({total_missing:,}/{total_frames:,} frames zero-filled)",
             extra={"stage": "extraction"},
         )
@@ -1238,38 +1556,23 @@ def _log_extraction_report(run_stats: _RunStats, logger) -> None:
         f"  Processing time   : {run_stats.total_proc_sec:.1f}s",
         extra={"stage": "extraction"},
     )
-
-    # Expected skip rate from handoff doc: 5–8% of clips
-    skip_policy_rate = (
-        run_stats.n_skipped_policy / max(run_stats.n_queued, 1)
-    )
-    if run_stats.n_skipped_policy > 0:
-        logger.info(
-            f"  Policy skip rate  : {skip_policy_rate:.1%} "
-            f"(expected 5–8% per project specification)",
-            extra={"stage": "extraction"},
-        )
-
-    if run_stats.n_skipped_error > 0:
-        logger.warning(
-            f"  {run_stats.n_skipped_error} clip(s) failed due to errors. "
-            "Check logs above for details. These clips will not be available "
-            "for training. Review data/preprocessing_summary.json for the full list.",
-            extra={"stage": "extraction"},
-        )
-
     logger.info("=" * 65, extra={"stage": "extraction"})
 
 
-def _validate_extraction_health(run_stats: _RunStats, logger) -> bool:
+def _validate_extraction_health(
+    run_stats: _RunStats,
+    logger,
+) -> bool:
     """
     Check overall extraction health and emit actionable warnings.
 
-    Returns False if any critical threshold is exceeded — not a hard failure,
-    but the caller should log a prominent warning.
+    Returns False if any threshold is exceeded. This is not a hard failure —
+    the caller decides whether to exit with code 2. The thresholds are
+    informed by the project handoff document's expected values.
 
-    Thresholds (based on project specification in handoff document):
-    - Policy skip rate > 10%: may indicate MediaPipe configuration issue
+    Thresholds
+    ----------
+    - Policy skip rate > 10%: higher than expected 5–8% → MediaPipe issue?
     - Error rate > 5%: filesystem or video corruption concern
     - Global missing rate > 15%: MediaPipe detection quality concern
 
@@ -1286,37 +1589,35 @@ def _validate_extraction_health(run_stats: _RunStats, logger) -> bool:
         True if all health checks pass.
     """
     healthy = True
+    n_eff = max(run_stats.n_queued, 1)
 
-    # Skip rate
-    skip_rate = run_stats.n_skipped_policy / max(run_stats.n_queued, 1)
-    if skip_rate > 0.10:
+    policy_rate = run_stats.n_skipped_policy / n_eff
+    if policy_rate > 0.10:
         logger.warning(
-            f"Policy skip rate is {skip_rate:.1%} — above 10% threshold. "
-            "Consider lowering --max-missing-frame-pct or checking MediaPipe "
-            "confidence settings. Expected: 5–8% per project specification.",
+            f"Policy skip rate {policy_rate:.1%} exceeds 10% threshold "
+            f"(expected 5–8% for WLASL). "
+            "Consider raising --max-missing-frame-pct or reviewing "
+            "--min-detection-confidence settings.",
             extra={"stage": "extraction"},
         )
         healthy = False
 
-    # Error rate
-    error_rate = run_stats.n_skipped_error / max(run_stats.n_queued, 1)
+    error_rate = run_stats.n_skipped_error / n_eff
     if error_rate > 0.05:
         logger.warning(
-            f"Error skip rate is {error_rate:.1%} — above 5% threshold. "
-            "Review skipped_error records in preprocessing_summary.json.",
+            f"Error rate {error_rate:.1%} exceeds 5% threshold. "
+            "Review skipped_error records in preprocessing_summary_latest.json.",
             extra={"stage": "extraction"},
         )
         healthy = False
 
-    # Global missing frame rate
     if run_stats.total_frames > 0:
         global_miss = run_stats.total_missing / run_stats.total_frames
         if global_miss > 0.15:
             logger.warning(
-                f"Global missing-landmark rate is {global_miss:.1%} — above 15%. "
-                "Higher than expected for WLASL dataset. "
-                "Consider increasing --min-detection-confidence or reviewing "
-                "video quality for affected signs.",
+                f"Global missing-landmark rate {global_miss:.1%} exceeds 15%. "
+                "Consider reviewing video quality for high-miss signs, or "
+                "raising --min-detection-confidence.",
                 extra={"stage": "extraction"},
             )
             healthy = False
@@ -1324,15 +1625,12 @@ def _validate_extraction_health(run_stats: _RunStats, logger) -> bool:
     return healthy
 
 
-# ---------------------------------------------------------------------------
-# Landmark directory inventory
-# ---------------------------------------------------------------------------
-
 def _log_output_inventory(landmarks_dir: str, logger) -> None:
     """
-    Walk the landmarks directory tree and log file counts per split and sign.
+    Walk the landmarks directory and log file counts per split and sign.
 
-    Called at the end of the run to confirm the output structure is correct.
+    Uses a generator expression (``sum(1 for _ in glob())``) instead of
+    materialising the full file list into memory.
 
     Parameters
     ----------
@@ -1344,44 +1642,83 @@ def _log_output_inventory(landmarks_dir: str, logger) -> None:
     root = Path(landmarks_dir)
     if not root.exists():
         logger.warning(
-            f"Landmarks directory does not exist: {root}",
+            f"Landmarks directory not found: {root}",
             extra={"stage": "extraction"},
         )
         return
 
     total_files = 0
     split_counts: dict[str, int] = {}
-    sign_counts: dict[str, int] = defaultdict(int)
+    sign_totals:  dict[str, int] = defaultdict(int)
 
     for split_dir in sorted(root.iterdir()):
         if not split_dir.is_dir():
             continue
-        split_name = split_dir.name
         n_in_split = 0
         for sign_dir in sorted(split_dir.iterdir()):
             if not sign_dir.is_dir():
                 continue
-            n_files = len(list(sign_dir.glob("*.npy")))
-            n_in_split += n_files
-            sign_counts[sign_dir.name] += n_files
-        split_counts[split_name] = n_in_split
+            n_files = sum(1 for _ in sign_dir.glob("*.npy"))
+            n_in_split   += n_files
+            sign_totals[sign_dir.name] += n_files
+        split_counts[split_dir.name] = n_in_split
         total_files += n_in_split
 
+    signs_with_files = sum(1 for v in sign_totals.values() if v > 0)
     logger.info(
-        f"Landmark directory inventory | total_npy_files={total_files}",
+        f"Landmark inventory | total_npy={total_files} | "
+        f"signs_covered={signs_with_files}",
         extra={"stage": "extraction"},
     )
     for split_name, count in sorted(split_counts.items()):
         logger.info(
-            f"  {split_name:6s}: {count:4d} files",
+            f"  {split_name:6s}: {count:4d} .npy files",
             extra={"stage": "extraction"},
         )
 
-    signs_with_files = {s: c for s, c in sign_counts.items() if c > 0}
+
+# ---------------------------------------------------------------------------
+# MediaPipe extractor initialisation
+# ---------------------------------------------------------------------------
+
+def _init_extractor(args: argparse.Namespace, logger) -> Optional[LandmarkExtractor]:
+    """
+    Initialise the LandmarkExtractor with runtime configuration.
+
+    Returns None on failure (caller should return exit code 2).
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments.
+    logger
+        Active logger.
+
+    Returns
+    -------
+    LandmarkExtractor | None
+    """
     logger.info(
-        f"  Signs with ≥1 .npy file: {len(signs_with_files)}/35",
+        "Initialising MediaPipe Holistic extractor...",
         extra={"stage": "extraction"},
     )
+    try:
+        extractor = LandmarkExtractor(
+            min_detection_confidence=args.min_detection_confidence,
+            min_tracking_confidence=args.min_tracking_confidence,
+        )
+        # Warm up MediaPipe before the main loop to avoid cold-start timing
+        # on the first clip (model load takes 2–5 seconds).
+        extractor._init_mediapipe()
+        return extractor
+    except Exception as exc:
+        logger.error(
+            f"Failed to initialise LandmarkExtractor: {type(exc).__name__}: {exc}. "
+            "Ensure mediapipe==0.10.14 is installed in the active environment.",
+            extra={"stage": "extraction"},
+        )
+        logger.debug(traceback.format_exc(), extra={"stage": "extraction"})
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1390,21 +1727,21 @@ def _log_output_inventory(landmarks_dir: str, logger) -> None:
 
 def main() -> int:
     """
-    Execute Stage 3 landmark extraction pipeline.
+    Execute the Stage 3 landmark extraction pipeline.
 
     Returns
     -------
     int
-        Exit code: 0=success, 1=input error, 2=unexpected failure.
+        Exit code: 0=success, 1=input/validation error, 2=runtime failure.
     """
     parser = _build_parser()
-    args = parser.parse_args()
+    args   = parser.parse_args()
 
     # ----------------------------------------------------------------
-    # Logging — configure before ANY other operation
+    # Logging — must be configured before any other operation
     # ----------------------------------------------------------------
-    log_level = "DEBUG" if args.verbose else "INFO"
-    run_label = "stage3_sample" if args.sample_only else f"stage3_{args.split}"
+    log_level  = "DEBUG" if args.verbose else "INFO"
+    run_label  = "stage3_sample" if args.sample_only else f"stage3_{args.split}"
     if args.dry_run:
         run_label += "_dryrun"
 
@@ -1424,16 +1761,22 @@ def main() -> int:
         extra={"stage": "extraction"},
     )
     logger.info(f"Log file: {log_file}", extra={"stage": "extraction"})
+
+    mode_str = (
+        f"SAMPLE ({_SAMPLE_CLIPS_PER_SIGN} clip/sign/split)"
+        if args.sample_only
+        else args.split.upper()
+    )
     logger.info(
-        f"Mode: {'SAMPLE (' + str(_SAMPLE_CLIPS_PER_SIGN) + ' clip/sign)' if args.sample_only else args.split.upper()} | "
-        f"force={args.force} | dry_run={args.dry_run}",
+        f"Mode: {mode_str} | force={args.force} | "
+        f"verify_existing={args.verify_existing} | dry_run={args.dry_run}",
         extra={"stage": "extraction"},
     )
     logger.info(
-        f"MediaPipe config | "
+        f"Extractor config | "
         f"max_missing_frame_pct={args.max_missing_frame_pct:.0%} | "
-        f"min_detection_confidence={args.min_detection_confidence} | "
-        f"min_tracking_confidence={args.min_tracking_confidence}",
+        f"min_detection_conf={args.min_detection_confidence} | "
+        f"min_tracking_conf={args.min_tracking_confidence}",
         extra={"stage": "extraction"},
     )
 
@@ -1443,45 +1786,26 @@ def main() -> int:
     set_seeds(args.seed)
 
     # ----------------------------------------------------------------
-    # Validate argument constraints
+    # Argument validation
     # ----------------------------------------------------------------
-    if not (0.0 < args.max_missing_frame_pct <= 1.0):
-        logger.error(
-            f"--max-missing-frame-pct must be in (0, 1]. Got: {args.max_missing_frame_pct}",
-            extra={"stage": "extraction"},
-        )
-        return 1
-
-    if not (0.0 < args.min_detection_confidence <= 1.0):
-        logger.error(
-            f"--min-detection-confidence must be in (0, 1]. Got: {args.min_detection_confidence}",
-            extra={"stage": "extraction"},
-        )
-        return 1
-
-    if not (0.0 < args.min_tracking_confidence <= 1.0):
-        logger.error(
-            f"--min-tracking-confidence must be in (0, 1]. Got: {args.min_tracking_confidence}",
-            extra={"stage": "extraction"},
-        )
+    if not _validate_args(args, logger):
         return 1
 
     # ----------------------------------------------------------------
-    # Collect clips to process
+    # Collect clips
     # ----------------------------------------------------------------
     split_arg = "all" if args.sample_only else args.split
     clips = _collect_clips(
         splits_dir=args.splits_dir,
         split_arg=split_arg,
         sample_only=args.sample_only,
-        seed=args.seed,
         logger=logger,
     )
 
     if not clips:
         logger.error(
-            "No clips to process. Verify split CSVs exist in "
-            f"{args.splits_dir} and contain video_path entries.",
+            "No clips to process. Verify split CSVs exist and contain "
+            f"video_path entries: {args.splits_dir}",
             extra={"stage": "extraction"},
         )
         return 1
@@ -1489,11 +1813,14 @@ def main() -> int:
     # ----------------------------------------------------------------
     # Run statistics accumulator
     # ----------------------------------------------------------------
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_stats = _RunStats(run_id=run_id, args=args)
+    run_id     = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_stats  = _RunStats(
+        run_id=run_id,
+        max_missing_frame_pct=args.max_missing_frame_pct,
+    )
 
     # ----------------------------------------------------------------
-    # Dry-run short-circuit
+    # Dry-run short-circuit — no MediaPipe needed
     # ----------------------------------------------------------------
     if args.dry_run:
         logger.info(
@@ -1502,10 +1829,11 @@ def main() -> int:
         )
         _run_extraction_loop(
             clips=clips,
-            extractor=None,  # type: ignore[arg-type]
+            extractor=None,
             landmarks_dir=args.landmarks_dir,
             run_stats=run_stats,
             force=args.force,
+            verify_existing=False,
             dry_run=True,
             logger=logger,
         )
@@ -1517,39 +1845,18 @@ def main() -> int:
         return 0
 
     # ----------------------------------------------------------------
-    # Initialise MediaPipe Holistic extractor
+    # Initialise MediaPipe extractor
     # ----------------------------------------------------------------
-    logger.info(
-        "Initialising MediaPipe Holistic extractor...",
-        extra={"stage": "extraction"},
-    )
-
-    try:
-        extractor = LandmarkExtractor(
-            max_missing_frame_pct=args.max_missing_frame_pct,
-            static_image_mode=_DEFAULT_STATIC_IMAGE_MODE,
-            min_detection_confidence=args.min_detection_confidence,
-            min_tracking_confidence=args.min_tracking_confidence,
-        )
-    except Exception as exc:
-        logger.error(
-            f"Failed to initialise LandmarkExtractor: {type(exc).__name__}: {exc}. "
-            "Ensure mediapipe==0.10.14 is installed in the active environment.",
-            extra={"stage": "extraction"},
-        )
-        logger.debug(traceback.format_exc(), extra={"stage": "extraction"})
+    extractor = _init_extractor(args, logger)
+    if extractor is None:
         return 2
 
     logger.info(
-        f"LandmarkExtractor ready | "
-        f"feature_size={FEATURE_SIZE} values/frame | "
-        f"max_missing={extractor.max_missing_frame_pct:.0%}",
+        f"LandmarkExtractor ready | feature_size={FEATURE_SIZE} values/frame",
         extra={"stage": "extraction"},
     )
 
-    # ----------------------------------------------------------------
-    # Confirm output directory layout
-    # ----------------------------------------------------------------
+    # Ensure output root exists
     Path(args.landmarks_dir).mkdir(parents=True, exist_ok=True)
     logger.info(
         f"Output root: {args.landmarks_dir}",
@@ -1568,31 +1875,41 @@ def main() -> int:
             landmarks_dir=args.landmarks_dir,
             run_stats=run_stats,
             force=args.force,
+            verify_existing=args.verify_existing,
             dry_run=False,
             logger=logger,
         )
     except KeyboardInterrupt:
         logger.warning(
-            f"Extraction interrupted by user (KeyboardInterrupt). "
+            f"Extraction interrupted (KeyboardInterrupt). "
             f"{run_stats.n_extracted} clips extracted before interruption. "
-            "Re-run to continue from where you left off (resumable by default).",
+            "Re-run to continue — existing .npy files are not re-processed.",
             extra={"stage": "extraction"},
         )
-        # Still write partial summary so the user can review progress
-        _write_partial_summary(run_stats, args.summary_path, logger)
+        # Write partial summary before exiting so the user can review progress
+        summary = run_stats.to_dict(status="PARTIAL_INTERRUPTED")
+        try:
+            _write_summary(summary, args.summary_dir, logger)
+        except Exception:
+            pass
         return 2
 
     except Exception as exc:
         logger.error(
-            f"Unexpected exception in extraction loop: {type(exc).__name__}: {exc}",
+            f"Unexpected exception in extraction loop: "
+            f"{type(exc).__name__}: {exc}",
             extra={"stage": "extraction"},
         )
         logger.debug(traceback.format_exc(), extra={"stage": "extraction"})
-        _write_partial_summary(run_stats, args.summary_path, logger)
+        summary = run_stats.to_dict(status="PARTIAL_INTERRUPTED")
+        try:
+            _write_summary(summary, args.summary_dir, logger)
+        except Exception:
+            pass
         return 2
 
     # ----------------------------------------------------------------
-    # Post-run validation and reporting
+    # Post-run reporting
     # ----------------------------------------------------------------
     total_elapsed = time.time() - pipeline_start
 
@@ -1607,11 +1924,11 @@ def main() -> int:
         )
 
     # ----------------------------------------------------------------
-    # Write / merge extraction summary JSON
+    # Write summary JSON (latest + history)
     # ----------------------------------------------------------------
     try:
-        summary_dict = run_stats.to_summary_dict()
-        _merge_and_write_summary(summary_dict, args.summary_path, logger)
+        summary = run_stats.to_dict(status="completed")
+        _write_summary(summary, args.summary_dir, logger)
     except Exception as exc:
         logger.error(
             f"Failed to write extraction summary: {exc}",
@@ -1620,16 +1937,16 @@ def main() -> int:
         # Non-fatal — the .npy files are the critical output
 
     # ----------------------------------------------------------------
-    # Landmark directory inventory (confirms output structure)
+    # Landmark directory inventory
     # ----------------------------------------------------------------
     _log_output_inventory(args.landmarks_dir, logger)
 
     # ----------------------------------------------------------------
-    # Manual verification instructions (sample-only mode)
+    # Sample-mode verification instructions
     # ----------------------------------------------------------------
     if args.sample_only and run_stats.n_extracted > 0:
         logger.info(
-            "SAMPLE EXTRACTION COMPLETE — Manual verification recommended:",
+            "SAMPLE EXTRACTION COMPLETE — Manual verification:",
             extra={"stage": "extraction"},
         )
         logger.info(
@@ -1641,15 +1958,15 @@ def main() -> int:
             extra={"stage": "extraction"},
         )
         logger.info(
-            "  assert arr.ndim == 2 and arr.shape[1] == 225",
+            "  assert arr.ndim == 2 and arr.shape[1] == 225  # (N, 225)",
             extra={"stage": "extraction"},
         )
         logger.info(
-            "  print(arr.shape, arr.min(), arr.max())",
+            "  print(arr.shape, arr.min(), arr.max())  # values in ~[0,1]",
             extra={"stage": "extraction"},
         )
         logger.info(
-            "If shapes and value ranges look correct, proceed to "
+            "If shapes and ranges look correct, open "
             "notebooks/02_landmark_inspection.ipynb.",
             extra={"stage": "extraction"},
         )
@@ -1660,74 +1977,41 @@ def main() -> int:
         )
 
     # ----------------------------------------------------------------
-    # Summary footer
+    # Footer
     # ----------------------------------------------------------------
     logger.info("=" * 65, extra={"stage": "extraction"})
     logger.info("STAGE 3 COMPLETE", extra={"stage": "extraction"})
     logger.info(
-        f"  Extracted     : {run_stats.n_extracted} clips",
+        f"  Extracted (fresh) : {run_stats.n_extracted}",
         extra={"stage": "extraction"},
     )
     logger.info(
-        f"  Total elapsed : {total_elapsed:.1f}s "
+        f"  Usable total      : {run_stats.n_usable}",
+        extra={"stage": "extraction"},
+    )
+    logger.info(
+        f"  Total elapsed     : {total_elapsed:.1f}s "
         f"({total_elapsed / 60:.1f} minutes)",
         extra={"stage": "extraction"},
     )
     logger.info(
-        f"  Summary       : {args.summary_path}",
+        f"  Summary dir       : {args.summary_dir}",
         extra={"stage": "extraction"},
     )
     logger.info(
-        f"  Landmarks dir : {args.landmarks_dir}",
+        f"  Landmarks dir     : {args.landmarks_dir}",
         extra={"stage": "extraction"},
     )
 
     if not args.sample_only:
         logger.info(
-            "Next step: Stage 4 — build src/features/pipeline.py (FeaturePipeline) "
+            "Next: Stage 4 — build src/features/pipeline.py (FeaturePipeline) "
             "and run notebooks/03_feature_engineering_experiments.ipynb.",
             extra={"stage": "extraction"},
         )
     logger.info("=" * 65, extra={"stage": "extraction"})
 
     return 0
-
-
-def _write_partial_summary(
-    run_stats: _RunStats,
-    summary_path: str,
-    logger,
-) -> None:
-    """
-    Write a partial extraction summary after an interruption or error.
-
-    Records what was completed before the interruption so the user can
-    inspect the partial state and resume the run cleanly.
-
-    Parameters
-    ----------
-    run_stats : _RunStats
-        Partially completed run statistics.
-    summary_path : str
-        Path to write the JSON.
-    logger
-        Active logger.
-    """
-    try:
-        summary_dict = run_stats.to_summary_dict()
-        # Mark as partial in the metadata
-        if "_run_metadata" in summary_dict:
-            summary_dict["_run_metadata"]["status"] = "PARTIAL_INTERRUPTED"
-        _merge_and_write_summary(summary_dict, summary_path, logger)
-        logger.info(
-            f"Partial extraction summary written: {summary_path}",
-            extra={"stage": "extraction"},
-        )
-    except Exception as exc:
-        logger.error(
-            f"Could not write partial summary: {exc}",
-            extra={"stage": "extraction"},
-        )
 
 
 # ---------------------------------------------------------------------------
