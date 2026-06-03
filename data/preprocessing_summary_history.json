@@ -1,0 +1,546 @@
+[
+  {
+    "_run_metadata": {
+      "run_id": "20260602T020025Z",
+      "status": "completed",
+      "started_utc": "2026-06-02T02:00:25.541607+00:00",
+      "completed_utc": "2026-06-02T02:15:46.462697+00:00",
+      "max_missing_frame_pct": 0.3
+    },
+    "aggregate": {
+      "n_queued": 105,
+      "n_extracted": 15,
+      "n_skipped_cached": 0,
+      "n_skipped_policy": 90,
+      "n_skipped_error": 0,
+      "n_usable": 15,
+      "policy_skip_rate": 0.8571,
+      "error_rate": 0.0,
+      "total_frames": 1065,
+      "total_missing_frames": 284,
+      "global_missing_rate": 0.2667,
+      "total_proc_sec": 913.7,
+      "mean_proc_sec_per_clip": 60.912
+    },
+    "per_sign": {
+      "before": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "birthday": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 60,
+        "missing_frames": 18,
+        "missing_rate": 0.3
+      },
+      "black": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "blue": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "book": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "boy": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "can": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 60,
+        "missing_frames": 17,
+        "missing_rate": 0.2833
+      },
+      "candy": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "chair": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "change": {
+        "usable": 2,
+        "skipped": 1,
+        "total_frames": 168,
+        "missing_frames": 44,
+        "missing_rate": 0.2619
+      },
+      "clothes": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "color": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "computer": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 45,
+        "missing_frames": 8,
+        "missing_rate": 0.1778
+      },
+      "cousin": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 73,
+        "missing_frames": 21,
+        "missing_rate": 0.2877
+      },
+      "drink": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "eat": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "family": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "finish": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "friend": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "girl": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 53,
+        "missing_frames": 15,
+        "missing_rate": 0.283
+      },
+      "give": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "go": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "help": {
+        "usable": 2,
+        "skipped": 1,
+        "total_frames": 121,
+        "missing_frames": 25,
+        "missing_rate": 0.2066
+      },
+      "house": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "know": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 52,
+        "missing_frames": 14,
+        "missing_rate": 0.2692
+      },
+      "later": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 84,
+        "missing_frames": 23,
+        "missing_rate": 0.2738
+      },
+      "like": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "many": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "mother": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "name": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 45,
+        "missing_frames": 13,
+        "missing_rate": 0.2889
+      },
+      "now": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "orange": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "thanksgiving": {
+        "usable": 2,
+        "skipped": 1,
+        "total_frames": 266,
+        "missing_frames": 75,
+        "missing_rate": 0.282
+      },
+      "think": {
+        "usable": 0,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "who": {
+        "usable": 1,
+        "skipped": 2,
+        "total_frames": 38,
+        "missing_frames": 11,
+        "missing_rate": 0.2895
+      }
+    }
+  },
+  {
+    "_run_metadata": {
+      "run_id": "20260602T184706Z",
+      "status": "completed",
+      "started_utc": "2026-06-02T18:47:06.913114+00:00",
+      "completed_utc": "2026-06-02T19:12:50.460839+00:00",
+      "extractor_schema": "1.1",
+      "max_missing_frame_pct": 0.3
+    },
+    "aggregate": {
+      "n_queued": 208,
+      "n_extracted": 35,
+      "n_cached": 15,
+      "n_skipped_policy": 158,
+      "n_skipped_error": 0,
+      "n_usable": 50,
+      "policy_skip_rate": 0.7596,
+      "error_rate": 0.0,
+      "total_frames": 1799,
+      "total_decode_failures": 70,
+      "total_missing_both": 253,
+      "global_missing_rate": 0.1463,
+      "total_proc_sec": 1533.2,
+      "mean_proc_sec_per_clip": 43.805
+    },
+    "per_sign": {
+      "before": {
+        "usable": 2,
+        "skipped": 4,
+        "total_frames": 87,
+        "missing_frames": 19,
+        "missing_rate": 0.2184
+      },
+      "birthday": {
+        "usable": 3,
+        "skipped": 2,
+        "total_frames": 144,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "black": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 34,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "blue": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 51,
+        "missing_frames": 10,
+        "missing_rate": 0.1961
+      },
+      "book": {
+        "usable": 2,
+        "skipped": 3,
+        "total_frames": 72,
+        "missing_frames": 8,
+        "missing_rate": 0.1111
+      },
+      "boy": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 31,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "can": {
+        "usable": 2,
+        "skipped": 4,
+        "total_frames": 42,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "candy": {
+        "usable": 1,
+        "skipped": 6,
+        "total_frames": 32,
+        "missing_frames": 7,
+        "missing_rate": 0.2188
+      },
+      "chair": {
+        "usable": 0,
+        "skipped": 5,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "change": {
+        "usable": 2,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "clothes": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 37,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "color": {
+        "usable": 2,
+        "skipped": 4,
+        "total_frames": 142,
+        "missing_frames": 18,
+        "missing_rate": 0.1268
+      },
+      "computer": {
+        "usable": 3,
+        "skipped": 4,
+        "total_frames": 104,
+        "missing_frames": 14,
+        "missing_rate": 0.1346
+      },
+      "cousin": {
+        "usable": 1,
+        "skipped": 8,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "drink": {
+        "usable": 1,
+        "skipped": 7,
+        "total_frames": 79,
+        "missing_frames": 22,
+        "missing_rate": 0.2785
+      },
+      "eat": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 52,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "family": {
+        "usable": 0,
+        "skipped": 5,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "finish": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 33,
+        "missing_frames": 6,
+        "missing_rate": 0.1818
+      },
+      "friend": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 60,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "girl": {
+        "usable": 2,
+        "skipped": 5,
+        "total_frames": 60,
+        "missing_frames": 17,
+        "missing_rate": 0.2833
+      },
+      "give": {
+        "usable": 0,
+        "skipped": 5,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "go": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 35,
+        "missing_frames": 8,
+        "missing_rate": 0.2286
+      },
+      "help": {
+        "usable": 4,
+        "skipped": 3,
+        "total_frames": 128,
+        "missing_frames": 17,
+        "missing_rate": 0.1328
+      },
+      "house": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 46,
+        "missing_frames": 8,
+        "missing_rate": 0.1739
+      },
+      "know": {
+        "usable": 2,
+        "skipped": 4,
+        "total_frames": 69,
+        "missing_frames": 19,
+        "missing_rate": 0.2754
+      },
+      "later": {
+        "usable": 2,
+        "skipped": 5,
+        "total_frames": 37,
+        "missing_frames": 10,
+        "missing_rate": 0.2703
+      },
+      "like": {
+        "usable": 0,
+        "skipped": 6,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "many": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 44,
+        "missing_frames": 9,
+        "missing_rate": 0.2045
+      },
+      "mother": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 76,
+        "missing_frames": 21,
+        "missing_rate": 0.2763
+      },
+      "name": {
+        "usable": 2,
+        "skipped": 3,
+        "total_frames": 55,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "now": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 43,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "orange": {
+        "usable": 0,
+        "skipped": 6,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "thanksgiving": {
+        "usable": 4,
+        "skipped": 2,
+        "total_frames": 92,
+        "missing_frames": 22,
+        "missing_rate": 0.2391
+      },
+      "think": {
+        "usable": 2,
+        "skipped": 5,
+        "total_frames": 114,
+        "missing_frames": 18,
+        "missing_rate": 0.1579
+      },
+      "who": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      }
+    }
+  }
+]
