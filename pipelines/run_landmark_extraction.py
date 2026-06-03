@@ -32,21 +32,57 @@ Each file contains a float32 array of shape ``(num_frames, 225)`` where:
     [126:225] pose       — 33 landmarks × (x, y, z)
 
 Alongside every .npy file a sibling .meta.json sidecar is written by the
-extractor (v1.1 schema). The sidecar stores per-clip detection statistics
-including the new ``decode_failure_frames`` field, which separates transient
-OpenCV codec errors from genuine MediaPipe detection failures.
+extractor (v1.2 schema). The sidecar stores per-clip detection statistics
+including ``detected_frames`` (frames where at least one hand was detected,
+the primary v1.2 skip criterion) and ``decode_failure_frames`` (separate
+from genuine MediaPipe detection failures).
 
 IMPORTANT: Arrays store the clip's actual frame count — they are NOT padded
 to seq_len=30. Padding/truncation are deferred to ``FeaturePipeline`` (Stage 4)
 so the same .npy files serve all sequence-length ablation experiments
 ({20, 30, 40, 60} frames) without any re-extraction.
 
+Skip policy — v1.2 (dual-criterion absolute)
+---------------------------------------------
+Notebook 02 analysis of the sample run revealed that the old ratio-based
+policy (skip if missing_both_pct > 30%) was catastrophically wrong for WLASL:
+
+    Expected skip rate : 5–8%
+    Observed skip rate : 76% (158/208 clips skipped)
+    Projected usable   : ~84 clips from 350 → ~2.4 clips per class
+    Impact             : 70% accuracy target mathematically impossible
+
+Root cause: WLASL clips contain large temporal dead zones (preparation
+movements, idle frames, lead-in/lead-out segments) that inflate the ratio
+without reducing training value. One-handed signs also naturally inflate
+``missing_left`` or ``missing_right``, and when neither hand overlaps, the
+``missing_both`` rate approaches the percentage of "resting" frames.
+
+The correct question is "does this clip contain enough usable frames for
+the LSTM to learn from?" ``detected_frames`` directly answers this.
+
+v1.2 dual-criterion policy (implemented in extractor.py, enforced here):
+
+    KEEP clip if ALL of the following hold:
+      (a) detected_frames >= min_detected_frames  (default: 15)
+              At least 15 frames where at least one hand was detected.
+      (b) missing_pct <= max_missing_pct          (default: 0.95)
+              Catastrophe filter: 95%+ both-absent means the clip is
+              genuinely unusable (corrupt file, signer never visible).
+
+    SKIP clip if either criterion fails.
+
+Expected outcomes with v1.2:
+    Expected skip rate : ~3–6%
+    Expected usable    : ~330–340 clips from 350
+    Mean clips/class   : ~9.4–9.7
+
 Resumability
 ------------
-The extractor itself checks for a valid .npy + .meta.json pair before doing any
-work (shape, dtype, schema version v1.1, full finiteness scan). This pipeline
-respects those cache hits and adds an optional ``--verify-existing`` path to
-spot-check cached files independently before trusting them.
+The extractor itself checks for a valid .npy + .meta.json pair before doing
+any work (shape, dtype, schema version v1.2, full finiteness scan). This
+pipeline respects those cache hits and adds an optional ``--verify-existing``
+path to spot-check cached files independently before trusting them.
 
 Summary outputs
 ---------------
@@ -55,36 +91,32 @@ Two pipeline-level JSON summary files are written after each run:
     data/preprocessing_summary_latest.json  — current run (always overwritten)
     data/preprocessing_summary_history.json — append-only audit log
 
-These are written by ``_write_pipeline_summary()`` in this script and contain
-pipeline-layer metadata (CLI args, run mode, health-check results) in addition
-to the per-clip statistics delegated to the extractor's ``ExtractionStats``.
-They are distinct from the extractor-internal summaries that
-``LandmarkExtractor.extract_dataset()`` writes when called directly; this
-script drives extraction clip-by-clip via ``extract_video()`` so it controls
-the summary format entirely.
+A ``landmark_inventory.csv`` is also written by the extractor after each
+batch run. Notebook 02 loads this CSV for the missing-landmark analysis.
 
-A ``landmark_inventory.csv`` is written by the extractor after each batch run
-(via ``write_landmark_inventory``). Notebook 02 loads this CSV for the
-missing-landmark analysis.
+Per-hand missing rate fix (Notebook 02 Bug 9.1)
+-------------------------------------------------
+The original v1.1 pipeline zeroed ``n_missing_left``, ``n_missing_right``,
+and ``n_missing_pose`` in ``_finalise_run()``, making the per-hand columns in
+``landmark_inventory.csv`` always 0.0. This is fixed in v1.2 by propagating
+per-hand missing counts through ``_RunStats.record_extracted()`` and
+``_RunStats.record_cached()``, and correctly mapping them in ``_finalise_run()``.
 
-Schema alignment with extractor.py v1.1
+Schema alignment with extractor.py v1.2
 -----------------------------------------
-This script is aligned with ``src/features/extractor.py`` schema version 1.1.
-Key behavioural changes from v1.0 that are reflected here:
+This script is fully aligned with ``src/features/extractor.py`` schema
+version 1.2. Key changes from v1.1:
 
-  - ``decode_failure_frames`` field is now propagated through all
+  - ``detected_frames`` field is now propagated through all
     ``_RunStats.record_*`` methods and included in summary outputs.
-  - ``missing_pct`` is computed over successfully-decoded frames only (not
-    total frames). Health-check thresholds have been adjusted accordingly:
-    a global missing rate > 15% now indicates genuine MediaPipe quality
-    issues, not codec noise inflating the denominator.
-  - Cache-hit clips return ``status="cached"`` (not ``status="skipped"``).
-    The routing logic in ``_run_extraction_loop`` has been updated to match.
-  - The extractor handles .npy writes internally (no atomic tmp-file logic
-    needed here). Post-write verification is still performed via
-    ``_verify_npy_file()`` as an independent safety check.
-  - ``write_landmark_inventory`` is called inside ``_finalise_run()`` via the
-    extractor's results list, not called a second time from this script.
+  - Primary skip criterion is ``detected_frames < min_detected_frames``,
+    not a missing ratio. The ``--max-missing-frame-pct`` CLI argument now
+    sets the catastrophe filter threshold (default: 0.95) rather than
+    the primary threshold (which was 0.30 in v1.1).
+  - New ``--min-detected-frames`` CLI argument controls the primary criterion.
+  - Cache-hit clips restore ``detected_frames`` from .meta.json sidecar.
+  - Health check thresholds recalibrated for v1.2 expected outcomes.
+  - Per-hand missing rate bug (Notebook 02 Bug 9.1) is fixed.
 
 Usage
 -----
@@ -106,10 +138,10 @@ Verify existing cached files before trusting them:
 Dry run (validate inputs and log plan, write nothing):
     python pipelines/run_landmark_extraction.py --dry-run
 
-Override MediaPipe thresholds:
-    python pipelines/run_landmark_extraction.py --split all \
-        --max-missing-frame-pct 0.40 \
-        --min-detection-confidence 0.4
+Override skip policy thresholds:
+    python pipelines/run_landmark_extraction.py --split all \\
+        --min-detected-frames 20 \\
+        --max-missing-frame-pct 0.90
 
 Verbose debug logging:
     python pipelines/run_landmark_extraction.py --sample-only --verbose
@@ -132,7 +164,7 @@ Design principles
 - Post-write verification independent of extractor's own cache check
 - Per-clip exception isolation: one bad video never aborts the whole run
 - ETA computed from a fixed pre-loop count — never drifts as files are written
-- Aligned with extractor.py schema version 1.1 throughout
+- Aligned with extractor.py schema version 1.2 throughout
 """
 
 from __future__ import annotations
@@ -165,14 +197,22 @@ from src.utils.logger import configure_logging, get_logger
 from src.utils.reproducibility import set_seeds
 
 # ---------------------------------------------------------------------------
-# Feature modules
+# Feature modules — import constants first (no heavy deps), then extractor
 # ---------------------------------------------------------------------------
+from src.features.constants import (
+    FEATURE_SIZE,
+    EXTRACTOR_SCHEMA_VERSION,
+    MIN_DETECTED_FRAMES_DEFAULT,
+    MAX_MISSING_PCT_CATASTROPHE,
+    HEALTH_POLICY_SKIP_RATE_WARN,
+    HEALTH_ERROR_RATE_WARN,
+    HEALTH_GLOBAL_MISSING_RATE_WARN,
+)
 from src.features.extractor import (
     LandmarkExtractor,
     ExtractionResult,
     write_landmark_inventory,
 )
-from src.features.constants import FEATURE_SIZE, EXTRACTOR_SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -186,22 +226,10 @@ _DEFAULT_LOG_DIR       = str(_REPO_ROOT / "logs")
 _VALID_SPLITS = ("train", "val", "test", "all")
 _LOG_INTERVAL = 50    # clips between progress log lines
 
-# Must match extractor.py v1.1 default: min(3, available_clips) per sign
+# Must match extractor.py default: min(3, available_clips) per sign
 _SAMPLE_CLIPS_PER_SIGN = 3
 
 _SEED = 42
-
-# Extractor defaults kept in sync with extractor.py module constants
-_DEFAULT_MAX_MISSING_FRAME_PCT = 0.30
-_DEFAULT_MIN_DETECTION_CONF    = 0.5
-_DEFAULT_MIN_TRACKING_CONF     = 0.5
-
-# Health check thresholds (calibrated for v1.1 missing_pct denominator)
-# With correctly-computed missing_pct (over successfully-decoded frames only),
-# these are tighter than the v1.0 values that were inflated by codec errors.
-_HEALTH_POLICY_SKIP_RATE_WARN  = 0.10   # >10% skipped by missing-rate policy
-_HEALTH_ERROR_RATE_WARN        = 0.05   # >5% clips with extraction errors
-_HEALTH_GLOBAL_MISSING_RATE    = 0.15   # >15% of frames missing both hands
 
 # Characters unsafe as filesystem path components on any OS
 _UNSAFE_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -213,7 +241,7 @@ _UNSAFE_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 def _sanitize_path_component(name: str) -> str:
     """
-    Replace characters that are unsafe in a filesystem path component.
+    Replace characters unsafe in a filesystem path component with underscores.
 
     WLASL sign labels are plain ASCII words; this is a safety net for edge
     cases and Windows compatibility rather than routine processing.
@@ -227,13 +255,6 @@ def _sanitize_path_component(name: str) -> str:
     -------
     str
         Safe path component, guaranteed non-empty.
-
-    Examples
-    --------
-    >>> _sanitize_path_component("before")
-    'before'
-    >>> _sanitize_path_component("sign/with:special*chars")
-    'sign_with_special_chars'
     """
     safe = _UNSAFE_PATH_CHARS.sub("_", name)
     safe = safe.strip(". ")
@@ -253,12 +274,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "Reads split CSVs produced by Stage 1, runs MediaPipe Holistic on every\n"
             "video clip, and writes (num_frames, 225) float32 .npy arrays to\n"
             "data/landmarks/<split>/<sign>/<video_id>.npy.\n\n"
-            "Aligned with extractor.py schema version 1.1:\n"
-            "  - decode_failure_frames tracked separately from detection failures\n"
-            "  - missing_pct denominator is successfully_decoded_frames (not total)\n"
-            "  - sidecar .meta.json schema version field enforced on cache reads\n\n"
+            "Extractor schema version: 1.2 (dual-criterion absolute skip policy)\n"
+            "  Primary criterion : detected_frames >= min_detected_frames (default: 15)\n"
+            "  Secondary criterion: missing_both_pct <= max_missing_pct (default: 0.95)\n\n"
+            "Notebook 02 analysis found the previous 30% ratio policy produced a 76%\n"
+            "skip rate on WLASL (expected 5-8%). The v1.2 policy is expected to retain\n"
+            "~94-97% of clips.\n\n"
             "Always run --sample-only first to validate the extractor before\n"
-            "committing to the full 30–90 minute extraction."
+            "committing to the full 30-90 minute extraction."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -266,7 +289,7 @@ Examples:
   # Stage 2 validation gate (3 clips/sign, all splits — ~2-5 minutes)
   python pipelines/run_landmark_extraction.py --sample-only
 
-  # Full extraction, all splits (30-90 minutes)
+  # Full extraction, all splits (30-90 minutes) — PRIMARY USAGE
   python pipelines/run_landmark_extraction.py --split all
 
   # Training split only
@@ -275,7 +298,7 @@ Examples:
   # Force re-extraction (overwrite existing .npy + .meta.json)
   python pipelines/run_landmark_extraction.py --split all --force
 
-  # Resume and verify previously cached files
+  # Resume and verify previously cached files (after interruption)
   python pipelines/run_landmark_extraction.py --split all --verify-existing
 
   # Dry run — validate inputs and log plan, write nothing
@@ -284,9 +307,13 @@ Examples:
   # Verbose debug output
   python pipelines/run_landmark_extraction.py --sample-only --verbose
 
-  # Override MediaPipe thresholds (lower confidence for difficult clips)
+  # Override v1.2 skip policy thresholds
   python pipelines/run_landmark_extraction.py --split all \\
-      --max-missing-frame-pct 0.40 --min-detection-confidence 0.4
+      --min-detected-frames 20 --max-missing-frame-pct 0.90
+
+  # Run threshold diagnostic on existing sample summary
+  python pipelines/run_landmark_extraction.py --threshold-diagnostic \\
+      data/preprocessing_summary_latest.json
 
 Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         """,
@@ -351,6 +378,17 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         metavar="{train,val,test,all}",
         help="Which split(s) to process (default: all).",
     )
+    mode_group.add_argument(
+        "--threshold-diagnostic",
+        metavar="SUMMARY_JSON",
+        help=(
+            "Run a skip-threshold sensitivity analysis on an existing "
+            "preprocessing_summary_latest.json and exit. Prints expected "
+            "retention at multiple threshold values. "
+            "Useful for selecting optimal --min-detected-frames before "
+            "committing to a full extraction run."
+        ),
+    )
 
     # ----------------------------------------------------------------
     # Behaviour flags
@@ -361,7 +399,8 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
         help=(
             "Re-extract and overwrite .npy + .meta.json files that already exist. "
             "Without this flag, existing valid files are skipped (resumable by default). "
-            "Implies --verify-existing is redundant (will be warned)."
+            "Note: cached files that pass validation are always skipped unless --force "
+            "is set, even if their sidecar schema version is current."
         ),
     )
     parser.add_argument(
@@ -390,41 +429,55 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
     )
 
     # ----------------------------------------------------------------
-    # Extractor configuration
+    # v1.2 Skip policy configuration
     # ----------------------------------------------------------------
+    parser.add_argument(
+        "--min-detected-frames",
+        type=int,
+        default=MIN_DETECTED_FRAMES_DEFAULT,
+        metavar="N",
+        help=(
+            "PRIMARY skip criterion (v1.2): minimum number of frames where at "
+            "least one hand must be detected for the clip to be retained. "
+            f"Default: {MIN_DETECTED_FRAMES_DEFAULT}. "
+            "Clips with fewer detected frames are skipped with reason "
+            "'insufficient_detected_frames'. "
+            "Notebook 02 analysis: 15 is the floor below which there is "
+            "insufficient temporal context for seq_len=20 training."
+        ),
+    )
     parser.add_argument(
         "--max-missing-frame-pct",
         type=float,
-        default=_DEFAULT_MAX_MISSING_FRAME_PCT,
+        default=MAX_MISSING_PCT_CATASTROPHE,
         metavar="RATIO",
         help=(
-            "Skip a clip if the fraction of *successfully decoded* frames where "
-            "both hands are absent exceeds this threshold "
-            f"(default: {_DEFAULT_MAX_MISSING_FRAME_PCT}). "
-            "Note: in extractor v1.1, decode failures (OpenCV codec errors) are "
-            "excluded from this denominator, giving an accurate MediaPipe-only "
-            "missing rate."
+            "SECONDARY skip criterion — catastrophe filter (v1.2): skip if "
+            "the fraction of successfully-decoded frames with BOTH hands absent "
+            f"exceeds this threshold. Default: {MAX_MISSING_PCT_CATASTROPHE} (95%%). "
+            "This catches corrupt files and clips where the signer is never visible. "
+            "Note: in v1.1 this was the PRIMARY criterion at 0.30, which produced "
+            "a 76%% skip rate on WLASL. In v1.2 it is a catastrophe filter only."
         ),
     )
     parser.add_argument(
         "--min-detection-confidence",
         type=float,
-        default=_DEFAULT_MIN_DETECTION_CONF,
+        default=0.5,
         metavar="CONF",
         help=(
-            f"MediaPipe Holistic minimum detection confidence "
-            f"(default: {_DEFAULT_MIN_DETECTION_CONF}). "
-            "Must be identical between extraction and inference (Stage 7)."
+            "MediaPipe Holistic minimum detection confidence (default: 0.5). "
+            "MUST be identical between extraction (Stage 3) and inference (Stage 7)."
         ),
     )
     parser.add_argument(
         "--min-tracking-confidence",
         type=float,
-        default=_DEFAULT_MIN_TRACKING_CONF,
+        default=0.5,
         metavar="CONF",
         help=(
-            f"MediaPipe Holistic minimum tracking confidence "
-            f"(default: {_DEFAULT_MIN_TRACKING_CONF})."
+            "MediaPipe Holistic minimum tracking confidence (default: 0.5). "
+            "MUST be identical between extraction (Stage 3) and inference (Stage 7)."
         ),
     )
     parser.add_argument(
@@ -440,6 +493,139 @@ Exit codes: 0=success, 1=input error/no clips, 2=unexpected failure
     )
 
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Threshold diagnostic (Notebook 02 recommendation, Section 10.3)
+# ---------------------------------------------------------------------------
+
+def run_threshold_diagnostic(summary_json_path: str, logger) -> int:
+    """
+    Print skip-threshold sensitivity analysis from an existing summary JSON.
+
+    Reads the per-clip records from ``preprocessing_summary_latest.json``
+    and prints expected retention at multiple ``min_detected_frames`` values.
+    This helps select the optimal threshold before committing to a full run.
+
+    Uses ``detected_frames`` (v1.2 primary criterion) rather than
+    ``missing_pct`` (v1.1 ratio criterion).
+
+    Parameters
+    ----------
+    summary_json_path : str
+        Path to preprocessing_summary_latest.json.
+    logger
+        Active logger.
+
+    Returns
+    -------
+    int
+        Exit code: 0 on success, 1 on error.
+    """
+    path = Path(summary_json_path)
+    if not path.exists():
+        logger.error(
+            f"Summary JSON not found: {path}. "
+            "Run --sample-only first to generate it.",
+            extra={"stage": "extraction"},
+        )
+        return 1
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            summary = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error(
+            f"Could not read summary JSON: {exc}",
+            extra={"stage": "extraction"},
+        )
+        return 1
+
+    # Support both pipeline-level summary (_RunStats.to_dict) and
+    # extractor-level summary (ExtractionStats.to_dict) formats
+    per_clip = summary.get("per_clip", [])
+    if not per_clip:
+        logger.error(
+            "No per_clip data found in summary JSON. "
+            "The file may be from an older run or may be the history file.",
+            extra={"stage": "extraction"},
+        )
+        return 1
+
+    # Collect detected_frames and missing_pct for all non-error clips
+    records = [
+        {
+            "detected_frames": r.get("detected_frames", r.get("n_frames", 0)),
+            "missing_pct":     r.get("missing_pct", 0.0),
+        }
+        for r in per_clip
+        if r.get("outcome", r.get("status", "error")) != "error"
+    ]
+    total = len(records)
+
+    if total == 0:
+        logger.error(
+            "No non-error clips found in per_clip data.",
+            extra={"stage": "extraction"},
+        )
+        return 1
+
+    thresholds_detected = [5, 10, 15, 20, 25, 30]
+    thresholds_missing  = [0.70, 0.80, 0.90, 0.95, 1.00]
+
+    logger.info("=" * 65, extra={"stage": "extraction"})
+    logger.info("THRESHOLD DIAGNOSTIC", extra={"stage": "extraction"})
+    logger.info(
+        f"  Based on {total} clips from: {path}",
+        extra={"stage": "extraction"},
+    )
+    logger.info("=" * 65, extra={"stage": "extraction"})
+
+    logger.info(
+        "PRIMARY CRITERION: min_detected_frames (v1.2)",
+        extra={"stage": "extraction"},
+    )
+    logger.info(
+        f"  {'min_detected':>14} | {'Retained':>10} | {'Skipped':>10} | {'Ret. rate':>10}",
+        extra={"stage": "extraction"},
+    )
+    logger.info("  " + "-" * 52, extra={"stage": "extraction"})
+    for t in thresholds_detected:
+        retained = sum(1 for r in records if r["detected_frames"] >= t)
+        skipped  = total - retained
+        logger.info(
+            f"  {t:>14} | {retained:>10} | {skipped:>10} | {retained/total:>10.1%}",
+            extra={"stage": "extraction"},
+        )
+
+    logger.info("", extra={"stage": "extraction"})
+    logger.info(
+        "SECONDARY CRITERION: max_missing_pct — catastrophe filter (v1.2)",
+        extra={"stage": "extraction"},
+    )
+    logger.info(
+        f"  {'max_missing_pct':>14} | {'Retained':>10} | {'Skipped':>10} | {'Ret. rate':>10}",
+        extra={"stage": "extraction"},
+    )
+    logger.info("  " + "-" * 52, extra={"stage": "extraction"})
+    for t in thresholds_missing:
+        retained = sum(1 for r in records if r["missing_pct"] <= t)
+        skipped  = total - retained
+        logger.info(
+            f"  {t:>14.0%} | {retained:>10} | {skipped:>10} | {retained/total:>10.1%}",
+            extra={"stage": "extraction"},
+        )
+
+    logger.info("", extra={"stage": "extraction"})
+    logger.info(
+        f"Recommended v1.2 defaults: "
+        f"--min-detected-frames {MIN_DETECTED_FRAMES_DEFAULT} "
+        f"--max-missing-frame-pct {MAX_MISSING_PCT_CATASTROPHE}",
+        extra={"stage": "extraction"},
+    )
+    logger.info("=" * 65, extra={"stage": "extraction"})
+
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +649,13 @@ def _validate_args(args: argparse.Namespace, logger) -> bool:
         True if all constraints pass; False signals the caller to exit(1).
     """
     valid = True
+
+    if args.min_detected_frames < 1:
+        logger.error(
+            f"--min-detected-frames must be >= 1. Got: {args.min_detected_frames}",
+            extra={"stage": "extraction"},
+        )
+        valid = False
 
     if not (0.0 < args.max_missing_frame_pct <= 1.0):
         logger.error(
@@ -758,10 +951,6 @@ def _verify_npy_file(
     With ``full_check=False`` (fast spot-check on cache-hit verification):
     - Only the first row is checked for finiteness
 
-    Note: This is complementary to the extractor's own ``_try_load_cached``
-    validation. Running both on a freshly extracted file provides defence-in-
-    depth against partial writes or memory corruption.
-
     Parameters
     ----------
     npy_path : Path
@@ -811,9 +1000,7 @@ def _verify_npy_file(
             "The extractor guarantees float32 — this suggests a foreign file.",
             extra={"stage": "extraction", "video_id": video_id},
         )
-        # Dtype mismatch is a warning, not a hard failure here. The extractor
-        # raises on dtype mismatch during its own cache validation; we simply
-        # flag it in the pipeline layer for visibility.
+        # Dtype mismatch is a warning, not a hard failure here.
 
     rows_to_check = arr if full_check else (arr[:1] if arr.shape[0] > 0 else arr)
     if rows_to_check.size > 0 and not np.isfinite(rows_to_check).all():
@@ -837,13 +1024,7 @@ def _read_sidecar(npy_path: Path) -> Optional[dict[str, Any]]:
 
     Reads the .meta.json written by ``LandmarkExtractor._write_meta()``.
     Returns None if the file is absent, unreadable, or has a schema version
-    that does not match ``EXTRACTOR_SCHEMA_VERSION``.
-
-    Importantly, schema version mismatches are surfaced as a warning here
-    so the pipeline layer can decide whether to reprocess. The extractor
-    itself enforces this check during its own cache validation; this
-    function provides a parallel read for the pipeline's statistics
-    accumulation logic.
+    that does not match ``EXTRACTOR_SCHEMA_VERSION`` (v1.2).
 
     Parameters
     ----------
@@ -853,7 +1034,7 @@ def _read_sidecar(npy_path: Path) -> Optional[dict[str, Any]]:
     Returns
     -------
     dict | None
-        Parsed sidecar JSON with all ExtractionResult fields, or None.
+        Parsed sidecar JSON, or None on any validation failure.
     """
     meta_path = _get_sidecar_path(npy_path)
     if not meta_path.exists():
@@ -863,9 +1044,8 @@ def _read_sidecar(npy_path: Path) -> Optional[dict[str, Any]]:
             meta = json.load(f)
         stored_version = meta.get("schema_version", "")
         if stored_version != EXTRACTOR_SCHEMA_VERSION:
-            # Schema version mismatch: the extractor will reprocess this
-            # clip on its next cache check, so we treat it as a cache miss
-            # for statistics purposes too.
+            # Schema version mismatch: extractor will reprocess on next cache
+            # check, so treat as a miss for statistics purposes too.
             return None
         return meta
     except (json.JSONDecodeError, OSError):
@@ -946,10 +1126,14 @@ class _RunStats:
     """
     Accumulates per-clip and aggregate statistics for the current pipeline run.
 
-    Aligned with extractor.py v1.1:
-      - ``decode_failure_frames`` is tracked separately from detection failures
+    Aligned with extractor.py v1.2:
+      - ``detected_frames`` tracked per clip and aggregated (v1.2 primary criterion)
+      - ``decode_failure_frames`` tracked separately from detection failures
       - ``missing_pct`` stored per-clip is over successfully-decoded frames
-      - Cache-hit status is ``"cached"`` not ``"skipped"``
+      - Per-hand missing counts propagated (fixes Notebook 02 Bug 9.1)
+      - Cache-hit status is ``"cached"``
+      - Policy-skip reason is one of: "insufficient_detected_frames",
+        "catastrophic_missing_rate", "no_frames_extracted"
 
     Attributes
     ----------
@@ -960,46 +1144,60 @@ class _RunStats:
     n_skipped_cached : int
         Clips skipped because a valid .npy + .meta.json already existed.
     n_skipped_policy : int
-        Clips skipped due to the missing-frame-rate threshold.
+        Clips skipped due to the v1.2 skip policy (either criterion).
     n_skipped_error : int
         Clips skipped due to video read failure or MediaPipe exception.
     n_dry_run : int
         Clips processed in dry-run mode (no actual work done).
     total_frames : int
-        Sum of frame counts across freshly extracted clips.
+        Sum of total frame counts across freshly extracted clips.
+    total_detected : int
+        Sum of detected_frames across freshly extracted clips.
     total_missing_both : int
-        Sum of missing-both-hands frame counts across extracted clips.
-        Computed over successfully-decoded frames (v1.1 semantics).
+        Sum of missing_both_hands frame counts across extracted clips.
+        Computed over successfully-decoded frames (v1.2 semantics).
+    total_missing_left : int
+        Sum of missing_left_hand frame counts (fixes Bug 9.1).
+    total_missing_right : int
+        Sum of missing_right_hand frame counts (fixes Bug 9.1).
+    total_missing_pose : int
+        Sum of missing_pose frame counts (fixes Bug 9.1).
     total_decode_failures : int
         Sum of decode_failure_frames across extracted clips.
     total_proc_sec : float
         Total wall-clock processing time for extracted clips.
     """
 
-    def __init__(self, run_id: str, max_missing_frame_pct: float) -> None:
-        self._run_id          = run_id
-        self._started_utc     = datetime.now(timezone.utc).isoformat()
-        self._max_missing_pct = max_missing_frame_pct
+    def __init__(self, run_id: str, min_detected_frames: int, max_missing_pct: float) -> None:
+        self._run_id              = run_id
+        self._started_utc         = datetime.now(timezone.utc).isoformat()
+        self._min_detected_frames = min_detected_frames
+        self._max_missing_pct     = max_missing_pct
 
         self._records: list[dict[str, Any]] = []
 
         # Counters
-        self.n_queued             = 0
-        self.n_extracted          = 0
-        self.n_skipped_cached     = 0
-        self.n_skipped_policy     = 0
-        self.n_skipped_error      = 0
-        self.n_dry_run            = 0
-        self.total_frames         = 0
-        self.total_missing_both   = 0   # v1.1: over successfully-decoded frames
-        self.total_decode_failures = 0  # v1.1: separate from detection failures
-        self.total_proc_sec       = 0.0
+        self.n_queued              = 0
+        self.n_extracted           = 0
+        self.n_skipped_cached      = 0
+        self.n_skipped_policy      = 0
+        self.n_skipped_error       = 0
+        self.n_dry_run             = 0
+        self.total_frames          = 0
+        self.total_detected        = 0    # v1.2: sum of detected_frames
+        self.total_missing_both    = 0
+        self.total_missing_left    = 0    # v1.2: fix for Bug 9.1
+        self.total_missing_right   = 0    # v1.2: fix for Bug 9.1
+        self.total_missing_pose    = 0    # v1.2: fix for Bug 9.1
+        self.total_decode_failures = 0
+        self.total_proc_sec        = 0.0
 
         # Per-sign breakdown
-        self._sign_frames:        dict[str, int] = defaultdict(int)
-        self._sign_missing:       dict[str, int] = defaultdict(int)
-        self._sign_extracted:     dict[str, int] = defaultdict(int)
-        self._sign_skipped:       dict[str, int] = defaultdict(int)
+        self._sign_frames:    dict[str, int] = defaultdict(int)
+        self._sign_detected:  dict[str, int] = defaultdict(int)
+        self._sign_missing:   dict[str, int] = defaultdict(int)
+        self._sign_extracted: dict[str, int] = defaultdict(int)
+        self._sign_skipped:   dict[str, int] = defaultdict(int)
 
     # ------------------------------------------------------------------
     # Recording methods — one per outcome type
@@ -1013,29 +1211,38 @@ class _RunStats:
     ) -> None:
         """Record a freshly extracted clip (status='extracted')."""
         sign = clip["sign_label"]
-        self.n_extracted           += 1
-        self.total_frames          += result.num_frames
-        self.total_missing_both    += result.missing_both_hands_frames
-        self.total_decode_failures += result.decode_failure_frames   # v1.1
-        self.total_proc_sec        += proc_sec
-        self._sign_frames[sign]    += result.num_frames
-        self._sign_missing[sign]   += result.missing_both_hands_frames
-        self._sign_extracted[sign] += 1
+        self.n_extracted             += 1
+        self.total_frames            += result.num_frames
+        self.total_detected          += result.detected_frames        # v1.2
+        self.total_missing_both      += result.missing_both_hands_frames
+        self.total_missing_left      += result.missing_left_hand_frames  # Bug 9.1 fix
+        self.total_missing_right     += result.missing_right_hand_frames # Bug 9.1 fix
+        self.total_missing_pose      += result.missing_pose_frames       # Bug 9.1 fix
+        self.total_decode_failures   += result.decode_failure_frames
+        self.total_proc_sec          += proc_sec
+        self._sign_frames[sign]      += result.num_frames
+        self._sign_detected[sign]    += result.detected_frames
+        self._sign_missing[sign]     += result.missing_both_hands_frames
+        self._sign_extracted[sign]   += 1
 
         self._records.append({
-            "video_id":              clip["video_id"],
-            "sign_label":            sign,
-            "class_idx":             clip["class_idx"],
-            "signer_id":             clip["signer_id"],
-            "split":                 clip["split"],
-            "video_path":            clip["video_path"],
-            "output_path":           result.output_path,
-            "outcome":               "extracted",
-            "proc_sec":              round(proc_sec, 4),
-            "n_frames":              result.num_frames,
-            "decode_failure_frames": result.decode_failure_frames,       # v1.1
-            "n_missing_both":        result.missing_both_hands_frames,
-            "missing_pct":           round(result.missing_pct, 4),       # v1.1 denominator
+            "video_id":                clip["video_id"],
+            "sign_label":              sign,
+            "class_idx":               clip["class_idx"],
+            "signer_id":               clip["signer_id"],
+            "split":                   clip["split"],
+            "video_path":              clip["video_path"],
+            "output_path":             result.output_path,
+            "outcome":                 "extracted",
+            "proc_sec":                round(proc_sec, 4),
+            "n_frames":                result.num_frames,
+            "decode_failure_frames":   result.decode_failure_frames,
+            "detected_frames":         result.detected_frames,           # v1.2
+            "n_missing_left":          result.missing_left_hand_frames,  # Bug 9.1
+            "n_missing_right":         result.missing_right_hand_frames, # Bug 9.1
+            "n_missing_pose":          result.missing_pose_frames,       # Bug 9.1
+            "n_missing_both":          result.missing_both_hands_frames,
+            "missing_pct":             round(result.missing_pct, 4),
         })
 
     def record_cached(
@@ -1043,37 +1250,45 @@ class _RunStats:
         clip: dict[str, Any],
         output_path: str,
         n_frames: int = 0,
+        detected_frames: int = 0,           # v1.2
         missing_pct: float = 0.0,
         missing_both: int = 0,
-        decode_failure_frames: int = 0,   # v1.1
+        missing_left: int = 0,              # Bug 9.1 fix
+        missing_right: int = 0,             # Bug 9.1 fix
+        missing_pose: int = 0,              # Bug 9.1 fix
+        decode_failure_frames: int = 0,
     ) -> None:
         """
         Record a cache-hit clip (status='cached').
 
-        Statistics are restored from the v1.1 .meta.json sidecar when
-        available so aggregate missing-rate figures remain accurate even for
-        clips that were not processed in this run.
+        All per-hand statistics are restored from the v1.2 .meta.json sidecar
+        so aggregate figures remain accurate for clips not processed this run.
         """
         sign = clip["sign_label"]
-        self.n_skipped_cached      += 1
-        self._sign_frames[sign]    += n_frames
-        self._sign_missing[sign]   += missing_both
-        self._sign_extracted[sign] += 1   # counts toward usable total
+        self.n_skipped_cached        += 1
+        self._sign_frames[sign]      += n_frames
+        self._sign_detected[sign]    += detected_frames
+        self._sign_missing[sign]     += missing_both
+        self._sign_extracted[sign]   += 1   # counts toward usable total
 
         self._records.append({
-            "video_id":              clip["video_id"],
-            "sign_label":            sign,
-            "class_idx":             clip["class_idx"],
-            "signer_id":             clip["signer_id"],
-            "split":                 clip["split"],
-            "video_path":            clip["video_path"],
-            "output_path":           output_path,
-            "outcome":               "cached",
-            "proc_sec":              0.0,
-            "n_frames":              n_frames,
-            "decode_failure_frames": decode_failure_frames,  # v1.1
-            "n_missing_both":        missing_both,
-            "missing_pct":           round(missing_pct, 4),
+            "video_id":                clip["video_id"],
+            "sign_label":              sign,
+            "class_idx":               clip["class_idx"],
+            "signer_id":               clip["signer_id"],
+            "split":                   clip["split"],
+            "video_path":              clip["video_path"],
+            "output_path":             output_path,
+            "outcome":                 "cached",
+            "proc_sec":                0.0,
+            "n_frames":                n_frames,
+            "decode_failure_frames":   decode_failure_frames,
+            "detected_frames":         detected_frames,   # v1.2
+            "n_missing_left":          missing_left,      # Bug 9.1
+            "n_missing_right":         missing_right,     # Bug 9.1
+            "n_missing_pose":          missing_pose,      # Bug 9.1
+            "n_missing_both":          missing_both,
+            "missing_pct":             round(missing_pct, 4),
         })
 
     def record_skipped_policy(
@@ -1082,27 +1297,31 @@ class _RunStats:
         result: ExtractionResult,
         proc_sec: float,
     ) -> None:
-        """Record a clip skipped by the missing-frame-pct policy."""
+        """Record a clip skipped by the v1.2 dual-criterion policy."""
         sign = clip["sign_label"]
         self.n_skipped_policy      += 1
         self._sign_skipped[sign]   += 1
         self.total_proc_sec        += proc_sec
 
         self._records.append({
-            "video_id":              clip["video_id"],
-            "sign_label":            sign,
-            "class_idx":             clip["class_idx"],
-            "signer_id":             clip["signer_id"],
-            "split":                 clip["split"],
-            "video_path":            clip["video_path"],
-            "output_path":           "",
-            "outcome":               "skipped_policy",
-            "proc_sec":              round(proc_sec, 4),
-            "n_frames":              result.num_frames,
-            "decode_failure_frames": result.decode_failure_frames,  # v1.1
-            "n_missing_both":        result.missing_both_hands_frames,
-            "missing_pct":           round(result.missing_pct, 4),
-            "skip_reason":           result.skip_reason,
+            "video_id":                clip["video_id"],
+            "sign_label":              sign,
+            "class_idx":               clip["class_idx"],
+            "signer_id":               clip["signer_id"],
+            "split":                   clip["split"],
+            "video_path":              clip["video_path"],
+            "output_path":             "",
+            "outcome":                 "skipped_policy",
+            "proc_sec":                round(proc_sec, 4),
+            "n_frames":                result.num_frames,
+            "decode_failure_frames":   result.decode_failure_frames,
+            "detected_frames":         result.detected_frames,      # v1.2
+            "n_missing_left":          result.missing_left_hand_frames,
+            "n_missing_right":         result.missing_right_hand_frames,
+            "n_missing_pose":          result.missing_pose_frames,
+            "n_missing_both":          result.missing_both_hands_frames,
+            "missing_pct":             round(result.missing_pct, 4),
+            "skip_reason":             result.skip_reason,
         })
 
     def record_error(
@@ -1118,27 +1337,31 @@ class _RunStats:
         self.total_proc_sec      += proc_sec
 
         self._records.append({
-            "video_id":              clip["video_id"],
-            "sign_label":            sign,
-            "class_idx":             clip["class_idx"],
-            "signer_id":             clip["signer_id"],
-            "split":                 clip["split"],
-            "video_path":            clip["video_path"],
-            "output_path":           "",
-            "outcome":               "error",
-            "proc_sec":              round(proc_sec, 4),
-            "n_frames":              0,
-            "decode_failure_frames": 0,
-            "n_missing_both":        0,
-            "missing_pct":           0.0,
-            "error_message":         error_msg,
+            "video_id":                clip["video_id"],
+            "sign_label":              sign,
+            "class_idx":               clip["class_idx"],
+            "signer_id":               clip["signer_id"],
+            "split":                   clip["split"],
+            "video_path":              clip["video_path"],
+            "output_path":             "",
+            "outcome":                 "error",
+            "proc_sec":                round(proc_sec, 4),
+            "n_frames":                0,
+            "decode_failure_frames":   0,
+            "detected_frames":         0,
+            "n_missing_left":          0,
+            "n_missing_right":         0,
+            "n_missing_pose":          0,
+            "n_missing_both":          0,
+            "missing_pct":             0.0,
+            "error_message":           error_msg,
         })
 
     def record_dry_run(self, clip: dict[str, Any]) -> None:
         """Record a clip in dry-run mode."""
         self.n_dry_run += 1
         self._records.append({
-            "video_id":  clip["video_id"],
+            "video_id":   clip["video_id"],
             "sign_label": clip["sign_label"],
             "class_idx":  clip["class_idx"],
             "signer_id":  clip["signer_id"],
@@ -1163,11 +1386,22 @@ class _RunStats:
         """
         Global both-hands-absent rate over successfully-decoded frames.
 
-        Aligns with v1.1 semantics: decode_failure_frames are excluded from
-        the denominator, so this reflects genuine MediaPipe detection quality.
+        Denominator excludes decode_failure_frames (v1.2 semantics), so this
+        reflects genuine MediaPipe detection quality rather than codec noise.
         """
         denom = self.total_frames - self.total_decode_failures
         return self.total_missing_both / denom if denom > 0 else 0.0
+
+    @property
+    def global_detection_rate(self) -> float:
+        """
+        Fraction of successfully-decoded frames where at least one hand was detected.
+
+        This is 1 - global_missing_rate, exposed separately for clarity in
+        health reporting.
+        """
+        denom = self.total_frames - self.total_decode_failures
+        return self.total_detected / denom if denom > 0 else 0.0
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -1196,14 +1430,17 @@ class _RunStats:
             | set(self._sign_skipped)
         )
         for sign in sorted(all_signs):
-            total_f = self._sign_frames.get(sign, 0)
-            miss_f  = self._sign_missing.get(sign, 0)
+            total_f    = self._sign_frames.get(sign, 0)
+            detected_f = self._sign_detected.get(sign, 0)
+            miss_f     = self._sign_missing.get(sign, 0)
             per_sign[sign] = {
-                "usable":         self._sign_extracted.get(sign, 0),
-                "skipped":        self._sign_skipped.get(sign, 0),
-                "total_frames":   total_f,
-                "missing_frames": miss_f,
-                "missing_rate":   round(miss_f / total_f, 4) if total_f > 0 else 0.0,
+                "usable":           self._sign_extracted.get(sign, 0),
+                "skipped":          self._sign_skipped.get(sign, 0),
+                "total_frames":     total_f,
+                "detected_frames":  detected_f,
+                "missing_frames":   miss_f,
+                "detection_rate":   round(detected_f / total_f, 4) if total_f > 0 else 0.0,
+                "missing_rate":     round(miss_f / total_f, 4)     if total_f > 0 else 0.0,
             }
 
         return {
@@ -1213,22 +1450,29 @@ class _RunStats:
                 "started_utc":           self._started_utc,
                 "completed_utc":         datetime.now(timezone.utc).isoformat(),
                 "extractor_schema":      EXTRACTOR_SCHEMA_VERSION,
-                "max_missing_frame_pct": self._max_missing_pct,
+                "skip_policy":           "dual_criterion_v1.2",
+                "min_detected_frames":   self._min_detected_frames,
+                "max_missing_pct":       self._max_missing_pct,
             },
             "aggregate": {
-                "n_queued":               self.n_queued,
-                "n_extracted":            self.n_extracted,
-                "n_cached":               self.n_skipped_cached,
-                "n_skipped_policy":       self.n_skipped_policy,
-                "n_skipped_error":        self.n_skipped_error,
-                "n_usable":               self.n_usable,
-                "policy_skip_rate":       round(self.n_skipped_policy / n_eff, 4),
-                "error_rate":             round(self.n_skipped_error   / n_eff, 4),
-                "total_frames":           self.total_frames,
-                "total_decode_failures":  self.total_decode_failures,  # v1.1
-                "total_missing_both":     self.total_missing_both,
-                "global_missing_rate":    round(self.global_missing_rate, 4),  # v1.1
-                "total_proc_sec":         round(self.total_proc_sec, 1),
+                "n_queued":              self.n_queued,
+                "n_extracted":           self.n_extracted,
+                "n_cached":              self.n_skipped_cached,
+                "n_skipped_policy":      self.n_skipped_policy,
+                "n_skipped_error":       self.n_skipped_error,
+                "n_usable":              self.n_usable,
+                "policy_skip_rate":      round(self.n_skipped_policy / n_eff, 4),
+                "error_rate":            round(self.n_skipped_error   / n_eff, 4),
+                "total_frames":          self.total_frames,
+                "total_detected":        self.total_detected,           # v1.2
+                "total_decode_failures": self.total_decode_failures,
+                "total_missing_left":    self.total_missing_left,       # Bug 9.1 fix
+                "total_missing_right":   self.total_missing_right,      # Bug 9.1 fix
+                "total_missing_pose":    self.total_missing_pose,       # Bug 9.1 fix
+                "total_missing_both":    self.total_missing_both,
+                "global_missing_rate":   round(self.global_missing_rate,    4),
+                "global_detection_rate": round(self.global_detection_rate,  4),  # v1.2
+                "total_proc_sec":        round(self.total_proc_sec, 1),
                 "mean_proc_sec_per_clip": round(
                     self.total_proc_sec / max(self.n_extracted, 1), 3
                 ),
@@ -1328,16 +1572,14 @@ def _run_extraction_loop(
       and statistics accumulation only.
     - ETA is computed from a fixed pre-loop count so it never drifts as files
       are written during the run.
-    - Cache-hit routing uses ``result.status == "cached"`` (v1.1 extractor
-      returns this; the old "skipped" routing from v1.0 is removed).
+    - Cache-hit routing uses ``result.status == "cached"`` (v1.2 extractor).
     - Post-write verification (``_verify_npy_file``) is an independent check
       applied after each fresh extraction as defence-in-depth.
     - Each clip is isolated: any exception is caught, logged, and counted as
       an error without aborting the rest of the run.
     - ``--verify-existing`` triggers a spot-check on cache-hit files; corrupt
       ones are deleted so the extractor reprocesses them on the same call.
-    - ``extractor`` is None only when ``dry_run=True``; this is asserted before
-      the loop begins.
+    - ``extractor`` is None only when ``dry_run=True``.
 
     Parameters
     ----------
@@ -1348,7 +1590,7 @@ def _run_extraction_loop(
     landmarks_dir : str
         Root output directory for .npy files.
     run_stats : _RunStats
-        Statistics accumulator.
+        Statistics accumulator (v1.2: includes detected_frames, per-hand counts).
     force : bool
         Re-extract even if a valid cached .npy + .meta.json exists.
     verify_existing : bool
@@ -1376,8 +1618,8 @@ def _run_extraction_loop(
             "This is a bug in the pipeline initialisation logic."
         )
 
-    # Pre-compute how many clips actually need extraction (fixed before loop).
-    # This count is the ETA denominator so ETA never drifts as files are written.
+    # Pre-compute how many clips actually need extraction (fixed before loop
+    # so ETA never drifts as files are written during the run).
     n_to_process_initially = sum(
         1 for c in clips
         if force or not _get_output_path(
@@ -1386,7 +1628,7 @@ def _run_extraction_loop(
     )
     logger.info(
         f"Clips requiring extraction: {n_to_process_initially} | "
-        f"already cached: {len(clips) - n_to_process_initially}",
+        f"already cached (fast path): {len(clips) - n_to_process_initially}",
         extra={"stage": "extraction"},
     )
 
@@ -1433,8 +1675,12 @@ def _run_extraction_loop(
                         clip,
                         output_path=str(npy_path),
                         n_frames=             meta.get("num_frames",               0)   if meta else 0,
+                        detected_frames=      meta.get("detected_frames",          0)   if meta else 0,  # v1.2
                         missing_pct=          meta.get("missing_pct",              0.0) if meta else 0.0,
                         missing_both=         meta.get("missing_both_hands_frames",0)   if meta else 0,
+                        missing_left=         meta.get("missing_left_hand_frames", 0)   if meta else 0,  # Bug 9.1
+                        missing_right=        meta.get("missing_right_hand_frames",0)   if meta else 0,  # Bug 9.1
+                        missing_pose=         meta.get("missing_pose_frames",      0)   if meta else 0,  # Bug 9.1
                         decode_failure_frames=meta.get("decode_failure_frames",    0)   if meta else 0,
                     )
                     logger.debug(
@@ -1448,8 +1694,12 @@ def _run_extraction_loop(
                     clip,
                     output_path=str(npy_path),
                     n_frames=             meta.get("num_frames",               0)   if meta else 0,
+                    detected_frames=      meta.get("detected_frames",          0)   if meta else 0,  # v1.2
                     missing_pct=          meta.get("missing_pct",              0.0) if meta else 0.0,
                     missing_both=         meta.get("missing_both_hands_frames",0)   if meta else 0,
+                    missing_left=         meta.get("missing_left_hand_frames", 0)   if meta else 0,  # Bug 9.1
+                    missing_right=        meta.get("missing_right_hand_frames",0)   if meta else 0,  # Bug 9.1
+                    missing_pose=         meta.get("missing_pose_frames",      0)   if meta else 0,  # Bug 9.1
                     decode_failure_frames=meta.get("decode_failure_frames",    0)   if meta else 0,
                 )
                 logger.debug(
@@ -1460,8 +1710,6 @@ def _run_extraction_loop(
 
         # ----------------------------------------------------------------
         # Validate video file on disk before calling the extractor.
-        # This surfaces missing-file errors with a clean warning rather
-        # than letting the extractor raise a RuntimeError.
         # ----------------------------------------------------------------
         resolved_video_path = _resolve_video_path(video_path_str, video_id, logger)
         if resolved_video_path is None:
@@ -1474,7 +1722,7 @@ def _run_extraction_loop(
         # ----------------------------------------------------------------
         # Delegate extraction to LandmarkExtractor.
         # The extractor handles: MediaPipe processing, decode-failure
-        # tracking (v1.1), skip-policy application, .npy write, and
+        # tracking (v1.1+), v1.2 dual-criterion policy, .npy write, and
         # .meta.json sidecar write.
         # ----------------------------------------------------------------
         clip_start = time.time()
@@ -1510,14 +1758,17 @@ def _run_extraction_loop(
         # ----------------------------------------------------------------
 
         if result.status == "cached":
-            # The extractor's own cache check triggered (e.g. the pipeline
-            # fast-path above was bypassed by --force=False on a race).
+            # Extractor's own cache check triggered (e.g. race with --force=False).
             run_stats.record_cached(
                 clip,
                 output_path=result.output_path,
                 n_frames=             result.num_frames,
+                detected_frames=      result.detected_frames,
                 missing_pct=          result.missing_pct,
                 missing_both=         result.missing_both_hands_frames,
+                missing_left=         result.missing_left_hand_frames,
+                missing_right=        result.missing_right_hand_frames,
+                missing_pose=         result.missing_pose_frames,
                 decode_failure_frames=result.decode_failure_frames,
             )
             n_newly_processed += 1
@@ -1525,9 +1776,10 @@ def _run_extraction_loop(
 
         if result.status == "skipped":
             logger.info(
-                f"Skipped (policy: >{run_stats._max_missing_pct:.0%} "
-                f"both-hands absent on decoded frames) | "
+                f"Skipped (v1.2 policy: {result.skip_reason}) | "
                 f"video_id={video_id} | sign={sign_label} | "
+                f"detected={result.detected_frames} | "
+                f"min_detected={run_stats._min_detected_frames} | "
                 f"missing_pct={result.missing_pct:.1%} | "
                 f"decode_failures={result.decode_failure_frames}",
                 extra={"stage": "extraction", "video_id": video_id},
@@ -1552,8 +1804,6 @@ def _run_extraction_loop(
 
         # status == "extracted" ─────────────────────────────────────────
         # Post-write verification: independent check on the file just written.
-        # The extractor guarantees float32 and (N, 225); this catches any
-        # partial write or OS-level corruption that slipped through.
         if not _verify_npy_file(npy_path, video_id, logger, full_check=True):
             logger.error(
                 f"Post-write verification failed — removing corrupt .npy: "
@@ -1576,6 +1826,7 @@ def _run_extraction_loop(
         logger.debug(
             f"Extracted: {video_id} ({sign_label}) | "
             f"frames={result.num_frames} | "
+            f"detected={result.detected_frames} | "
             f"decode_failures={result.decode_failure_frames} | "
             f"missing_pct={result.missing_pct:.1%} | "
             f"time={proc_sec:.2f}s",
@@ -1627,9 +1878,11 @@ def _log_extraction_report(run_stats: _RunStats, logger) -> None:
     """
     Emit a structured, human-readable extraction report at INFO level.
 
-    Uses the v1.1 semantics for missing_pct (over successfully-decoded
-    frames) and surfaces decode_failure_frames as a separate line item
-    for full transparency.
+    Uses v1.2 semantics:
+    - Primary criterion is detected_frames (not missing ratio)
+    - decode_failure_frames tracked separately
+    - Per-hand missing rates included (Bug 9.1 fix)
+    - global_detection_rate reported alongside global_missing_rate
 
     Parameters
     ----------
@@ -1641,7 +1894,7 @@ def _log_extraction_report(run_stats: _RunStats, logger) -> None:
     n_eff = max(run_stats.n_queued, 1)
 
     logger.info("=" * 65, extra={"stage": "extraction"})
-    logger.info("STAGE 3 — EXTRACTION REPORT", extra={"stage": "extraction"})
+    logger.info("STAGE 3 — EXTRACTION REPORT (schema v1.2)", extra={"stage": "extraction"})
     logger.info("=" * 65, extra={"stage": "extraction"})
     logger.info(f"  Queued              : {run_stats.n_queued}",          extra={"stage": "extraction"})
     logger.info(f"  Extracted (fresh)   : {run_stats.n_extracted}",       extra={"stage": "extraction"})
@@ -1649,8 +1902,9 @@ def _log_extraction_report(run_stats: _RunStats, logger) -> None:
     logger.info(f"  Usable total        : {run_stats.n_usable}",          extra={"stage": "extraction"})
     logger.info(
         f"  Skipped (policy)    : {run_stats.n_skipped_policy}  "
-        f"(>{run_stats._max_missing_pct:.0%} both-hands absent — "
-        f"{run_stats.n_skipped_policy / n_eff:.1%} of queued)",
+        f"({run_stats.n_skipped_policy / n_eff:.1%} of queued) "
+        f"[v1.2: primary=detected<{run_stats._min_detected_frames}, "
+        f"secondary=missing>{run_stats._max_missing_pct:.0%}]",
         extra={"stage": "extraction"},
     )
     logger.info(
@@ -1659,21 +1913,34 @@ def _log_extraction_report(run_stats: _RunStats, logger) -> None:
         extra={"stage": "extraction"},
     )
     if run_stats.total_frames > 0:
+        n_decoded = run_stats.total_frames - run_stats.total_decode_failures
         logger.info(
             f"  Total frames        : {run_stats.total_frames:,}",
             extra={"stage": "extraction"},
         )
         logger.info(
             f"  Decode failures     : {run_stats.total_decode_failures:,}  "
-            f"(codec errors, excluded from missing_pct denominator — v1.1)",
+            f"(codec errors, excluded from detection rate denominator)",
+            extra={"stage": "extraction"},
+        )
+        logger.info(
+            f"  Detected frames     : {run_stats.total_detected:,} / {n_decoded:,} decoded  "
+            f"(detection rate={run_stats.global_detection_rate:.1%})",
             extra={"stage": "extraction"},
         )
         logger.info(
             f"  Global missing rate : {run_stats.global_missing_rate:.2%}  "
-            f"({run_stats.total_missing_both:,}/{run_stats.total_frames - run_stats.total_decode_failures:,} "
-            "decoded frames zero-filled both hands)",
+            f"({run_stats.total_missing_both:,}/{n_decoded:,} both-hands absent)",
             extra={"stage": "extraction"},
         )
+        if run_stats.n_extracted > 0:
+            logger.info(
+                f"  Per-hand missing    : "
+                f"left={run_stats.total_missing_left:,} | "
+                f"right={run_stats.total_missing_right:,} | "
+                f"pose={run_stats.total_missing_pose:,}",
+                extra={"stage": "extraction"},
+            )
     logger.info(
         f"  Processing time     : {run_stats.total_proc_sec:.1f}s",
         extra={"stage": "extraction"},
@@ -1688,10 +1955,11 @@ def _validate_extraction_health(
     """
     Check overall extraction health and emit actionable warnings.
 
-    Thresholds are calibrated for extractor v1.1 where ``missing_pct``
-    is computed over successfully-decoded frames only. Because codec errors
-    no longer inflate the denominator, a global missing rate > 15% is a
-    genuine MediaPipe quality signal rather than codec noise.
+    Thresholds are calibrated for extractor v1.2 (dual-criterion policy):
+    - Expected policy skip rate: ~3–6% (not 5–8% as in v1.1)
+    - Expected global missing rate: can be higher due to one-handed signs
+      retained at up to 95% both-absent rate. Threshold raised to 35%.
+    - Error rate threshold unchanged at 5%.
 
     Parameters
     ----------
@@ -1703,47 +1971,62 @@ def _validate_extraction_health(
     Returns
     -------
     bool
-        True if all health checks pass.
+        True if all health checks pass (no threshold exceeded).
     """
     healthy = True
     n_eff   = max(run_stats.n_queued, 1)
 
     policy_rate = run_stats.n_skipped_policy / n_eff
-    if policy_rate > _HEALTH_POLICY_SKIP_RATE_WARN:
+    if policy_rate > HEALTH_POLICY_SKIP_RATE_WARN:
         logger.warning(
             f"Policy skip rate {policy_rate:.1%} exceeds "
-            f"{_HEALTH_POLICY_SKIP_RATE_WARN:.0%} threshold "
-            f"(expected 5–8% for WLASL with v1.1 extractor). "
-            "Possible causes: unusual signing angles, poor lighting, "
-            "or --max-missing-frame-pct set too low. "
-            "Consider raising --max-missing-frame-pct or lowering "
-            "--min-detection-confidence.",
+            f"{HEALTH_POLICY_SKIP_RATE_WARN:.0%} threshold. "
+            f"With the v1.2 dual-criterion policy (min_detected_frames="
+            f"{run_stats._min_detected_frames}), expected skip rate is ~3–6%%. "
+            "Possible causes: video files contain unusually short or corrupted "
+            "clips with very few detectable frames. "
+            "Review skipped clips in preprocessing_summary_latest.json "
+            "(per_clip, outcome='skipped_policy') for patterns.",
             extra={"stage": "extraction"},
         )
         healthy = False
 
     error_rate = run_stats.n_skipped_error / n_eff
-    if error_rate > _HEALTH_ERROR_RATE_WARN:
+    if error_rate > HEALTH_ERROR_RATE_WARN:
         logger.warning(
             f"Error rate {error_rate:.1%} exceeds "
-            f"{_HEALTH_ERROR_RATE_WARN:.0%} threshold. "
+            f"{HEALTH_ERROR_RATE_WARN:.0%} threshold. "
             "Review error records in preprocessing_summary_latest.json "
             "under the 'per_clip' key for details.",
             extra={"stage": "extraction"},
         )
         healthy = False
 
-    if run_stats.global_missing_rate > _HEALTH_GLOBAL_MISSING_RATE:
+    if run_stats.global_missing_rate > HEALTH_GLOBAL_MISSING_RATE_WARN:
         logger.warning(
             f"Global missing-landmark rate {run_stats.global_missing_rate:.1%} "
-            f"exceeds {_HEALTH_GLOBAL_MISSING_RATE:.0%}. "
-            "This is measured over successfully-decoded frames (v1.1) so it "
-            "reflects genuine MediaPipe detection quality, not codec errors. "
-            "Consider reviewing video quality for high-miss signs or adjusting "
-            "--min-detection-confidence.",
+            f"exceeds {HEALTH_GLOBAL_MISSING_RATE_WARN:.0%}. "
+            "This is measured over successfully-decoded frames so it "
+            "reflects genuine MediaPipe detection quality. "
+            "Note: one-handed signs naturally inflate this rate. "
+            "Consider reviewing per-sign missing rates in the landmark "
+            "inventory CSV and checking video quality for high-miss signs.",
             extra={"stage": "extraction"},
         )
         healthy = False
+
+    # Warn if usable clip count is dangerously low for training
+    if run_stats.n_usable < 200:
+        logger.warning(
+            f"Usable clip count ({run_stats.n_usable}) is below 200. "
+            "The ≥70% validation accuracy target requires at least ~200 "
+            "training clips. If this is a full extraction run (not sample), "
+            "check the per-sign breakdown in preprocessing_summary_latest.json "
+            "and consider lowering --min-detected-frames.",
+            extra={"stage": "extraction"},
+        )
+        # This is advisory only — does not set healthy=False.
+        # Sample runs will always be below 200; health=True is correct for them.
 
     return healthy
 
@@ -1751,9 +2034,6 @@ def _validate_extraction_health(
 def _log_output_inventory(landmarks_dir: str, logger) -> None:
     """
     Walk the landmarks directory and log .npy file counts per split and sign.
-
-    Uses a generator expression (``sum(1 for _ in glob())``) to avoid
-    materialising the full file list into memory.
 
     Parameters
     ----------
@@ -1812,10 +2092,15 @@ def _finalise_run(
     """
     Write the landmark_inventory.csv using the per-clip records from _RunStats.
 
-    This function creates a minimal ExtractionResult list from the already-
-    accumulated _RunStats records and delegates to ``write_landmark_inventory``
-    in the extractor module. This keeps the CSV format consistent with what
+    This function creates ExtractionResult objects from the already-accumulated
+    _RunStats records and delegates to ``write_landmark_inventory`` in the
+    extractor module. This keeps the CSV format consistent with what
     ``LandmarkExtractor.extract_dataset()`` produces when called directly.
+
+    v1.2 changes from v1.1:
+    - ``detected_frames`` is populated from ``rec.get("detected_frames", 0)``
+    - Per-hand counts (n_missing_left/right/pose) are populated correctly
+      (fixes Notebook 02 Bug 9.1 — previously hardcoded to 0)
 
     Parameters
     ----------
@@ -1837,26 +2122,27 @@ def _finalise_run(
             "cached":         "cached",
             "skipped_policy": "skipped",
             "error":          "error",
-            "dry_run":        "skipped",  # dry-run clips appear as skipped
+            "dry_run":        "skipped",
         }
         status = status_map.get(outcome, "error")
 
         result = ExtractionResult(
-            video_id=                 rec.get("video_id",              ""),
-            sign_label=               rec.get("sign_label",            ""),
-            split=                    rec.get("split",                 ""),
-            output_path=              rec.get("output_path",           ""),
-            status=                   status,
-            num_frames=               rec.get("n_frames",              0),
-            decode_failure_frames=    rec.get("decode_failure_frames", 0),   # v1.1
-            missing_left_hand_frames= 0,   # not tracked at pipeline level
-            missing_right_hand_frames=0,
-            missing_pose_frames=      0,
-            missing_both_hands_frames=rec.get("n_missing_both",       0),
-            missing_pct=              rec.get("missing_pct",           0.0),
-            skip_reason=              rec.get("skip_reason",           ""),
-            processing_time_sec=      rec.get("proc_sec",              0.0),
-            error_message=            rec.get("error_message",         ""),
+            video_id=                   rec.get("video_id",              ""),
+            sign_label=                 rec.get("sign_label",            ""),
+            split=                      rec.get("split",                 ""),
+            output_path=                rec.get("output_path",           ""),
+            status=                     status,
+            num_frames=                 rec.get("n_frames",              0),
+            decode_failure_frames=      rec.get("decode_failure_frames", 0),
+            detected_frames=            rec.get("detected_frames",       0),   # v1.2
+            missing_left_hand_frames=   rec.get("n_missing_left",        0),   # Bug 9.1 fix
+            missing_right_hand_frames=  rec.get("n_missing_right",       0),   # Bug 9.1 fix
+            missing_pose_frames=        rec.get("n_missing_pose",        0),   # Bug 9.1 fix
+            missing_both_hands_frames=  rec.get("n_missing_both",        0),
+            missing_pct=                rec.get("missing_pct",           0.0),
+            skip_reason=                rec.get("skip_reason",           ""),
+            processing_time_sec=        rec.get("proc_sec",              0.0),
+            error_message=              rec.get("error_message",         ""),
         )
         results.append(result)
 
@@ -1879,11 +2165,14 @@ def _finalise_run(
 
 def _init_extractor(args: argparse.Namespace, logger) -> Optional[LandmarkExtractor]:
     """
-    Initialise LandmarkExtractor with runtime configuration and warm up MediaPipe.
+    Initialise LandmarkExtractor with v1.2 runtime configuration.
 
-    The warm-up call (``extractor._init_mediapipe()``) loads the MediaPipe model
-    before the main loop so the first clip does not incur a cold-start timing
-    penalty (model load takes ~2–5 seconds).
+    Passes ``min_detected_frames`` (v1.2 primary criterion) and
+    ``max_missing_pct`` (v1.2 catastrophe filter) from CLI args.
+
+    The warm-up call (``extractor._init_mediapipe()``) loads the MediaPipe
+    model before the main loop to avoid a cold-start timing penalty (~2–5s)
+    on the first clip.
 
     Parameters
     ----------
@@ -1900,6 +2189,8 @@ def _init_extractor(args: argparse.Namespace, logger) -> Optional[LandmarkExtrac
     logger.info(
         f"Initialising LandmarkExtractor | "
         f"schema_version={EXTRACTOR_SCHEMA_VERSION} | "
+        f"skip_policy=dual_criterion_v1.2 | "
+        f"min_detected_frames={args.min_detected_frames} | "
         f"max_missing_pct={args.max_missing_frame_pct:.0%} | "
         f"min_detection_conf={args.min_detection_confidence} | "
         f"min_tracking_conf={args.min_tracking_confidence}",
@@ -1909,6 +2200,8 @@ def _init_extractor(args: argparse.Namespace, logger) -> Optional[LandmarkExtrac
         extractor = LandmarkExtractor(
             min_detection_confidence=args.min_detection_confidence,
             min_tracking_confidence=args.min_tracking_confidence,
+            min_detected_frames=args.min_detected_frames,
+            max_missing_pct=args.max_missing_frame_pct,
         )
         # Warm up MediaPipe before the main loop
         extractor._init_mediapipe()
@@ -1945,8 +2238,15 @@ def main() -> int:
     # Logging — must be configured before any other operation
     # ----------------------------------------------------------------
     log_level = "DEBUG" if args.verbose else "INFO"
-    run_label = "stage3_sample" if args.sample_only else f"stage3_{args.split}"
-    if args.dry_run:
+
+    if args.threshold_diagnostic:
+        run_label = "stage3_threshold_diagnostic"
+    elif args.sample_only:
+        run_label = "stage3_sample"
+    else:
+        run_label = f"stage3_{args.split}"
+
+    if getattr(args, "dry_run", False):
         run_label += "_dryrun"
 
     log_file = configure_logging(
@@ -1960,9 +2260,7 @@ def main() -> int:
     # ----------------------------------------------------------------
     # Header
     # ----------------------------------------------------------------
-    logger.info(
-        "=" * 65, extra={"stage": "extraction"}
-    )
+    logger.info("=" * 65, extra={"stage": "extraction"})
     logger.info(
         "WLASL Gesture Recognition — Stage 3: Landmark Extraction",
         extra={"stage": "extraction"},
@@ -1972,10 +2270,26 @@ def main() -> int:
         extra={"stage": "extraction"},
     )
     logger.info(
+        f"Skip policy              : dual_criterion_v1.2 "
+        f"(primary: detected_frames >= {args.min_detected_frames}, "
+        f"secondary: missing_pct <= {args.max_missing_frame_pct:.0%})",
+        extra={"stage": "extraction"},
+    )
+    logger.info(
         f"Log file                 : {log_file}",
         extra={"stage": "extraction"},
     )
+    logger.info("=" * 65, extra={"stage": "extraction"})
 
+    # ----------------------------------------------------------------
+    # Threshold diagnostic mode (short-circuit before anything else)
+    # ----------------------------------------------------------------
+    if args.threshold_diagnostic:
+        return run_threshold_diagnostic(args.threshold_diagnostic, logger)
+
+    # ----------------------------------------------------------------
+    # Mode summary
+    # ----------------------------------------------------------------
     mode_str = (
         f"SAMPLE ({_SAMPLE_CLIPS_PER_SIGN} clips/sign/split)"
         if args.sample_only
@@ -1986,16 +2300,6 @@ def main() -> int:
         f"verify_existing={args.verify_existing} | "
         f"dry_run={args.dry_run}",
         extra={"stage": "extraction"},
-    )
-    logger.info(
-        f"Extractor config | "
-        f"max_missing_pct={args.max_missing_frame_pct:.0%} | "
-        f"min_detection_conf={args.min_detection_confidence} | "
-        f"min_tracking_conf={args.min_tracking_confidence}",
-        extra={"stage": "extraction"},
-    )
-    logger.info(
-        "=" * 65, extra={"stage": "extraction"}
     )
 
     # ----------------------------------------------------------------
@@ -2035,7 +2339,8 @@ def main() -> int:
     run_id    = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_stats = _RunStats(
         run_id=run_id,
-        max_missing_frame_pct=args.max_missing_frame_pct,
+        min_detected_frames=args.min_detected_frames,
+        max_missing_pct=args.max_missing_frame_pct,
     )
 
     # ----------------------------------------------------------------
@@ -2106,7 +2411,6 @@ def main() -> int:
             "re-processed.",
             extra={"stage": "extraction"},
         )
-        # Write partial summary before exiting so the user can review progress
         try:
             partial = run_stats.to_dict(status="PARTIAL_INTERRUPTED")
             _write_pipeline_summary(partial, args.summary_dir, logger)
@@ -2163,7 +2467,7 @@ def main() -> int:
         )
 
     # ----------------------------------------------------------------
-    # Write landmark_inventory.csv (aligned with extractor CSV format)
+    # Write landmark_inventory.csv
     # ----------------------------------------------------------------
     _finalise_run(run_stats, args.landmarks_dir, logger)
 
@@ -2176,10 +2480,7 @@ def main() -> int:
     # Sample-mode verification guidance
     # ----------------------------------------------------------------
     if args.sample_only and run_stats.n_extracted > 0:
-        logger.info(
-            "SAMPLE EXTRACTION COMPLETE",
-            extra={"stage": "extraction"},
-        )
+        logger.info("SAMPLE EXTRACTION COMPLETE", extra={"stage": "extraction"})
         logger.info(
             "Manually verify a few output arrays before proceeding:",
             extra={"stage": "extraction"},
@@ -2212,6 +2513,32 @@ def main() -> int:
         )
 
     # ----------------------------------------------------------------
+    # Full extraction — next-step guidance
+    # ----------------------------------------------------------------
+    if not args.sample_only:
+        # Warn specifically if sample .npy files exist from the v1.1 run
+        # (schema v1.1 sidecars will be rejected by v1.2 cache check;
+        # those clips will be automatically re-extracted — this is correct).
+        old_sidecars = list(Path(args.landmarks_dir).rglob("*.meta.json"))
+        if old_sidecars:
+            # Spot-check the first sidecar's schema version
+            try:
+                with open(old_sidecars[0], encoding="utf-8") as f:
+                    sample_meta = json.load(f)
+                stored_ver = sample_meta.get("schema_version", "")
+                if stored_ver != EXTRACTOR_SCHEMA_VERSION:
+                    logger.info(
+                        f"Found {len(old_sidecars)} existing .meta.json sidecar(s) "
+                        f"with schema version '{stored_ver}' "
+                        f"(current: '{EXTRACTOR_SCHEMA_VERSION}'). "
+                        "These will be automatically re-extracted by the v1.2 "
+                        "extractor's cache validation — no action required.",
+                        extra={"stage": "extraction"},
+                    )
+            except Exception:
+                pass
+
+    # ----------------------------------------------------------------
     # Footer
     # ----------------------------------------------------------------
     logger.info("=" * 65, extra={"stage": "extraction"})
@@ -2222,6 +2549,15 @@ def main() -> int:
     )
     logger.info(
         f"  Usable total      : {run_stats.n_usable}",
+        extra={"stage": "extraction"},
+    )
+    logger.info(
+        f"  Policy skip rate  : {run_stats.n_skipped_policy / max(run_stats.n_queued, 1):.1%} "
+        f"(v1.2 expected: ~3-6%%)",
+        extra={"stage": "extraction"},
+    )
+    logger.info(
+        f"  Detection rate    : {run_stats.global_detection_rate:.1%} of decoded frames",
         extra={"stage": "extraction"},
     )
     logger.info(
@@ -2247,9 +2583,8 @@ def main() -> int:
         )
     logger.info("=" * 65, extra={"stage": "extraction"})
 
-    # Return exit code 2 if health checks failed, 0 if all passed.
-    # This allows CI scripts to distinguish between "extraction ran but
-    # something looks off" and "extraction ran cleanly".
+    # Return exit code 2 if health checks failed (log warnings were emitted),
+    # 0 if all health checks passed.
     return 0 if health_ok else 2
 
 
