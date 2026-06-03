@@ -1,0 +1,110 @@
+{
+  "_metadata": {
+    "notebook": "02_landmark_inspection",
+    "generated_at": "2026-06-03T06:41:17.253779",
+    "data_mode": "sample",
+    "extractor_schema": "1.1",
+    "n_usable_clips": 50,
+    "n_signs_covered": 30
+  },
+  "F6_landmark_detection_quality": {
+    "severity": "LOW",
+    "finding": "Global mean both-hands-absent rate: 9.9% over 50 usable clips (v1.1: over decoded frames only). Skip rate at 30% threshold: 76.0%. High-detection-failure signs: ['before', 'blue', 'candy', 'drink', 'finish', 'go', 'house', 'many', 'mother'].",
+    "decision": "Zero-fill policy confirmed adequate. Skip threshold of 30% appropriate. Signs in high_miss list may benefit from lower min_detection_confidence override during future data re-collection."
+  },
+  "F7_sequence_length": {
+    "severity": "MEDIUM",
+    "mean_frames": 36.0,
+    "coverage": {
+      "20": {
+        "pct_clips_fully_covered": 0.3,
+        "mean_content_captured": 0.3048
+      },
+      "30": {
+        "pct_clips_fully_covered": 0.32,
+        "mean_content_captured": 0.4499
+      },
+      "40": {
+        "pct_clips_fully_covered": 0.54,
+        "mean_content_captured": 0.5564
+      },
+      "60": {
+        "pct_clips_fully_covered": 0.8,
+        "mean_content_captured": 0.6636
+      }
+    },
+    "finding": "Mean 36.0 raw frames/clip. At seq_len=30: captures 45% of mean clip content; 32% of clips fully covered. At seq_len=60: captures 66% content.",
+    "decision": "Use seq_len=30 as Stage 5 primary. Group 3 ablation: {20, 30, 40}. Strongly recommended addition: seq_len=60 (captures 66% vs 45% for seq_len=30)."
+  },
+  "F8_normalization": {
+    "severity": "INFO",
+    "finding": "Wrist-relative normalization visually validated. Raw wrist positions scattered across [0,1] screen space; post-normalization wrist is at origin (0,0) by construction. Normalization correctly bypasses zero-filled frames.",
+    "decision": "Implement FeaturePipeline.normalise() exactly as in wrist_relative_normalize() in this notebook (cell 11). Key invariant: only normalize frames where (landmark_array != 0).any() \u2014 zero-filled frames must remain at zero, not shifted to origin.",
+    "implementation_note": "For LEFT_HAND_SLICE [0:63]: wrist = landmark[0:3]; subtract from all 21 landmarks. For RIGHT_HAND_SLICE [63:126]: wrist = landmark[63:66]; same. POSE_SLICE [126:225]: NOT normalized (pose relative to camera center is signal)."
+  },
+  "F9_inter_signer_variability": {
+    "severity": "HIGH",
+    "analysis_sign": "help",
+    "finding": "Substantial across-signer wrist trajectory variability observed for 'help'. Normalization removes absolute position but speed, arc shape, and temporal extent variation remains. 31 train signers vs 7 val signers \u2014 zero signer overlap (signer-aware split). Expected train/val accuracy gap: 15\u201325 percentage points.",
+    "decision": "spatial_temporal augmentation is the primary mitigation. Speed jitter (sample every Nth frame) specifically targets temporal variability. class_weight_balancing=True is mandatory (finding F1, HIGH severity). Per-signer accuracy breakdown (Stage 6) is the key evaluation for this gap.",
+    "high_dominance_signs": [
+      "go",
+      "computer",
+      "birthday",
+      "now",
+      "black",
+      "many"
+    ]
+  },
+  "F10_decode_failures_v11": {
+    "severity": "LOW",
+    "finding": "Extractor v1.1: decode_failure_frames tracked separately. Global codec error rate: 3.891%. Low correlation between decode failures and missing_both_pct confirms the v1.1 fix is working \u2014 codec errors no longer inflate missing_pct denominator.",
+    "decision": "No action required. v1.1 is correctly implemented."
+  },
+  "F11_val_clip_limitation": {
+    "severity": "MEDIUM",
+    "finding": "3 signs have only 1 val clip: ['girl', 'help', 'know']. Per-class val accuracy for these signs is a point estimate with no confidence interval \u2014 one misclassification = 0% val accuracy.",
+    "decision": "Document in LIMITATIONS.md and Stage 6 evaluation. Report macro-averaged F1 not just accuracy, and flag unreliable per-class estimates explicitly."
+  },
+  "stage4_configuration": {
+    "sequence_length": {
+      "default": 30,
+      "ablation": [
+        20,
+        30,
+        40
+      ],
+      "extended": [
+        20,
+        30,
+        40,
+        60
+      ]
+    },
+    "normalization": "wrist_relative",
+    "normalize_pose": false,
+    "missing_frame_policy": "zero_fill",
+    "skip_threshold": 0.3,
+    "augmentation_default": "spatial_temporal",
+    "class_weight_balancing": true,
+    "primary_training_metric": "per_class_f1",
+    "secondary_metric": "accuracy_per_latency_ms",
+    "high_priority_signs_for_augmentation": [
+      "go",
+      "computer",
+      "birthday",
+      "now",
+      "black",
+      "many",
+      "before",
+      "blue",
+      "candy",
+      "drink",
+      "finish",
+      "go",
+      "house",
+      "many",
+      "mother"
+    ]
+  }
+}
