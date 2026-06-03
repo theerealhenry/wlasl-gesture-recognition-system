@@ -1,157 +1,165 @@
 """
 src/features/__init__.py
 =========================
-Public API for the WLASL features package.
-
-This package implements the three-stage feature representation pipeline:
-
-    Stage 3 — Landmark Extraction (extractor.py)
-        MediaPipe Holistic → raw (num_frames, 225) .npy arrays
-        225 = 63 left_hand + 63 right_hand + 99 pose per frame
-
-    Stage 4 — Feature Engineering (pipeline.py, augmentation.py)
-        Normalisation → augmentation (train only) → pad/truncate → float32 tensor
-        FeaturePipeline is the single class used at both training and inference time
-
-Architecture rationale
-----------------------
-The deliberate split between extraction (Stage 3) and feature engineering
-(Stage 4) is a key design decision:
-
-- Extraction produces raw, unpadded arrays indexed to the clip's actual frame
-  count. These are written once to disk and never recomputed.
-- Padding/truncation is deferred to FeaturePipeline so the same .npy files
-  can serve all sequence-length ablation experiments (seq_len ∈ {20, 30, 40})
-  without any re-extraction.
-- Normalisation is applied at read time by FeaturePipeline, not baked into
-  the .npy files, so normalisation strategies can be changed without disk I/O.
-
-Circular import prevention
---------------------------
-Feature layout constants live in ``src.features.constants`` — a standalone,
-dependency-free module. Both this ``__init__.py`` and ``extractor.py`` import
-from ``constants`` directly, so there is no circular dependency:
-
-    __init__.py  →  constants.py   (safe)
-    extractor.py →  constants.py   (safe)
+Public API for the WLASL feature engineering package.
 
 Import surface
 --------------
-Everything a downstream module needs is importable directly from src.features:
+External code (notebooks, pipeline entry points, tests) should import from
+this package rather than reaching into submodules directly. This keeps the
+internal module structure free to change without breaking callers.
 
-    from src.features import (
-        # Layout constants
-        FEATURE_SIZE, LEFT_HAND_SLICE, RIGHT_HAND_SLICE, POSE_SLICE,
-        N_HAND_LANDMARKS, N_POSE_LANDMARKS, N_COORDS_PER_LANDMARK,
-        N_HAND_FEATURES, N_POSE_FEATURES,
-        WRIST_LANDMARK_INDEX, EXTRACTOR_SCHEMA_VERSION,
-        # Stage 3
-        LandmarkExtractor, ExtractionResult, ExtractionStats,
-    )
+Stage availability
+------------------
+Not all submodules exist yet. The import structure below is additive:
+new exports are added as each stage is built and never removed, so
+callers written against the current API remain valid after future stages
+are completed.
 
-FeaturePipeline and augmentation utilities are exported here once Stage 4
-is implemented. Their symbols are pre-declared in __all__ so imports fail
-fast with a clear ImportError rather than a silent AttributeError.
+    Stage 3  (extractor, constants)      — available now
+    Stage 4  (augmentation, pipeline)    — added after Stage 4 is built
 """
 
-from __future__ import annotations
-
 # ---------------------------------------------------------------------------
-# Feature layout constants — re-exported from the dependency-free constants
-# module so that downstream code can do ``from src.features import FEATURE_SIZE``
-# without worrying about which sub-module owns the definition.
+# Stage 3 — Landmark extraction (available now)
 # ---------------------------------------------------------------------------
 
-from src.features.constants import (  # noqa: F401
+# Constants — always import first; they have no dependencies and are needed
+# by both extractor.py and run_landmark_extraction.py.
+from src.features.constants import (
+    # Schema version
+    EXTRACTOR_SCHEMA_VERSION,
+
+    # MediaPipe landmark geometry
     N_HAND_LANDMARKS,
     N_POSE_LANDMARKS,
     N_COORDS_PER_LANDMARK,
+
+    # Derived feature dimensions
     N_HAND_FEATURES,
     N_POSE_FEATURES,
     FEATURE_SIZE,
+
+    # Feature vector slices
     LEFT_HAND_SLICE,
     RIGHT_HAND_SLICE,
     POSE_SLICE,
-    WRIST_LANDMARK_INDEX,
-    NOSE_LANDMARK_INDEX,
-    EXTRACTOR_SCHEMA_VERSION,
+
+    # Wrist indices (used by FeaturePipeline for normalisation)
+    LEFT_HAND_WRIST_LANDMARK_IDX,
+    LEFT_WRIST_FEATURE_START,
+    RIGHT_HAND_WRIST_LANDMARK_IDX,
+    RIGHT_WRIST_FEATURE_START,
+
+    # v1.2 skip policy defaults
+    MIN_DETECTED_FRAMES_DEFAULT,
+    MAX_MISSING_PCT_CATASTROPHE,
+
+    # Sequence length defaults
+    DEFAULT_SEQUENCE_LENGTH,
+    ABLATION_SEQUENCE_LENGTHS,
+
+    # Storage conventions
+    LANDMARK_FILE_EXTENSION,
+    SIDECAR_FILE_EXTENSION,
+    LANDMARK_INVENTORY_FILENAME,
+    LANDMARK_INVENTORY_COLUMNS,
+
+    # Health check thresholds
+    HEALTH_POLICY_SKIP_RATE_WARN,
+    HEALTH_ERROR_RATE_WARN,
+    HEALTH_GLOBAL_MISSING_RATE_WARN,
+
+    # MediaPipe configuration defaults
+    DEFAULT_MODEL_COMPLEXITY,
+    DEFAULT_MIN_DETECTION_CONFIDENCE,
+    DEFAULT_MIN_TRACKING_CONFIDENCE,
 )
 
-# ---------------------------------------------------------------------------
-# Stage 3 exports — LandmarkExtractor
-# (Imported after constants to guarantee no circular dependency)
-# ---------------------------------------------------------------------------
-
-from src.features.extractor import (  # noqa: F401
+# Extractor — MediaPipe Holistic landmark extraction.
+# Heavy imports (cv2, mediapipe) are deferred inside extractor.py; importing
+# this module does NOT trigger MediaPipe initialisation.
+from src.features.extractor import (
+    # Primary extraction class
     LandmarkExtractor,
+
+    # Result data structures
     ExtractionResult,
     ExtractionStats,
+
+    # Batch CSV output helper (used by run_landmark_extraction.py)
+    write_landmark_inventory,
 )
 
 # ---------------------------------------------------------------------------
-# Stage 4 exports — FeaturePipeline, augmentation
-# Lazy import: raises ImportError with a clear, actionable message if the
-# Stage 4 modules have not been built yet, rather than failing silently.
+# Stage 4 — Feature engineering pipeline (not yet built)
 # ---------------------------------------------------------------------------
-
-def __getattr__(name: str):
-    """
-    Lazy imports for Stage 4 symbols.
-
-    Raises ImportError with a clear message if Stage 4 has not been built.
-    """
-    _stage4_symbols = {
-        "FeaturePipeline":       "src.features.pipeline",
-        "AugmentationPipeline":  "src.features.augmentation",
-        "apply_temporal_jitter": "src.features.augmentation",
-        "apply_speed_jitter":    "src.features.augmentation",
-        "apply_spatial_flip":    "src.features.augmentation",
-        "apply_gaussian_noise":  "src.features.augmentation",
-        "apply_rotation":        "src.features.augmentation",
-    }
-
-    if name in _stage4_symbols:
-        module_path = _stage4_symbols[name]
-        raise ImportError(
-            f"'{name}' is a Stage 4 symbol from '{module_path}'. "
-            "Build src/features/pipeline.py and src/features/augmentation.py "
-            "before importing this symbol. Stage 3 (landmark extraction) "
-            "can be used independently without Stage 4."
-        )
-
-    raise AttributeError(f"module 'src.features' has no attribute '{name}'")
-
+# When Stage 4 is complete, add:
+#
+#   from src.features.augmentation import (
+#       TemporalAugmentation,
+#       SpatialAugmentation,
+#       AugmentationPipeline,
+#   )
+#   from src.features.pipeline import FeaturePipeline
+#
+# The API surface below is the target; keep this comment as a placeholder
+# so the Stage 4 author knows exactly where to add their exports.
 
 # ---------------------------------------------------------------------------
-# Public API declaration
+# Package metadata
 # ---------------------------------------------------------------------------
 
 __all__ = [
-    # Feature layout constants
-    "FEATURE_SIZE",
+    # Schema
+    "EXTRACTOR_SCHEMA_VERSION",
+
+    # Geometry constants
     "N_HAND_LANDMARKS",
     "N_POSE_LANDMARKS",
     "N_COORDS_PER_LANDMARK",
     "N_HAND_FEATURES",
     "N_POSE_FEATURES",
+    "FEATURE_SIZE",
+
+    # Slices
     "LEFT_HAND_SLICE",
     "RIGHT_HAND_SLICE",
     "POSE_SLICE",
-    "WRIST_LANDMARK_INDEX",
-    "NOSE_LANDMARK_INDEX",
-    "EXTRACTOR_SCHEMA_VERSION",
 
-    # Stage 3 — Landmark Extraction
+    # Wrist indices
+    "LEFT_HAND_WRIST_LANDMARK_IDX",
+    "LEFT_WRIST_FEATURE_START",
+    "RIGHT_HAND_WRIST_LANDMARK_IDX",
+    "RIGHT_WRIST_FEATURE_START",
+
+    # Skip policy
+    "MIN_DETECTED_FRAMES_DEFAULT",
+    "MAX_MISSING_PCT_CATASTROPHE",
+
+    # Sequence lengths
+    "DEFAULT_SEQUENCE_LENGTH",
+    "ABLATION_SEQUENCE_LENGTHS",
+
+    # Storage
+    "LANDMARK_FILE_EXTENSION",
+    "SIDECAR_FILE_EXTENSION",
+    "LANDMARK_INVENTORY_FILENAME",
+    "LANDMARK_INVENTORY_COLUMNS",
+
+    # Health thresholds
+    "HEALTH_POLICY_SKIP_RATE_WARN",
+    "HEALTH_ERROR_RATE_WARN",
+    "HEALTH_GLOBAL_MISSING_RATE_WARN",
+
+    # MediaPipe defaults
+    "DEFAULT_MODEL_COMPLEXITY",
+    "DEFAULT_MIN_DETECTION_CONFIDENCE",
+    "DEFAULT_MIN_TRACKING_CONFIDENCE",
+
+    # Extractor
     "LandmarkExtractor",
     "ExtractionResult",
     "ExtractionStats",
-
-    # Stage 4 — Feature Engineering (available once pipeline.py is built)
-    "FeaturePipeline",
-    "AugmentationPipeline",
-    "apply_temporal_jitter",
-    "apply_speed_jitter",
-    "apply_spatial_flip",
-    "apply_gaussian_noise",
-    "apply_rotation",
+    "write_landmark_inventory",
 ]
