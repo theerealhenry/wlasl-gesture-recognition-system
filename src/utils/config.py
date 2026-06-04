@@ -114,7 +114,7 @@ class DataConfig(BaseModel):
     landmark_dir: str = "data/landmarks"
     splits_dir: str = "data/splits"
     num_classes: int = Field(35, ge=2, le=2000, description="Number of sign classes")
-    sequence_length: int = Field(30, ge=5, le=120, description="Fixed sequence length in frames")
+    sequence_length: int = Field(60, ge=5, le=150, description="Fixed sequence length in frames")
     padding: PaddingStrategy = PaddingStrategy.POST
     normalisation: NormalisationStrategy = NormalisationStrategy.WRIST_RELATIVE
     missing_frame_strategy: MissingFrameStrategy = MissingFrameStrategy.ZERO_FILL
@@ -124,6 +124,58 @@ class DataConfig(BaseModel):
         le=1.0,
         description="Skip videos where more than this fraction of frames are missing",
     )
+
+    z_coord_clip: float = Field(
+        0.10,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Soft-clip z-coordinates to ±this value after wrist-relative normalisation. "
+            "Removes physically implausible MediaPipe depth outliers. "
+            "Set to 0.0 to disable. Recommended: 0.10 (Notebook 03 finding)."
+        ),
+    )
+    flip_min_hand_presence: float = Field(
+        0.30,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum fraction of frames where BOTH hands must be present "
+            "for spatial flip augmentation to be applied to a clip. "
+            "Enforced at clip level (not sign level) to protect one-handed signs. "
+            "Recommended: 0.30 (Notebook 03 finding)."
+        ),
+    )
+    normalise_pose: bool = Field(
+        False,
+        description=(
+            "Whether to apply wrist-relative normalisation to pose landmarks. "
+            "Should be False: pose body-position is discriminative signal, not noise. "
+            "Confirmed by Notebook 03 analysis."
+        ),
+    )
+
+    landmark_config: str = Field(
+        "full",
+        description=(
+            "Which landmark bands to use as model input. "
+            "One of: 'full' (225 dims, hands+pose), "
+            "'hands_only' (126 dims, left+right hands), "
+            "'pose_only' (99 dims, pose skeleton). "
+            "Controlled by Group 4 ablation. "
+            "Notebook 03: hands_only Fisher=0.752 vs full Fisher=0.432."
+        ),
+    )    
+
+    @field_validator("landmark_config")
+    @classmethod
+    def validate_landmark_config(cls, v: str) -> str:
+        allowed = {"full", "hands_only", "pose_only"}
+        if v not in allowed:
+            raise ValueError(
+                f"landmark_config must be one of {allowed}, got '{v}'. "
+            )
+        return v
 
     @field_validator("raw_dir", "landmark_dir", "splits_dir", mode="before")
     @classmethod
@@ -178,6 +230,15 @@ class AugmentationConfig(BaseModel):
     gaussian_noise_std: float = Field(0.0, ge=0.0, le=0.1)
     rotation_deg: float = Field(0.0, ge=0.0, le=30.0)
     speed_jitter: bool = False
+    gaussian_noise_detected_only: bool = Field(
+        True,
+        description=(
+            "If True, Gaussian noise is applied only to detected (non-zero) landmark "
+            "frames. Zero-filled frames (one-handed signs, detection failures) are "
+            "passed through unchanged. MUST be True to preserve semantic zero-fill signal. "
+            "Notebook 03 finding: zero-fill is discriminative for one-handed signs."
+        ),
+    )
 
 
 class TrainingConfig(BaseModel):
@@ -434,7 +495,7 @@ def load_config(
     model : str
         Model config name. One of: dense, lstm, gru, bilstm.
     data : str
-        Data config name. One of: seq20, seq30, seq40.
+        Data config name. One of: seq20, seq30, seq40, seq60, seq80, seq100.
     augmentation : str
         Augmentation config name. One of: none, temporal, spatial_temporal.
     experiment : str, optional
@@ -637,7 +698,7 @@ training:
   reduce_lr_factor: 0.5
   reduce_lr_min_lr: 1.0e-6
   shuffle: true
-  class_weight_balancing: false
+  class_weight_balancing: true
 
 logging:
   log_dir: logs
@@ -707,7 +768,10 @@ data:
   padding: post
   normalisation: wrist_relative
   missing_frame_strategy: zero_fill
-  max_missing_frame_pct: 0.30
+  max_missing_frame_pct: 0.95
+  z_coord_clip: 0.10
+  flip_min_hand_presence: 0.30
+  normalise_pose: false
   num_classes: 35
 """,
         "data/seq30.yaml": """
@@ -716,7 +780,10 @@ data:
   padding: post
   normalisation: wrist_relative
   missing_frame_strategy: zero_fill
-  max_missing_frame_pct: 0.30
+  max_missing_frame_pct: 0.95
+  z_coord_clip: 0.10
+  flip_min_hand_presence: 0.30
+  normalise_pose: false
   num_classes: 35
 """,
         "data/seq40.yaml": """
@@ -725,19 +792,47 @@ data:
   padding: post
   normalisation: wrist_relative
   missing_frame_strategy: zero_fill
-  max_missing_frame_pct: 0.30
+  max_missing_frame_pct: 0.95
+  z_coord_clip: 0.10
+  flip_min_hand_presence: 0.30
+  normalise_pose: false
   num_classes: 35
 """,
-        "augmentation/none.yaml": """
-# No augmentation — used for all baseline comparison experiments
-augmentation:
-  enabled: false
-  temporal_jitter: false
-  frame_drop_prob: 0.0
-  spatial_flip: false
-  gaussian_noise_std: 0.0
-  rotation_deg: 0.0
-  speed_jitter: false
+        "data/seq60.yaml": """
+data:
+  sequence_length: 60
+  padding: post
+  normalisation: wrist_relative
+  missing_frame_strategy: zero_fill
+  max_missing_frame_pct: 0.95
+  z_coord_clip: 0.10
+  flip_min_hand_presence: 0.30
+  normalise_pose: false
+  num_classes: 35
+""",
+        "data/seq80.yaml": """
+data:
+  sequence_length: 80
+  padding: post
+  normalisation: wrist_relative
+  missing_frame_strategy: zero_fill
+  max_missing_frame_pct: 0.95
+  z_coord_clip: 0.10
+  flip_min_hand_presence: 0.30
+  normalise_pose: false
+  num_classes: 35
+""",
+        "data/seq100.yaml": """
+data:
+  sequence_length: 100
+  padding: post
+  normalisation: wrist_relative
+  missing_frame_strategy: zero_fill
+  max_missing_frame_pct: 0.95
+  z_coord_clip: 0.10
+  flip_min_hand_presence: 0.30
+  normalise_pose: false
+  num_classes: 35
 """,
         "augmentation/temporal.yaml": """
 # Temporal augmentation only
@@ -747,19 +842,35 @@ augmentation:
   frame_drop_prob: 0.10
   spatial_flip: false
   gaussian_noise_std: 0.0
+  gaussian_noise_detected_only: true
   rotation_deg: 0.0
   speed_jitter: true
 """,
         "augmentation/spatial_temporal.yaml": """
-# Full spatial + temporal augmentation — used for final model training
+# Full spatial + temporal augmentation — used for final model training.
+# gaussian_noise_detected_only=true: preserves semantic zero-fill for one-handed signs.
+# spatial_flip enforced at clip level via data.flip_min_hand_presence threshold.
 augmentation:
   enabled: true
   temporal_jitter: true
   frame_drop_prob: 0.10
   spatial_flip: true
   gaussian_noise_std: 0.01
+  gaussian_noise_detected_only: true
   rotation_deg: 5.0
   speed_jitter: true
+""",
+        "augmentation/none.yaml": """
+# No augmentation — used for all baseline comparison experiments
+augmentation:
+  enabled: false
+  temporal_jitter: false
+  frame_drop_prob: 0.0
+  spatial_flip: false
+  gaussian_noise_std: 0.0
+  gaussian_noise_detected_only: true
+  rotation_deg: 0.0
+  speed_jitter: false
 """,
         "experiment/baseline.yaml": """
 # Group 1: Architecture comparison — isolates model type as the single variable
@@ -773,21 +884,29 @@ seed: 42
 """,
         "experiment/ablation_sequence.yaml": """
 # Group 3: Sequence length ablation — fixed LSTM + best augmentation
+# Extended to {20, 30, 40, 60, 80, 100} per Notebook 03 finding:
+# median clip = 67 frames, P75 = 84, P90 = 95
+# seq_len=30 captures only 50.5% of mean content — insufficient.
+# seq_len=60 captures 85% — minimum defensible primary configuration.
 experiment_name: ablation_sequence_length
 seed: 42
 """,
         "experiment/ablation_landmarks.yaml": """
 # Group 4: Landmark configuration ablation
+# Hands-only Fisher = 0.752 (1.74x full-225 baseline of 0.432)
+# Run with best seq_len and best augmentation from Groups 2 and 3.
 experiment_name: ablation_landmark_config
 seed: 42
 """,
         "experiment/best_model.yaml": """
-# Champion model config — used for final training and TFLite export
-experiment_name: best_model_bilstm_spatial_temporal_seq30
+# Champion model config — used for final training and TFLite export.
+# Primary seq_len candidate: 60 (85% mean content coverage per Notebook 03).
+# Final seq_len determined by Group 3 ablation results.
+experiment_name: best_model_bilstm_spatial_temporal_seq60
 seed: 42
 
-# Primary metric: validation accuracy
-# Secondary metric (for deployment ranking): accuracy / median_latency_ms
+training:
+  class_weight_balancing: true
 """,
     }
 
