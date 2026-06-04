@@ -1,0 +1,195 @@
+{
+  "_metadata": {
+    "notebook": "03_full_landmark_analysis",
+    "generated_at": "2026-06-03T21:27:13.802219",
+    "extractor_schema": "1.2",
+    "n_usable_clips": 339,
+    "n_signs_covered": 35,
+    "dataset_mode": "full"
+  },
+  "dataset_quality": {
+    "fisher_raw_plus_velocity": 0.3811,
+    "mean_frames_per_clip": 67.6,
+    "p75_frames": 84.0,
+    "global_detection_rate": 0.6472,
+    "global_missing_both_pct": 0.3528,
+    "decode_failure_rate": 0.02957,
+    "n_isolation_outliers": 17,
+    "fisher_baseline": 0.4316,
+    "fisher_with_velocity": 0.3341,
+    "fisher_xy_only": 0.4116,
+    "fisher_pose_only": 0.1611
+  },
+  "feature_pipeline_spec": {
+    "input_shape": [
+      null,
+      225
+    ],
+    "normalisation": {
+      "type": "wrist_relative",
+      "apply_to": [
+        "left_hand",
+        "right_hand"
+      ],
+      "pose_normalised": false,
+      "zero_fill_mask_guard": true,
+      "note": "Must be identical between training and inference (Stage 7)"
+    },
+    "sequence_length": {
+      "primary": 30,
+      "ablation": [
+        20,
+        30,
+        40,
+        60
+      ],
+      "recommended_primary": 60,
+      "pad_value": 0.0,
+      "truncate_strategy": "centre_crop",
+      "pad_strategy": "right_pad"
+    },
+    "missing_frame_handling": {
+      "policy": "zero_fill_retained",
+      "zero_fill_is_signal": true,
+      "note": "Zero-fill for one-handed signs is semantically informative"
+    },
+    "derived_features": {
+      "include_velocity": "False",
+      "include_acceleration": false,
+      "velocity_note": "Fisher gain: 0.77\u00d7",
+      "retain_z_coords": "True",
+      "include_pose": "False"
+    },
+    "input_to_model": {
+      "primary_feature_size": 225,
+      "with_velocity_size": 450,
+      "dtype": "float32"
+    }
+  },
+  "augmentation_config": {
+    "primary_strategy": "spatial_temporal",
+    "temporal_jitter": true,
+    "frame_drop_prob": 0.1,
+    "frame_drop_safe": true,
+    "dropout_cosine_sim": 1.0,
+    "speed_jitter": true,
+    "speed_jitter_range": [
+      0.7,
+      1.3
+    ],
+    "speed_jitter_priority_signs": [
+      "black",
+      "before",
+      "like",
+      "finish",
+      "give",
+      "go",
+      "thanksgiving",
+      "cousin"
+    ],
+    "gaussian_noise_std": 0.01,
+    "rotation_deg": 5.0,
+    "spatial_flip": "conditional",
+    "flip_safe_signs": [
+      "before",
+      "birthday",
+      "blue",
+      "book",
+      "boy",
+      "can",
+      "candy",
+      "chair",
+      "change",
+      "clothes",
+      "color",
+      "computer",
+      "cousin",
+      "drink",
+      "eat",
+      "family",
+      "friend",
+      "girl",
+      "give",
+      "go",
+      "help",
+      "house",
+      "know",
+      "later",
+      "like",
+      "many",
+      "mother",
+      "name",
+      "now",
+      "orange",
+      "thanksgiving",
+      "think",
+      "who"
+    ],
+    "flip_unsafe_signs": [],
+    "class_weight_balancing": true
+  },
+  "training_configuration": {
+    "primary_metric": "per_class_f1",
+    "secondary_metric": "accuracy_per_latency_ms",
+    "class_weight_balancing": true,
+    "dropout_rate": 0.35,
+    "early_stopping_patience": 10,
+    "batch_size": 32,
+    "learning_rate": 0.001
+  },
+  "stage5_experiment_plan": {
+    "group1_architectures": [
+      "dense_baseline",
+      "lstm_baseline",
+      "lstm_stacked",
+      "gru_baseline",
+      "bilstm_baseline"
+    ],
+    "group2_augmentation": [
+      "lstm_no_aug",
+      "lstm_temporal_aug",
+      "lstm_spatial_temporal_aug"
+    ],
+    "group3_sequence_length": [
+      "lstm_seq20",
+      "lstm_seq30",
+      "lstm_seq40",
+      "lstm_seq60"
+    ],
+    "group4_landmark_config": [
+      "lstm_hands_only",
+      "lstm_pose_only",
+      "lstm_full"
+    ],
+    "expected_baseline_val_acc": "40-55% (Dense)",
+    "target_val_acc": "\u226570% (BiLSTM + spatial_temporal + seq60)",
+    "known_hard_signs": [
+      {
+        "sign_a": "black",
+        "sign_b": "cousin",
+        "distance": 1.3685373067855835
+      },
+      {
+        "sign_a": "drink",
+        "sign_b": "girl",
+        "distance": 1.4138191938400269
+      },
+      {
+        "sign_a": "black",
+        "sign_b": "mother",
+        "distance": 1.4412940740585327
+      },
+      {
+        "sign_a": "cousin",
+        "sign_b": "eat",
+        "distance": 1.5731087923049927
+      },
+      {
+        "sign_a": "blue",
+        "sign_b": "who",
+        "distance": 1.6170529127120972
+      }
+    ]
+  },
+  "data_constraints_narrative": "The dataset contains 339 usable clips across 35 classes (mean 67.6 frames/clip, global detection rate 64.7%). The signer-aware train/val/test split ensures zero overlap. All accuracy numbers must be contextualised against the severely constrained working set (~9 clips/class mean). Achieving \u226570% val accuracy requires aggressive augmentation, class weight balancing, and careful regularisation."
+}
