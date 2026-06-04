@@ -1,0 +1,10 @@
+data:
+  sequence_length: 60
+  padding: post
+  normalisation: wrist_relative
+  missing_frame_strategy: zero_fill
+  max_missing_frame_pct: 0.95
+  z_coord_clip: 0.10
+  flip_min_hand_presence: 0.30
+  normalise_pose: false
+  num_classes: 35

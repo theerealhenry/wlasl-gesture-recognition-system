@@ -1,0 +1,39 @@
+# =============================================================================
+# base.yaml — Global defaults for all experiments
+# All values here can be overridden by model/, data/, augmentation/ configs.
+# =============================================================================
+
+experiment_name: "unnamed_experiment"
+seed: 42
+num_classes: 35
+
+training:
+  batch_size: 32
+  epochs: 50
+  learning_rate: 0.001
+  early_stopping_patience: 10
+  early_stopping_monitor: val_accuracy
+  early_stopping_mode: max
+  reduce_lr_patience: 5
+  reduce_lr_factor: 0.5
+  reduce_lr_min_lr: 1.0e-6
+  shuffle: true
+  class_weight_balancing: true
+
+logging:
+  log_dir: logs
+  level: INFO
+  file_level: DEBUG
+
+mlflow:
+  experiment_name: "WLASL-35-class"
+  tracking_uri: mlruns
+  register_best_model: true
+  model_registry_name: gesture-lstm-production
+
+export:
+  output_dir: models
+  quantise: true
+  quantisation_mode: dynamic_range
+  representative_dataset_size: 100
+  max_accuracy_delta: 0.03

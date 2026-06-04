@@ -1,0 +1,9 @@
+# Dense feedforward baseline — non-temporal, used to prove sequence modelling matters
+model:
+  name: dense
+  hidden_units: 512
+  num_layers: 2
+  dropout: 0.4
+  bidirectional: false
+  dense_units: 128
+  activation: relu

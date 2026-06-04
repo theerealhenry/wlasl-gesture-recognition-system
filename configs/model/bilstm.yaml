@@ -1,0 +1,9 @@
+# Bidirectional LSTM — best accuracy candidate, higher latency
+model:
+  name: bilstm
+  hidden_units: 128
+  num_layers: 2
+  dropout: 0.3
+  bidirectional: true
+  dense_units: 64
+  activation: relu

@@ -1,0 +1,10 @@
+# Temporal augmentation only
+augmentation:
+  enabled: true
+  temporal_jitter: true
+  frame_drop_prob: 0.10
+  spatial_flip: false
+  gaussian_noise_std: 0.0
+  gaussian_noise_detected_only: true
+  rotation_deg: 0.0
+  speed_jitter: true

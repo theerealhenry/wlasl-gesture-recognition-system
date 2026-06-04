@@ -1,0 +1,10 @@
+# No augmentation — used for all baseline comparison experiments
+augmentation:
+  enabled: false
+  temporal_jitter: false
+  frame_drop_prob: 0.0
+  spatial_flip: false
+  gaussian_noise_std: 0.0
+  gaussian_noise_detected_only: true
+  rotation_deg: 0.0
+  speed_jitter: false

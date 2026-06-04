@@ -1,0 +1,8 @@
+# Champion model config — used for final training and TFLite export.
+# Primary seq_len candidate: 60 (85% mean content coverage per Notebook 03).
+# Final seq_len determined by Group 3 ablation results.
+experiment_name: best_model_bilstm_spatial_temporal_seq60
+seed: 42
+
+training:
+  class_weight_balancing: true

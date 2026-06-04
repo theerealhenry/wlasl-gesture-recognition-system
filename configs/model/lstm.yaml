@@ -1,0 +1,9 @@
+# LSTM — core sequence baseline
+model:
+  name: lstm
+  hidden_units: 128
+  num_layers: 2
+  dropout: 0.3
+  bidirectional: false
+  dense_units: 64
+  activation: relu

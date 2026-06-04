@@ -1,0 +1,3 @@
+# Group 2: Augmentation ablation — fixed LSTM + seq30, varies augmentation
+experiment_name: ablation_augmentation
+seed: 42

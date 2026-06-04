@@ -1,0 +1,12 @@
+# Full spatial + temporal augmentation — used for final model training.
+# gaussian_noise_detected_only=true: preserves semantic zero-fill for one-handed signs.
+# spatial_flip enforced at clip level via data.flip_min_hand_presence threshold.
+augmentation:
+  enabled: true
+  temporal_jitter: true
+  frame_drop_prob: 0.10
+  spatial_flip: true
+  gaussian_noise_std: 0.01
+  gaussian_noise_detected_only: true
+  rotation_deg: 5.0
+  speed_jitter: true

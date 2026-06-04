@@ -1,0 +1,7 @@
+# Group 3: Sequence length ablation — fixed LSTM + best augmentation
+# Extended to {20, 30, 40, 60, 80, 100} per Notebook 03 finding:
+# median clip = 67 frames, P75 = 84, P90 = 95
+# seq_len=30 captures only 50.5% of mean content — insufficient.
+# seq_len=60 captures 85% — minimum defensible primary configuration.
+experiment_name: ablation_sequence_length
+seed: 42
