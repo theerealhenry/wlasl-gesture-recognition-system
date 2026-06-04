@@ -74,6 +74,18 @@ from src.features.constants import (
     DEFAULT_MODEL_COMPLEXITY,
     DEFAULT_MIN_DETECTION_CONFIDENCE,
     DEFAULT_MIN_TRACKING_CONFIDENCE,
+
+    # Stage 4 — Feature pipeline constants
+    Z_COORD_CLIP_DEFAULT,
+    FLIP_MIN_HAND_PRESENCE_DEFAULT,
+    AUGMENTATION_NOISE_STD_DEFAULT,
+    AUGMENTATION_ROTATION_DEG_DEFAULT,
+    AUGMENTATION_FRAME_DROP_PROB_DEFAULT,
+    AUGMENTATION_SPEED_RANGE,
+    TRUNCATION_STRATEGY,
+    TRUNCATION_WARN_FRACTION,
+    LANDMARK_CONFIGS,
+    MIN_USABLE_DETECTED_FRAMES,
 )
 
 # Extractor — MediaPipe Holistic landmark extraction.
@@ -92,19 +104,20 @@ from src.features.extractor import (
 )
 
 # ---------------------------------------------------------------------------
-# Stage 4 — Feature engineering pipeline (not yet built)
+# Stage 4 — Feature engineering pipeline (add after Stage 4 is built)
 # ---------------------------------------------------------------------------
-# When Stage 4 is complete, add:
+# Uncomment these as each file is created during Stage 4:
 #
-#   from src.features.augmentation import (
-#       TemporalAugmentation,
-#       SpatialAugmentation,
-#       AugmentationPipeline,
-#   )
-#   from src.features.pipeline import FeaturePipeline
-#
-# The API surface below is the target; keep this comment as a placeholder
-# so the Stage 4 author knows exactly where to add their exports.
+# from src.features.augmentation import (
+#     TemporalAugmenter,
+#     SpatialAugmenter,
+#     AugmentationPipeline,
+# )
+# from src.features.pipeline import (
+#     FeaturePipeline,
+#     PipelineConfig,
+#     build_pipeline,
+# )
 
 # ---------------------------------------------------------------------------
 # Package metadata
@@ -162,4 +175,16 @@ __all__ = [
     "ExtractionResult",
     "ExtractionStats",
     "write_landmark_inventory",
+
+    # Stage 4 constants
+    "Z_COORD_CLIP_DEFAULT",
+    "FLIP_MIN_HAND_PRESENCE_DEFAULT",
+    "AUGMENTATION_NOISE_STD_DEFAULT",
+    "AUGMENTATION_ROTATION_DEG_DEFAULT",
+    "AUGMENTATION_FRAME_DROP_PROB_DEFAULT",
+    "AUGMENTATION_SPEED_RANGE",
+    "TRUNCATION_STRATEGY",
+    "TRUNCATION_WARN_FRACTION",
+    "LANDMARK_CONFIGS",
+    "MIN_USABLE_DETECTED_FRAMES",
 ]
