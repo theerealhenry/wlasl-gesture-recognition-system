@@ -245,10 +245,10 @@ MAX_MISSING_PCT_CATASTROPHE: float = 0.95
 
 #: Default sequence length used by FeaturePipeline when padding/truncating.
 #: Stage 5 ablation covers {20, 30, 40, 60}. This default matches base.yaml.
-DEFAULT_SEQUENCE_LENGTH: int = 30
+DEFAULT_SEQUENCE_LENGTH: int = 60
 
 #: Sequence lengths included in the Stage 5 ablation.
-ABLATION_SEQUENCE_LENGTHS: tuple[int, ...] = (20, 30, 40, 60)
+ABLATION_SEQUENCE_LENGTHS: tuple[int, ...] = (20, 30, 40, 60, 80, 100)
 
 # ---------------------------------------------------------------------------
 # Storage conventions
@@ -321,3 +321,54 @@ DEFAULT_MIN_DETECTION_CONFIDENCE: float = 0.5
 #: Default minimum tracking confidence for MediaPipe Holistic.
 #: MUST be identical between Stage 3 (extraction) and Stage 7 (inference).
 DEFAULT_MIN_TRACKING_CONFIDENCE: float = 0.5
+
+# ---------------------------------------------------------------------------
+# Stage 4 — Feature pipeline constants
+# ---------------------------------------------------------------------------
+
+#: Z-coordinate soft-clip bound (applied after wrist-relative normalisation).
+#: Z values beyond ±0.10 are physically implausible MediaPipe depth estimates.
+#: Confirmed by Notebook 03 z-coordinate distribution analysis.
+Z_COORD_CLIP_DEFAULT: float = 0.10
+
+#: Minimum fraction of frames where both hands must be present for spatial
+#: flip augmentation to be considered safe for a given clip.
+#: Enforced at clip level (not sign level) to protect one-handed sign semantics.
+#: Confirmed by Notebook 03 one-handed proportion analysis.
+FLIP_MIN_HAND_PRESENCE_DEFAULT: float = 0.30
+
+#: Gaussian noise standard deviation for spatial augmentation.
+#: Calibrated to ~6% of mean xy signal (0.01 / 0.16 ≈ 6%).
+#: Large enough to regularise; small enough to preserve wrist-relative shape.
+AUGMENTATION_NOISE_STD_DEFAULT: float = 0.01
+
+#: Maximum rotation in degrees for spatial rotation augmentation.
+AUGMENTATION_ROTATION_DEG_DEFAULT: float = 5.0
+
+#: Frame dropout probability for temporal jitter augmentation.
+AUGMENTATION_FRAME_DROP_PROB_DEFAULT: float = 0.10
+
+#: Speed jitter range: clip is resampled at a rate drawn from this range.
+#: [0.7, 1.3] creates ±30% speed variation without destroying sign structure.
+AUGMENTATION_SPEED_RANGE: tuple[float, float] = (0.7, 1.3)
+
+#: Centre-crop truncation: fraction of frames removed from each end.
+#: If seq_len < num_frames, remove (num_frames - seq_len) // 2 from start
+#: and remainder from end. This keeps the sign's peak motion centred.
+TRUNCATION_STRATEGY: str = "centre"
+
+#: Truncation warning threshold: log WARNING if more than this fraction
+#: of a clip's frames are truncated (i.e. seq_len < num_frames * threshold).
+TRUNCATION_WARN_FRACTION: float = 0.50
+
+#: Landmark configuration names for Group 4 ablation.
+LANDMARK_CONFIGS: dict[str, slice] = {
+    "hands_only":  slice(0, N_HAND_FEATURES * 2),    # [0:126]
+    "pose_only":   slice(N_HAND_FEATURES * 2, FEATURE_SIZE),  # [126:225]
+    "full":        slice(0, FEATURE_SIZE),             # [0:225]
+}
+
+#: Minimum number of detected frames in a clip for it to be included
+#: in training batches after extraction. Clips below this are filtered
+#: out at dataset load time (separate from extractor skip policy).
+MIN_USABLE_DETECTED_FRAMES: int = 10
