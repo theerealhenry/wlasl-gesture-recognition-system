@@ -11,17 +11,12 @@ internal module structure free to change without breaking callers.
 
 Stage availability
 ------------------
-Not all submodules exist yet. The import structure below is additive:
-new exports are added as each stage is built and never removed, so
-callers written against the current API remain valid after future stages
-are completed.
-
-    Stage 3  (extractor, constants)      — available now
-    Stage 4  (augmentation, pipeline)    — added after Stage 4 is built
+    Stage 3  (extractor, constants)                        — available
+    Stage 4  (augmentation, pipeline, dataset)             — available
 """
 
 # ---------------------------------------------------------------------------
-# Stage 3 — Landmark extraction (available now)
+# Stage 3 — Landmark extraction
 # ---------------------------------------------------------------------------
 
 # Constants — always import first; they have no dependencies and are needed
@@ -92,42 +87,39 @@ from src.features.constants import (
 # Heavy imports (cv2, mediapipe) are deferred inside extractor.py; importing
 # this module does NOT trigger MediaPipe initialisation.
 from src.features.extractor import (
-    # Primary extraction class
     LandmarkExtractor,
-
-    # Result data structures
     ExtractionResult,
     ExtractionStats,
-
-    # Batch CSV output helper (used by run_landmark_extraction.py)
     write_landmark_inventory,
 )
 
 # ---------------------------------------------------------------------------
-# Stage 4 — Feature engineering pipeline (add after Stage 4 is built)
+# Stage 4 — Feature engineering pipeline
 # ---------------------------------------------------------------------------
-# Uncomment these as each file is created during Stage 4:
-#
-# from src.features.augmentation import (
-#     TemporalAugmenter,
-#     SpatialAugmenter,
-#     AugmentationPipeline,
-# )
-# from src.features.pipeline import (
-#     FeaturePipeline,
-#     PipelineConfig,
-#     build_pipeline,
-# )
+
+from src.features.augmentation import (
+    TemporalAugmenter,
+    SpatialAugmenter,
+    AugmentationPipeline,
+)
+
+from src.features.pipeline import (
+    FeaturePipeline,
+)
+
+from src.features.dataset import (
+    GestureDataset,
+)
 
 # ---------------------------------------------------------------------------
 # Package metadata
 # ---------------------------------------------------------------------------
 
 __all__ = [
-    # Schema
+    # ── Stage 3: Schema ───────────────────────────────────────────────────
     "EXTRACTOR_SCHEMA_VERSION",
 
-    # Geometry constants
+    # ── Stage 3: Geometry constants ───────────────────────────────────────
     "N_HAND_LANDMARKS",
     "N_POSE_LANDMARKS",
     "N_COORDS_PER_LANDMARK",
@@ -135,48 +127,48 @@ __all__ = [
     "N_POSE_FEATURES",
     "FEATURE_SIZE",
 
-    # Slices
+    # ── Stage 3: Feature vector slices ────────────────────────────────────
     "LEFT_HAND_SLICE",
     "RIGHT_HAND_SLICE",
     "POSE_SLICE",
 
-    # Wrist indices
+    # ── Stage 3: Wrist indices ────────────────────────────────────────────
     "LEFT_HAND_WRIST_LANDMARK_IDX",
     "LEFT_WRIST_FEATURE_START",
     "RIGHT_HAND_WRIST_LANDMARK_IDX",
     "RIGHT_WRIST_FEATURE_START",
 
-    # Skip policy
+    # ── Stage 3: Skip policy ──────────────────────────────────────────────
     "MIN_DETECTED_FRAMES_DEFAULT",
     "MAX_MISSING_PCT_CATASTROPHE",
 
-    # Sequence lengths
+    # ── Stage 3: Sequence lengths ─────────────────────────────────────────
     "DEFAULT_SEQUENCE_LENGTH",
     "ABLATION_SEQUENCE_LENGTHS",
 
-    # Storage
+    # ── Stage 3: Storage conventions ──────────────────────────────────────
     "LANDMARK_FILE_EXTENSION",
     "SIDECAR_FILE_EXTENSION",
     "LANDMARK_INVENTORY_FILENAME",
     "LANDMARK_INVENTORY_COLUMNS",
 
-    # Health thresholds
+    # ── Stage 3: Health check thresholds ──────────────────────────────────
     "HEALTH_POLICY_SKIP_RATE_WARN",
     "HEALTH_ERROR_RATE_WARN",
     "HEALTH_GLOBAL_MISSING_RATE_WARN",
 
-    # MediaPipe defaults
+    # ── Stage 3: MediaPipe defaults ───────────────────────────────────────
     "DEFAULT_MODEL_COMPLEXITY",
     "DEFAULT_MIN_DETECTION_CONFIDENCE",
     "DEFAULT_MIN_TRACKING_CONFIDENCE",
 
-    # Extractor
+    # ── Stage 3: Extractor classes ────────────────────────────────────────
     "LandmarkExtractor",
     "ExtractionResult",
     "ExtractionStats",
     "write_landmark_inventory",
 
-    # Stage 4 constants
+    # ── Stage 4: Feature pipeline constants ───────────────────────────────
     "Z_COORD_CLIP_DEFAULT",
     "FLIP_MIN_HAND_PRESENCE_DEFAULT",
     "AUGMENTATION_NOISE_STD_DEFAULT",
@@ -187,4 +179,15 @@ __all__ = [
     "TRUNCATION_WARN_FRACTION",
     "LANDMARK_CONFIGS",
     "MIN_USABLE_DETECTED_FRAMES",
+
+    # ── Stage 4: Augmentation classes ─────────────────────────────────────
+    "TemporalAugmenter",
+    "SpatialAugmenter",
+    "AugmentationPipeline",
+
+    # ── Stage 4: Pipeline class ───────────────────────────────────────────
+    "FeaturePipeline",
+
+    # ── Stage 4: Dataset class ────────────────────────────────────────────
+    "GestureDataset",
 ]
