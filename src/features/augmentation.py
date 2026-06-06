@@ -875,19 +875,9 @@ class AugmentationPipeline:
                 drop_prob=float(self._config.frame_drop_prob),
             )
 
-            print(
-            "AFTER TEMPORAL:",
-            np.where(~arr.any(axis=1))[0]
-            )
-
         # 2. Resample at random speed
         if self._config.speed_jitter:
             arr = self._temporal.speed_jitter(arr, rng)
-        
-            print(
-            "AFTER SPEED:",
-            np.where(~arr.any(axis=1))[0]
-            )
 
         # 3. Add per-slot noise to detected components only
         if self._config.gaussian_noise_std > 0.0:
@@ -898,21 +888,12 @@ class AugmentationPipeline:
                 detected_only=bool(self._config.gaussian_noise_detected_only),
             )
 
-            print(
-            "AFTER NOISE:",
-            np.where(~arr.any(axis=1))[0]
-            )
-
         # 4. Rotate hand landmarks around wrist origin
         if self._config.rotation_deg > 0.0:
             arr = self._spatial.rotation_2d(
                 arr,
                 rng,
                 max_deg=float(self._config.rotation_deg),
-            )
-            print(
-            "AFTER ROT:",
-            np.where(~arr.any(axis=1))[0]
             )
 
         # 5. Per-frame-aware mirror + hand-slot reassignment
@@ -921,10 +902,6 @@ class AugmentationPipeline:
                 arr,
                 rng,
                 min_hand_presence=self._flip_threshold,
-            )
-            print(
-            "AFTER FLIP:",
-            np.where(~arr.any(axis=1))[0]
             )
 
         return arr
