@@ -860,9 +860,6 @@ class AugmentationPipeline:
         # Per-clip RNG: XOR base seed with clip_idx
         rng = np.random.default_rng(self._seed ^ int(clip_idx))
 
-        zero_rows_before = np.where(~arr.any(axis=1))[0]
-        print("INPUT ZERO ROWS:", zero_rows_before)
-
         # -------------------------------------------------------------------
         # Transform chain
         # -------------------------------------------------------------------
