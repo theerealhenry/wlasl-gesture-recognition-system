@@ -776,6 +776,70 @@ class FeaturePipeline:
             Shape (seq_len, feature_dim). May be a view of ``arr``.
         """
         return arr[:, self._lm_slice]
+    
+    def pre_augmentation(self, arr: np.ndarray) -> np.ndarray:
+        """
+        Apply the deterministic prefix of the transform chain WITHOUT augmentation
+        or landmark config selection.
+
+        Used by GestureDataset to build the per-epoch augmentation cache.
+        The returned (seq_len, 225) array feeds AugmentationPipeline each epoch,
+        after which landmark config slicing is applied inside _build_augmented_dataset().
+
+        This is a PUBLIC method — GestureDataset calls it directly and NEVER
+        calls any private pipeline method.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Raw landmark array of shape (T_raw, 225), any floating-point dtype.
+
+        Returns
+        -------
+        np.ndarray
+            Shape (seq_len, 225), dtype float32.
+            Produced by: validate → copy+cast → wrist_norm → z_clip → pad_truncate.
+            No augmentation. No landmark config slicing.
+        """
+        if not isinstance(arr, np.ndarray):
+            raise ValueError(
+                f"pre_augmentation expects a numpy ndarray, got {type(arr).__name__}."
+            )
+        if arr.ndim != 2:
+            raise ValueError(
+                f"pre_augmentation expects a 2D array (T_raw, {FEATURE_SIZE}), "
+                f"got ndim={arr.ndim}, shape={arr.shape}."
+            )
+        if arr.shape[0] == 0:
+            raise ValueError(
+                f"pre_augmentation received an empty clip (0 frames). "
+                "Check the .npy file for this video_id."
+            )
+        if arr.shape[1] != FEATURE_SIZE:
+            raise ValueError(
+                f"pre_augmentation expects feature dimension {FEATURE_SIZE}, "
+                f"got {arr.shape[1]}. Always pass the full 225-dim array."
+            )
+
+        arr = arr.astype(np.float32, copy=True)
+
+        if not np.isfinite(arr).all():
+            n_nan = int(np.isnan(arr).sum())
+            n_inf = int(np.isinf(arr).sum())
+            raise ValueError(
+                f"pre_augmentation received non-finite values (NaN={n_nan}, Inf={n_inf})."
+            )
+
+        arr = self._wrist_relative_normalise(arr)
+
+        if self._z_clip > 0.0:
+            arr = self._apply_z_clip(arr)
+
+        arr = self._pad_or_truncate(arr)
+
+        # NOTE: no augmentation, no landmark config slicing.
+        # Output is always (seq_len, 225) regardless of self._lm_config.
+        return arr.astype(np.float32, copy=False)
 
     # ------------------------------------------------------------------
     # Properties
