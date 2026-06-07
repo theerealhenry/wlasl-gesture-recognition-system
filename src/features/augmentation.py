@@ -358,6 +358,44 @@ class TemporalAugmenter:
         rng: Generator,
         speed_range: tuple[float, float] = AUGMENTATION_SPEED_RANGE,
     ) -> np.ndarray:
+        """
+        Resample the clip at a random speed, return array of same length.
+
+        For slower clips (rate < 1.0): n_resampled > T frames are extracted,
+        then centre-cropped back to T.
+
+        For faster clips (rate > 1.0): n_resampled < T frames are extracted,
+        then interpolated back to T frames using zero-aware linear interpolation.
+
+        Zero-fill invariant for interpolation
+        --------------------------------------
+        Standard np.interp blends values across frame boundaries. At the boundary
+        between a detected frame and a zero-fill frame, this produces non-zero
+        values in what were originally zero-fill slots — violating the zero-fill
+        invariant for one-handed signs.
+
+        Fix: after interpolation, for each output frame, identify the floor and
+        ceil source indices. If BOTH surrounding source frames have zero in a
+        given component slot, the output frame is forced to zero for that slot.
+
+        At a detected↔zero-fill boundary, the floor and ceil differ in zero
+        status, so interpolation proceeds normally (a blended transition value
+        is acceptable there). Only deep-interior zero-fill frames — where both
+        surrounding source frames are zero — are forced back to zero.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Input landmark array, shape (T, D), any floating-point dtype.
+        rng : numpy.random.Generator
+        speed_range : tuple[float, float]
+            (lo, hi) rate range. Rate > 1.0 = faster sign, rate < 1.0 = slower.
+
+        Returns
+        -------
+        np.ndarray
+            Shape (T, D), dtype float32.
+        """
         _validate_landmark_array(arr, "speed_jitter")
 
         lo, hi = _validate_speed_range(speed_range, "speed_jitter")
@@ -382,10 +420,13 @@ class TemporalAugmenter:
             start  = excess // 2
             return arr_resampled[start : start + T].astype(np.float32, copy=True)
 
-        # Faster clip — interpolate back to T frames
-        target_idx = np.linspace(0, n_resampled - 1, T)
-        source_idx = np.arange(n_resampled)
+        # ----------------------------------------------------------------
+        # Faster clip — zero-aware interpolation back to T frames
+        # ----------------------------------------------------------------
+        target_idx = np.linspace(0, n_resampled - 1, T)   # (T,) float
+        source_idx = np.arange(n_resampled, dtype=np.float64)
 
+        # Step 1: standard per-feature linear interpolation
         result = np.empty((T, D), dtype=np.float32)
         for d in range(D):
             result[:, d] = np.interp(
@@ -393,6 +434,46 @@ class TemporalAugmenter:
                 source_idx,
                 arr_resampled[:, d].astype(np.float64),
             )
+
+        # Step 2: zero-fill invariant enforcement
+        #
+        # For each output frame, find the floor and ceil source indices.
+        # If both surrounding source frames are zero for a component slot,
+        # the output frame must also be zero for that slot.
+        #
+        # At a detected↔zero boundary (floor detected, ceil zero or vice
+        # versa), the interpolated blend is kept — it represents a valid
+        # transition. Only frames where BOTH neighbours are zero are forced
+        # back to zero.
+        floor_idx = np.clip(
+            np.floor(target_idx).astype(np.int64), 0, n_resampled - 1
+        )
+        ceil_idx = np.clip(
+            np.ceil(target_idx).astype(np.int64), 0, n_resampled - 1
+        )
+
+        # Per-component-slot zero masks on the RESAMPLED array
+        # shape (n_resampled,) bool — True where the slot is all-zero
+        lh_zero_rs   = ~arr_resampled[:, LEFT_HAND_SLICE].any(axis=1)
+        rh_zero_rs   = ~arr_resampled[:, RIGHT_HAND_SLICE].any(axis=1)
+        pose_zero_rs = ~arr_resampled[:, POSE_SLICE].any(axis=1)
+
+        # shape (T,) bool — True where BOTH surrounding source frames are zero
+        lh_both_zero   = lh_zero_rs[floor_idx]   & lh_zero_rs[ceil_idx]
+        rh_both_zero   = rh_zero_rs[floor_idx]   & rh_zero_rs[ceil_idx]
+        pose_both_zero = pose_zero_rs[floor_idx] & pose_zero_rs[ceil_idx]
+
+        if lh_both_zero.any():
+            result[lh_both_zero,
+                LEFT_HAND_SLICE.start:LEFT_HAND_SLICE.stop] = 0.0
+
+        if rh_both_zero.any():
+            result[rh_both_zero,
+                RIGHT_HAND_SLICE.start:RIGHT_HAND_SLICE.stop] = 0.0
+
+        if pose_both_zero.any():
+            result[pose_both_zero,
+                POSE_SLICE.start:POSE_SLICE.stop] = 0.0
 
         return result
 
