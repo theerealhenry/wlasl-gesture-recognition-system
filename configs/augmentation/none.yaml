@@ -1,4 +1,6 @@
-# No augmentation — used for all baseline comparison experiments
+# No augmentation — used for all baseline comparison experiments (Group 1).
+# augmentation.enabled=False: AugmentationPipeline.__call__() returns
+# arr.astype(float32, copy=True) immediately without running any transform.
 augmentation:
   enabled: false
   temporal_jitter: false

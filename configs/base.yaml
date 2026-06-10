@@ -1,6 +1,14 @@
 # =============================================================================
 # base.yaml — Global defaults for all experiments
 # All values here can be overridden by model/, data/, augmentation/ configs.
+#
+# Stage 5 changes:
+#   training.epochs: 50 → 80
+#       Signer-independent splits + class weighting on 236 clips converge
+#       slowly. Early stopping (patience=15) handles termination.
+#   training.early_stopping_patience: 10 → 15
+#       Gives ReduceLROnPlateau (patience=5) room to fire twice before
+#       early stopping terminates the run.
 # =============================================================================
 
 experiment_name: "unnamed_experiment"
@@ -9,9 +17,9 @@ num_classes: 35
 
 training:
   batch_size: 32
-  epochs: 50
+  epochs: 80
   learning_rate: 0.001
-  early_stopping_patience: 10
+  early_stopping_patience: 15
   early_stopping_monitor: val_accuracy
   early_stopping_mode: max
   reduce_lr_patience: 5

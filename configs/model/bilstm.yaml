@@ -1,9 +1,21 @@
-# Bidirectional LSTM — best accuracy candidate, higher latency
+# BiLSTM — champion model candidate.
+# Bidirectional: each timestep sees past + future context.
+# Sign resolution (how a sign ends) is as discriminative as onset.
+# CRITICAL: hidden_units MUST be even — build_bilstm() uses hidden_units // 2
+# per direction. With merge_mode="concat", output width = 2 × (hidden_units // 2).
+#
+# Ablation default (this file):
+#   hidden_units=64 → 32 units/direction → concat output=64 (matches LSTM width)
+# Champion run (override via run_all_experiments.py or best_model.yaml):
+#   hidden_units=128 → 64 units/direction → concat output=128
+#
+
 model:
   name: bilstm
-  hidden_units: 128
+  hidden_units: 64
   num_layers: 2
   dropout: 0.3
+  recurrent_dropout: 0.1
   bidirectional: true
   dense_units: 64
   activation: relu

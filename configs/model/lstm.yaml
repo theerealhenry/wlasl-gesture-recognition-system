@@ -1,9 +1,14 @@
-# LSTM — core sequence baseline
+# LSTM — primary ablation architecture (Groups 2, 3, 4 fix architecture to LSTM).
+# hidden_units=64: ablation default. Champion run uses 128 via override.
+# recurrent_dropout=0.1: lighter than dropout=0.3 to avoid gradient instability
+# in stacked recurrent networks on short sequences. Sets >0 disables CuDNN
+# fast-path in TF 2.13 — not a concern for CPU training on WLASL (236 clips).
 model:
   name: lstm
-  hidden_units: 128
+  hidden_units: 64
   num_layers: 2
   dropout: 0.3
+  recurrent_dropout: 0.1
   bidirectional: false
   dense_units: 64
   activation: relu

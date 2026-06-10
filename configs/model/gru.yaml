@@ -1,9 +1,14 @@
-# GRU — fewer parameters than LSTM, often comparable accuracy, faster inference
+# GRU — streamlined alternative to LSTM.
+# Fewer parameters per unit (2 gates vs LSTM's 3) → lower latency.
+# Expected: within 1–3pp of LSTM accuracy; preferred deployment candidate
+# if accuracy matches (smaller model, faster TFLite inference on Android).
+# hidden_units=64: ablation default (same as LSTM for fair comparison).
 model:
   name: gru
-  hidden_units: 128
+  hidden_units: 64
   num_layers: 2
   dropout: 0.3
+  recurrent_dropout: 0.1
   bidirectional: false
   dense_units: 64
   activation: relu

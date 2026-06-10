@@ -1,5 +1,6 @@
-# Group 4: Landmark configuration ablation
-# Hands-only Fisher = 0.752 (1.74x full-225 baseline of 0.432)
-# Run with best seq_len and best augmentation from Groups 2 and 3.
+# Group 4: Landmark configuration ablation.
+# Fixed: LSTM, best augmentation (Group 2), best seq_len (Group 3).
+# Configs: hands_only (Fisher=0.810), pose_only (Fisher=0.218), full (Fisher=0.549).
+# Run hands_only first: highest Fisher ratio, most likely to outperform full.
 experiment_name: ablation_landmark_config
 seed: 42

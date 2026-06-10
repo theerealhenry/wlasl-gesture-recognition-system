@@ -1,3 +1,4 @@
-# Group 2: Augmentation ablation — fixed LSTM + seq30, varies augmentation
+# Group 2: Augmentation ablation — fixed LSTM + seq60, varies augmentation.
+# Runs: lstm_no_aug, lstm_temporal_aug, lstm_spatial_temporal_aug.
 experiment_name: ablation_augmentation
 seed: 42

@@ -1,9 +1,14 @@
-# Dense feedforward baseline — non-temporal, used to prove sequence modelling matters
+# Dense feedforward baseline — non-temporal, proves sequence modelling matters.
+# Expected accuracy: 40–55% (significantly below LSTM/GRU at 60–70%).
+# hidden_units=512 is the first Dense layer cap (build_dense() uses min(512, T*D//2)).
+# recurrent_dropout=0.0: Dense has no recurrent connections; value is ignored
+# by build_dense() but must be present for ModelConfig validation.
 model:
   name: dense
   hidden_units: 512
   num_layers: 2
-  dropout: 0.4
+  dropout: 0.3
+  recurrent_dropout: 0.0
   bidirectional: false
   dense_units: 128
   activation: relu

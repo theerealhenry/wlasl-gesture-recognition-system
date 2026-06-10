@@ -1,8 +1,29 @@
 # Champion model config — used for final training and TFLite export.
-# Primary seq_len candidate: 60 (85% mean content coverage per Notebook 03).
-# Final seq_len determined by Group 3 ablation results.
-experiment_name: best_model_bilstm_spatial_temporal_seq60
+# Architecture: bilstm (or Group 1 winner). Settings from Groups 2–4 results.
+# Stage 5 addition: primary_metric, secondary_metric, deployment_metric.
+# These are used by run_all_experiments.py for group-level champion selection
+# and logged to MLflow for experiment documentation.
+#
+# hidden_units override:
+#   Ablation runs use hidden_units=64 (from model/bilstm.yaml).
+#   Champion run uses 128 (64/direction for BiLSTM) for higher capacity.
+#   Apply via: overrides={"model.hidden_units": 128} in load_config()
+#   OR add "model:
+  hidden_units: 128" directly here.
+#
+# primary_metric: val_macro_f1
+#   With 21 singleton val classes, val_accuracy is unreliable as a selection
+#   criterion. val_macro_f1 (sklearn, zero_division=0) is the primary metric
+#   for all Stage 5 checkpoint and group-level selection decisions.
+
+experiment_name: best_model_bilstm_champion
 seed: 42
+
+primary_metric: val_macro_f1
+secondary_metric: val_acc
+deployment_metric: "val_macro_f1 / median_latency_ms"
 
 training:
   class_weight_balancing: true
+  epochs: 100
+  early_stopping_patience: 20

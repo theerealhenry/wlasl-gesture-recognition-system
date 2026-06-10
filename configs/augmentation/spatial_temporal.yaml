@@ -1,6 +1,8 @@
-# Full spatial + temporal augmentation — used for final model training.
-# gaussian_noise_detected_only=true: preserves semantic zero-fill for one-handed signs.
-# spatial_flip enforced at clip level via data.flip_min_hand_presence threshold.
+# Full spatial + temporal augmentation — expected Group 2 winner.
+# gaussian_noise_detected_only=true: preserves semantic zero-fill for
+# one-handed signs (LH 70.18% missing rate is signal, not noise).
+# spatial_flip enforced at clip level via data.flip_min_hand_presence=0.30.
+# rotation_deg=5.0: ±5° wrist-relative rotation (post-normalisation only).
 augmentation:
   enabled: true
   temporal_jitter: true

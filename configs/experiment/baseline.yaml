@@ -1,3 +1,5 @@
-# Group 1: Architecture comparison — isolates model type as the single variable
+# Group 1: Architecture comparison — isolates model type as the single variable.
+# Fixed: seq60, augmentation=none, seed=42.
+# Runs: dense_baseline, lstm_baseline, gru_baseline, bilstm_baseline.
 experiment_name: baseline_architecture_comparison
 seed: 42

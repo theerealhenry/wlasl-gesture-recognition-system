@@ -1,4 +1,6 @@
-# Temporal augmentation only
+# Temporal augmentation only — Group 2 ablation candidate.
+# temporal_jitter: zero-fills randomly selected frames in place.
+# speed_jitter: resamples clip at rate in [0.7, 1.3] with zero-aware interp.
 augmentation:
   enabled: true
   temporal_jitter: true
