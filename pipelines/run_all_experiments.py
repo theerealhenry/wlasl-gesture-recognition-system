@@ -814,8 +814,17 @@ def _execute_run(
     Handles resume mode, delegation to run_single_experiment(), fault
     tolerance, and timing.
 
-    The ``batch_id`` is injected as an MLflow override tag so every run
-    in this session is tagged for provenance filtering (Issues #1, #17).
+    The ``batch_id`` is injected as an MLflow tag (via the ``_tag_*`` key
+    convention) so every run in this session is tagged for provenance
+    filtering (Issues #1, #17).
+
+    Keys prefixed with ``_tag_`` are extracted from the overrides dict and
+    passed through the overrides as-is; run_training.py's _execute_run()
+    strips them before load_config() and applies them as MLflow tags after
+    the run context is opened. Keys prefixed with ``_`` but not ``_tag_``
+    (e.g. ``_champion_uses_fallbacks``) are dropped entirely here — they are
+    informational markers that have no corresponding config field and no
+    MLflow destination.
 
     Parameters
     ----------
@@ -891,10 +900,66 @@ def _execute_run(
             extra={"stage": "orchestrator"},
         )
 
-    # Inject batch_id tag into overrides so every MLflow run is tagged.
-    run_overrides = dict(spec.overrides)
+    # ── Build overrides — separating private keys from real config keys ────
+    #
+    # Three categories of keys arrive in spec.overrides:
+    #
+    #   (a) Real config keys  e.g. "data.landmark_config", "model.hidden_units"
+    #       → passed to run_single_experiment() → load_config() → OmegaConf merge
+    #       → Pydantic validation. These MUST be valid ExperimentConfig fields.
+    #
+    #   (b) _tag_* keys  e.g. "_tag_stage5_batch_id", "_tag_dataset_split_version"
+    #       → injected below to carry provenance metadata.
+    #       → run_training.py._execute_run() strips the "_tag_" prefix and applies
+    #         them as mlflow.set_tags() AFTER the run context opens, so they never
+    #         touch load_config() / OmegaConf / Pydantic.
+    #       → MUST NOT be passed directly to OmegaConf — ExperimentConfig uses
+    #         extra="forbid" and would raise ValidationError immediately.
+    #
+    #   (c) Other _* keys  e.g. "_champion_uses_fallbacks"
+    #       → Informational markers set by _build_champion_spec().
+    #       → No corresponding config field, no MLflow destination.
+    #       → Dropped here. Logged at DEBUG so the drop is traceable.
+    #
+    # run_training.py is responsible for the actual split (see its _execute_run
+    # docstring). We keep the separation clean here by only injecting _tag_* keys
+    # into run_overrides; real config keys flow through from spec.overrides.
+
+    run_overrides: Dict[str, Any] = {}
+    dropped_keys: list = []
+
+    for k, v in spec.overrides.items():
+        if k.startswith("_tag_") or k.startswith("_"):
+            # _tag_* → kept for run_training.py to apply as MLflow tags.
+            # Other _* → informational only, dropped with a debug log.
+            if k.startswith("_tag_"):
+                run_overrides[k] = v          # pass through to run_training.py
+            else:
+                dropped_keys.append(k)        # drop silently (logged below)
+        else:
+            run_overrides[k] = v              # real config key — pass through
+
+    if dropped_keys:
+        logger.debug(
+            f"  Dropped {len(dropped_keys)} informational private override key(s) "
+            f"for run '{spec.run_name}': {dropped_keys}. "
+            "These have no config field or MLflow destination.",
+            extra={"stage": "orchestrator"},
+        )
+
+    # Inject session provenance tags as _tag_* keys.
+    # run_training.py strips the "_tag_" prefix and applies them via
+    # mlflow.set_tags() after the run context opens — they never reach
+    # load_config() or Pydantic validation.
     run_overrides[f"_tag_{_BATCH_ID_TAG}"] = batch_id
     run_overrides[f"_tag_{_DATASET_VERSION_TAG}"] = _DATASET_VERSION_VALUE
+
+    logger.debug(
+        f"  Run overrides for '{spec.run_name}': "
+        f"config_keys={[k for k in run_overrides if not k.startswith('_')]} | "
+        f"tag_keys={[k for k in run_overrides if k.startswith('_tag_')]}",
+        extra={"stage": "orchestrator"},
+    )
 
     try:
         result = run_single_experiment(
@@ -995,7 +1060,6 @@ def _execute_run(
             error_message=f"{type(exc).__name__}: {exc}",
             batch_id=batch_id,
         )
-
 
 # ---------------------------------------------------------------------------
 # Group executor
