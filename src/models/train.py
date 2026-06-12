@@ -796,14 +796,15 @@ def _save_run_manifest(
 def _save_config_snapshot(cfg: Any, artifact_dir: Path) -> None:
     """
     Save a YAML (preferred) or JSON representation of the full config.
-
-    OmegaConf serialisation is attempted first. Falls back to JSON if the
-    OmegaConf import or serialisation fails.
     """
     out_path = artifact_dir / "config_snapshot.yaml"
     try:
+        import json as _json
         from omegaconf import OmegaConf
-        cfg_dict = cfg.to_dict()
+
+        # model_dump with mode="json" serialises Enums to their .value strings,
+        # making the dict safe for OmegaConf.create() which cannot handle Enum objects.
+        cfg_dict = cfg.model_dump(mode="json")
         yaml_str = OmegaConf.to_yaml(OmegaConf.create(cfg_dict))
         out_path.write_text(yaml_str, encoding="utf-8")
     except Exception as exc:
@@ -813,7 +814,7 @@ def _save_config_snapshot(cfg: Any, artifact_dir: Path) -> None:
         )
         out_path_json = artifact_dir / "config_snapshot.json"
         with open(out_path_json, "w", encoding="utf-8") as f:
-            json.dump(cfg.to_dict(), f, indent=2, default=str)
+            _json.dump(cfg.model_dump(mode="json"), f, indent=2)
 
 
 def _save_metrics_history(
@@ -1416,7 +1417,7 @@ def train_one_run(
 
     with _artefact_guard("MLflow config dict"):
         import mlflow as _mlf
-        _mlf.log_dict(cfg.to_dict(), "config_snapshot.json")
+        _mlf.log_dict(cfg.model_dump(mode="json"), "config_snapshot.json")
 
     # ── 10. Build and return results summary ──────────────────────────────
     result: Dict[str, Any] = {
