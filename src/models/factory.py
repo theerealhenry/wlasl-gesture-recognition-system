@@ -483,7 +483,7 @@ def build_model(cfg: Any, pipeline: Optional[Any] = None) -> Any:
 
     # ── Step 4: Dispatch to the correct builder ───────────────────────────
     builder = _BUILDERS[name]
-    model   = builder(cfg)
+    model   = builder(cfg, pipeline=pipeline)
 
     # ── Step 5: Verify return type ────────────────────────────────────────
     _verify_model_return(model, name)

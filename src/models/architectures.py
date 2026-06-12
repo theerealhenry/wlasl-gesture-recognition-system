@@ -186,7 +186,7 @@ Module-level exports
 from __future__ import annotations
 
 import numpy as np
-from typing import Any
+from typing import Any, Optional
 
 from src.utils.logger import get_logger
 
@@ -246,43 +246,59 @@ _LR_MAX: float = 1.0
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _get_input_shape(cfg: Any) -> tuple[int, int]:
-    """
-    Extract and validate ``(seq_len, feature_dim)`` from the config.
+# architectures.py — replace the entire _get_input_shape function
 
-    Both values must be positive integers. A ``ValueError`` here is far more
-    informative than the cryptic TensorFlow error produced by a shape mismatch
-    deep inside graph construction.
+def _get_input_shape(cfg: Any, pipeline: Optional[Any] = None) -> tuple[int, int]:
+    """
+    Extract and validate ``(seq_len, feature_dim)`` from the config and pipeline.
+
+    feature_dim is NOT a DataConfig field — it is derived from
+    cfg.data.landmark_config inside FeaturePipeline. When a pipeline instance
+    is available (production path via build_model(cfg, pipeline=pipeline)),
+    feature_dim is read from pipeline.feature_dim. When no pipeline is
+    provided (unit tests with synthetic configs), feature_dim is derived
+    from landmark_config via the LANDMARK_CONFIGS slice mapping.
 
     Parameters
     ----------
     cfg : ExperimentConfig
-        Full frozen experiment config from ``load_config()``.
+    pipeline : FeaturePipeline | None
 
     Returns
     -------
     tuple[int, int]
         (sequence_length, feature_dim)
-
-    Raises
-    ------
-    ValueError
-        If either dimension is below its minimum threshold.
     """
-    seq_len     = int(cfg.data.sequence_length)
-    feature_dim = int(cfg.data.feature_dim)
+    from src.features.constants import LANDMARK_CONFIGS
+
+    seq_len = int(cfg.data.sequence_length)
 
     if seq_len < _MIN_SEQ_LEN:
         raise ValueError(
             f"cfg.data.sequence_length={seq_len} is below the minimum "
             f"({_MIN_SEQ_LEN}). Check your data config YAML."
         )
+
+    if pipeline is not None and hasattr(pipeline, "feature_dim"):
+        feature_dim = int(pipeline.feature_dim)
+    else:
+        # Fallback for unit tests without a pipeline instance.
+        lm_config = getattr(cfg.data, "landmark_config", "full")
+        if lm_config not in LANDMARK_CONFIGS:
+            raise ValueError(
+                f"cfg.data.landmark_config='{lm_config}' is not in LANDMARK_CONFIGS. "
+                f"Valid values: {sorted(LANDMARK_CONFIGS.keys())}."
+            )
+        lm_slice    = LANDMARK_CONFIGS[lm_config]
+        feature_dim = lm_slice.stop - lm_slice.start
+
     if feature_dim < _MIN_FEATURE_DIM:
         raise ValueError(
-            f"cfg.data.feature_dim={feature_dim} is below the minimum "
-            f"({_MIN_FEATURE_DIM}). Check your data config YAML and landmark_config. "
-            f"Valid values: full=225, hands_only=126, pose_only=99."
+            f"feature_dim={feature_dim} is below the minimum ({_MIN_FEATURE_DIM}). "
+            "Check cfg.data.landmark_config. "
+            "Valid values: full=225, hands_only=126, pose_only=99."
         )
+
     return seq_len, feature_dim
 
 
@@ -525,7 +541,7 @@ def _log_model_summary(model: Any, model_name: str) -> None:
 # Architecture 1: Dense Baseline
 # ---------------------------------------------------------------------------
 
-def build_dense(cfg: Any) -> Any:
+def build_dense(cfg: Any, pipeline: Optional[Any] = None) -> Any:
     """
     Build and compile a Dense feedforward baseline model.
 
@@ -592,7 +608,7 @@ def build_dense(cfg: Any) -> Any:
     """
     import tensorflow as tf
 
-    seq_len, feature_dim = _get_input_shape(cfg)
+    seq_len, feature_dim = _get_input_shape(cfg, pipeline)
     n_classes = _check_n_classes(cfg)
     dropout   = float(cfg.model.dropout)
 
@@ -667,7 +683,7 @@ def build_dense(cfg: Any) -> Any:
 # Architecture 2: Stacked LSTM
 # ---------------------------------------------------------------------------
 
-def build_lstm(cfg: Any) -> Any:
+def build_lstm(cfg: Any, pipeline: Optional[Any] = None) -> Any:
     """
     Build and compile a stacked LSTM model for gesture sequence classification.
 
@@ -739,7 +755,7 @@ def build_lstm(cfg: Any) -> Any:
     """
     import tensorflow as tf
 
-    seq_len, feature_dim = _get_input_shape(cfg)
+    seq_len, feature_dim = _get_input_shape(cfg, pipeline)
     n_classes         = _check_n_classes(cfg)
     hidden_units      = int(cfg.model.hidden_units)
     num_layers        = int(cfg.model.num_layers)
@@ -831,7 +847,7 @@ def build_lstm(cfg: Any) -> Any:
 # Architecture 3: Stacked GRU
 # ---------------------------------------------------------------------------
 
-def build_gru(cfg: Any) -> Any:
+def build_gru(cfg: Any, pipeline: Optional[Any] = None) -> Any:
     """
     Build and compile a stacked GRU model for gesture sequence classification.
 
@@ -885,7 +901,7 @@ def build_gru(cfg: Any) -> Any:
     """
     import tensorflow as tf
 
-    seq_len, feature_dim = _get_input_shape(cfg)
+    seq_len, feature_dim = _get_input_shape(cfg, pipeline)
     n_classes         = _check_n_classes(cfg)
     hidden_units      = int(cfg.model.hidden_units)
     num_layers        = int(cfg.model.num_layers)
@@ -965,7 +981,7 @@ def build_gru(cfg: Any) -> Any:
 # Architecture 4: Stacked Bidirectional LSTM
 # ---------------------------------------------------------------------------
 
-def build_bilstm(cfg: Any) -> Any:
+def build_bilstm(cfg: Any, pipeline: Optional[Any] = None) -> Any:
     """
     Build and compile a stacked Bidirectional LSTM (champion model candidate).
 
@@ -1054,7 +1070,7 @@ def build_bilstm(cfg: Any) -> Any:
     """
     import tensorflow as tf
 
-    seq_len, feature_dim = _get_input_shape(cfg)
+    seq_len, feature_dim = _get_input_shape(cfg, pipeline)
     n_classes         = _check_n_classes(cfg)
     hidden_units      = int(cfg.model.hidden_units)
     num_layers        = int(cfg.model.num_layers)
