@@ -1190,6 +1190,34 @@ def _execute_run(
 
     t_script_start = time.time()
 
+    # ── Separate MLflow tag overrides from real config overrides ──────────
+    #
+    # run_all_experiments.py injects _tag_* keys into the overrides dict to
+    # carry session provenance metadata (batch_id, dataset_split_version).
+    # These keys MUST NOT reach load_config() → OmegaConf → Pydantic because
+    # ExperimentConfig uses extra="forbid" and will raise ValidationError.
+    #
+    # Split strategy:
+    #   _tag_*  → strip prefix, collect as {tag_name: value} for mlflow.set_tags()
+    #   other _ → drop silently (informational markers, no config/MLflow target)
+    #   rest    → pass to load_config() as real config overrides
+    mlflow_tag_overrides: Dict[str, str] = {}
+    clean_overrides:      Dict[str, Any] = {}
+
+    for k, v in overrides.items():
+        if k.startswith("_tag_"):
+            mlflow_tag_overrides[k[5:]] = str(v)   # strip "_tag_" prefix
+        elif k.startswith("_"):
+            logger.debug(
+                f"Dropping private informational override key '{k}' — "
+                "no config field or MLflow tag destination.",
+                extra={"stage": "run_training"},
+            )
+        else:
+            clean_overrides[k] = v
+
+    overrides = clean_overrides   # only real config keys from here on
+
     # ── Step 1: Load and validate config ──────────────────────────────────
     logger.info(
         f"Loading config | model={args.model} | data={args.data} | "
@@ -1377,6 +1405,18 @@ def _execute_run(
                 run_name, experiment_group,
             )
             _set_mlflow_tags(cfg, experiment_group, run_name, args, env_snapshot)
+
+            # Apply provenance tags injected by run_all_experiments.py.
+            # These were carried as _tag_* keys in the overrides dict and
+            # extracted above. Applied here after the run context is open
+            # so they are attached to the correct MLflow run record.
+            if mlflow_tag_overrides:
+                mlflow.set_tags(mlflow_tag_overrides)
+                logger.debug(
+                    f"Applied {len(mlflow_tag_overrides)} orchestrator provenance "
+                    f"tag(s): {list(mlflow_tag_overrides.keys())}",
+                    extra={"stage": "run_training"},
+                )
 
             # Emit the human-readable pre-training header to the log
             _log_run_header(
