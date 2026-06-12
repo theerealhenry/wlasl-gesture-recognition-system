@@ -889,7 +889,7 @@ def _log_mlflow_params(cfg: Any, pipeline: Any, dataset: Any, model_summary: Dic
 
     mlflow.log_params({
         # ── Model architecture ─────────────────────────────────────────────
-        "model_type":          str(cfg.model.name),
+        "model_type":          cfg.model.name.value if hasattr(cfg.model.name, "value") else str(cfg.model.name),
         "hidden_units":        int(cfg.model.hidden_units),
         # num_layers and recurrent_dropout absent from dense.yaml → use safe getter
         "num_layers":          int(_get_config_attr(cfg.model, "num_layers",        1)),
@@ -1119,13 +1119,23 @@ def train_one_run(
     # to persist in TF 2.13.x.
     keras_callbacks = [reduce_lr]
 
-    # ── 5. Log parameters to MLflow ──────────────────────────────────────
+    # ── 5. Capture MLflow run ID — params and tags already logged by caller ──
+    #
+    # run_training.py logs all params via _log_mlflow_params() and all tags
+    # via _set_mlflow_tags() BEFORE calling train_one_run(). Repeating those
+    # calls here would cause MlflowException: "Changing param values is not
+    # allowed" when the Enum serialisation differs between the two callers.
+    # train_one_run() is responsible for per-epoch metrics and artefacts only.
     mlflow_run_id = ""
     if mlflow.active_run():
         mlflow_run_id = mlflow.active_run().info.run_id
-
-    _log_mlflow_params(cfg, pipeline, dataset, model_summary)
-    _set_mlflow_tags(cfg, experiment_group)
+    else:
+        logger.warning(
+            "train_one_run(): no active MLflow run found. "
+            "Metrics and artefacts will not be logged. "
+            "Call train_one_run() inside an mlflow.start_run() context.",
+            extra={"stage": "training"},
+        )
 
     # ── 6. Per-epoch training loop ────────────────────────────────────────
     #
