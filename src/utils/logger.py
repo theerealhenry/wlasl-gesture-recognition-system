@@ -274,13 +274,32 @@ def configure_logging(
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.DEBUG)  # Root captures all; handlers filter
 
-        # Console handler
+        # ── Remove all pre-existing handlers from the root logger ─────────
+        #
+        # Third-party libraries imported before configure_logging() is called
+        # (notably MLflow, which calls logging.basicConfig() internally) may
+        # have already attached StreamHandlers to the root logger.
+        # logging.basicConfig() is a no-op if the root logger already has
+        # handlers, BUT if it fires before our code runs, it adds one handler.
+        # Adding our handlers on top of that produces exactly 2 handlers →
+        # every log record is emitted twice.
+        #
+        # The fix: clear ALL existing root-logger handlers first, then add
+        # exactly the two handlers we want (console + rotating file).
+        # This is safe because configure_logging() is the authoritative
+        # logging setup for the entire pipeline — any handler added before
+        # this call was added by a library, not by our code.
+        for handler in root_logger.handlers[:]:   # iterate a copy
+            root_logger.removeHandler(handler)
+            handler.close()
+
+        # Console handler — the only StreamHandler in the entire pipeline
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(getattr(logging, level.upper(), logging.INFO))
         console_handler.setFormatter(ColouredConsoleFormatter())
         root_logger.addHandler(console_handler)
 
-        # Rotating file handler — prevents unbounded log growth on long training runs
+        # Rotating file handler — captures everything at DEBUG+
         file_handler = logging.handlers.RotatingFileHandler(
             _LOG_FILE_PATH,
             maxBytes=max_bytes,
@@ -291,7 +310,7 @@ def configure_logging(
         file_handler.setFormatter(FileFormatter())
         root_logger.addHandler(file_handler)
 
-        # Suppress noisy third-party loggers
+        # Suppress noisy third-party loggers — set after our handlers are in place
         for noisy_lib in ("urllib3", "requests", "matplotlib", "PIL", "absl"):
             logging.getLogger(noisy_lib).setLevel(logging.WARNING)
 
