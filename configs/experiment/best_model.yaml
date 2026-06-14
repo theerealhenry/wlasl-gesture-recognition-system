@@ -9,7 +9,7 @@
 #   Champion run uses 128 (64/direction for BiLSTM) for higher capacity.
 #   Apply via: overrides={"model.hidden_units": 128} in load_config()
 #   OR add "model:
-  hidden_units: 128" directly here.
+#  hidden_units: 128" directly here.
 #
 # primary_metric: val_macro_f1
 #   With 21 singleton val classes, val_accuracy is unreliable as a selection
