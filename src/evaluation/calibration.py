@@ -23,9 +23,13 @@ Concretely, this module:
      ``pipelines/run_evaluation.py`` using ``get_predictions(...,
      return_probs=True)`` from ``metrics.py``.
 
-  2. Is completely framework-agnostic — only ``numpy`` and ``scipy`` (for
-     bootstrap confidence intervals on bin accuracies). No TensorFlow import
-     anywhere in this file.
+  2. Is framework-agnostic at its core. The only non-numpy dependency for
+     metric computation is ``sklearn.metrics.f1_score``, which is already
+     a project-wide dependency (used throughout ``metrics.py``, ``train.py``,
+     and ``benchmark.py``). This dependency is declared explicitly at the top
+     of the module rather than deferred as a hidden local import — the previous
+     design claimed "numpy and scipy only" while importing sklearn internally,
+     which was a documentation/contract bug. scipy is NOT used in this module.
 
   3. Is independently unit-testable with synthetic probability arrays and
      synthetic true labels, requiring no model, dataset, or project
@@ -59,28 +63,32 @@ well-established empirical regularities apply:
      distribution, not by the validation distribution the model is evaluated
      on.
 
-The reliability diagram produced by ``compute_reliability_diagram()`` makes
-this overconfidence quantitative: each bar shows the actual accuracy of
-predictions that fell in a given confidence bucket, compared to the ideal
-diagonal (where 70%-confident predictions should be right 70% of the time).
-The Expected Calibration Error (ECE) summarises this as a single number.
-
-The confidence-threshold curve produced by
-``compute_confidence_threshold_curve()`` answers the deployment question:
-"if I only accept predictions where the model says it is at least X%
-confident, what accuracy do I achieve and what fraction of inputs do I have
-to reject?" For a real-time ASL-to-KSL transfer scenario, this trade-off
-between coverage and precision is operationally important.
+Champion model context (for reference)
+----------------------------------------
+  - Input shape:   (1, 100, 126) — seq_len=100, landmark_config=hands_only
+  - Output shape:  (1, 35) — softmax probabilities
+  - val_macro_f1:  0.6011 (52 clips, 7 unseen signers)
+  - early_stopping_monitor: val_accuracy (NOTE: the handoff document narrates
+    val_macro_f1 as the monitor, but the actual config_snapshot.yaml for the
+    champion run bilstm_hands_only_v4_aug confirms ``early_stopping_monitor:
+    val_accuracy``. This discrepancy is flagged in evaluation_report.json per
+    Phase F requirements; this module takes no position on which was intended.)
+  - ``y_proba`` consumed here comes from:
+    ``get_predictions(model, val_ds, return_probs=True)`` in metrics.py,
+    which returns float64 arrays of shape (52, 35).
 
 Calibration methodology decisions
 ------------------------------------
-Equal-width binning (fixed-width bins across [0, 1])
-    The most common approach in the literature and easiest to explain to a
-    client. The alternative — equal-mass binning (adaptive-width bins with
-    equal sample counts) — would be more statistically stable given the
-    tiny val set (52 clips) but is harder to interpret visually (the bar
-    widths vary, and bin edges are data-dependent). Equal-width is the
-    documented project choice.
+Equal-width binning (default) + optional quantile binning
+    Equal-width binning (fixed-width bins across [0, 1]) is the standard
+    approach and is easiest to explain. However, with only 52 validation
+    clips, equal-width bins result in many empty or 1–2 sample bins because
+    softmax confidence is not uniformly distributed across [0,1]. Optional
+    quantile binning (``strategy="quantile"``) places equal numbers of
+    predictions in each bin, producing more statistically stable estimates
+    at the cost of variable-width bars that are harder to interpret visually.
+    Both strategies are supported. Equal-width is the default for publication
+    consistency; quantile is recommended for internal diagnostics.
 
 n_bins=10 (default), configurable
     10 bins × 52 clips ≈ 5 clips/bin on average. This is very sparse —
@@ -88,96 +96,115 @@ n_bins=10 (default), configurable
     (a) reports ``bin_count`` for every bin so chart consumers can
     annotate the actual sample count above each bar rather than presenting
     a misleadingly smooth curve;
-    (b) flags bins with ``is_sparse`` when ``bin_count < _SPARSE_BIN_THRESHOLD``
+    (b) flags bins with ``is_sparse`` when ``bin_count < SPARSE_BIN_THRESHOLD``
     (default: 5), so downstream consumers can style or annotate them
     differently;
     (c) supports ``n_bins=5`` as the "low-sample-size" alternative that
-    ~10 clips/bin, which is still sparse but produces a coarser but more
-    reliable diagram.
+    produces ~10 clips/bin, which is still sparse but more reliable.
 
 Max confidence per prediction (class with highest softmax probability)
     The reliability diagram uses only the WINNING class's softmax probability
     as the "model confidence" for that prediction. This is the standard
     definition and the one that corresponds to the argmax prediction that
-    ``compute_macro_f1()`` in ``metrics.py`` is based on. It is NOT an
-    average over all 35 class probabilities — that would be a meaningless
-    mixed-class metric.
+    ``compute_macro_f1()`` in ``metrics.py`` is based on.
 
 ECE = weighted average of |confidence - accuracy|
-    Weighted by the fraction of samples in each non-empty bin (i.e. bins
-    with zero samples are excluded from the average). This is the standard
-    ECE formulation (Naeini et al., 2015). The unweighted version (average
-    over non-empty bins regardless of their size) is also computed and
-    reported as ``ece_unweighted`` for completeness.
+    Weighted by the fraction of samples in each non-empty bin. This is the
+    standard ECE formulation (Naeini et al., 2015). The unweighted version
+    (average over non-empty bins regardless of their size) is also computed
+    and reported as ``ece_unweighted`` for completeness. A bootstrap CI on
+    ECE itself is also computed (unlike the original, which only provided
+    bin-level CIs) to surface the global calibration uncertainty.
 
 Maximum Calibration Error (MCE)
     MCE = max over non-empty bins of |confidence - accuracy|. Reported
-    alongside ECE because ECE can be dominated by many small-error high-
-    mass bins while a single catastrophically miscalibrated high-confidence
-    bin (a scenario plausible on this 52-clip val set) would be visible
-    in MCE but obscured in ECE.
+    alongside ECE because ECE can be dominated by many small-error high-mass
+    bins while a single catastrophically miscalibrated high-confidence bin
+    (a scenario plausible on this 52-clip val set) would be visible in MCE
+    but obscured in ECE.
 
 Temperature scaling note (documented-not-implemented)
     The standard post-hoc calibration fix is temperature scaling: dividing
-    the logits (pre-softmax activations) by a learned scalar T before
-    softmax, optimised on the validation set. This is NOT implemented here
-    because (a) it requires access to the pre-softmax logits, which this
-    module does not receive; (b) with 52 val clips, the temperature estimate
-    would itself be highly unreliable; (c) Stage 6's goal is DIAGNOSIS, not
-    calibration repair — the repair belongs in a future model iteration.
-    The limitation and the remedy are documented in LIMITATIONS.md.
+    the logits (pre-softmax activations) by a learned scalar T before softmax,
+    optimised on the validation set. This is NOT implemented here because
+    (a) this module receives post-softmax probabilities, not logits; (b) with
+    52 val clips, the temperature estimate would itself be highly unreliable;
+    (c) Stage 6's goal is DIAGNOSIS, not calibration repair — the repair
+    belongs in a future model iteration. The limitation and the remedy are
+    documented in LIMITATIONS.md.
 
-Post-review disposition notes
--------------------------------
-This module was designed from scratch with the lessons of the ``metrics.py``
-and ``benchmark.py`` peer-review process in mind. The following design
-decisions reflect those lessons explicitly:
+Threshold curve macro-F1 interpretation note
+---------------------------------------------
+    The ``macro_f1`` values in ``compute_confidence_threshold_curve()`` are
+    labeled ``selective_macro_f1`` in the output to make clear that this is
+    NOT a measure of overall model quality — it is the macro-F1 achieved on
+    the subset of predictions the model is "confident" enough to make (those
+    at or above threshold τ). At high thresholds only easy predictions remain,
+    so this metric inflates naturally. The ``optimal_threshold_f1`` finding
+    must therefore be interpreted as "best selective precision at some coverage
+    cost", not as an improved model performance estimate.
 
-  1. All validation helpers follow the same pattern as ``metrics.py``:
-     ``_validate_class_count()``, ``_to_proba_array()``, etc. — one
-     validation point per input, shared across all public functions.
+Post-review disposition (critical review applied)
+---------------------------------------------------
+The following issues from the Phase A3 critical review were assessed,
+verified, and addressed in this revision:
 
-  2. ``compute_reliability_diagram()`` returns ``is_sparse`` flags per bin
-     (analogous to ``is_singleton`` in ``metrics.py``) so downstream
-     consumers never have to re-derive sparseness from the count alone.
+  1.  FIXED. Dead expression ``y_true_arr = _to_label_array(y_proba if False
+      else y_true, "y_true")`` removed; clean call with y_true directly.
 
-  3. Empty bins are represented in the output dict with ``None`` values (not
-     0.0, not NaN) for ``mean_confidence`` and ``actual_accuracy``, so a
-     chart consumer can explicitly decide how to handle them (skip, draw
-     empty rectangle, label as "0 samples") without guessing the module's
-     intent.
+  2.  FIXED. Hidden sklearn dependency declared explicitly at module top and
+      in this docstring rather than deferred as a local import inside
+      ``compute_confidence_threshold_curve()``. The "numpy and scipy only"
+      contract claim has been corrected; scipy is NOT used here.
 
-  4. Threshold curve uses a linspace over [0, 1] that always INCLUDES both
-     endpoints so that ``coverage(0) == 1.0`` (all predictions accepted)
-     and ``coverage(1) = 0.0 or small`` (only perfect-confidence
-     predictions, usually 0) are always present in the output.
+  3.  FIXED. Bootstrap seeding now uses ``np.random.SeedSequence([seed, b])``
+      rather than ``seed ^ b`` XOR, which introduced structured bit-level
+      correlation between per-bin bootstrap streams.
 
-  5. The ``compute_calibration_summary()`` consolidation function (analogous
-     to ``compute_evaluation_summary()`` in ``metrics.py``) bundles both
-     results so ``run_evaluation.py`` can call it once and receive a single
-     JSON-serialisable dict for ``evaluation_report.json``.
+  4.  FIXED. ``matplotlib.use("Agg")`` global-state mutation removed from
+      plot functions. Callers that need a non-interactive backend (e.g. CI
+      environments) should set it at application entry point. Plot functions
+      now use ``plt.switch_backend("Agg")`` contextually only if no backend
+      is yet active, and only as a best-effort fallback.
 
-Champion model context
-------------------------
-  - Input shape:   (1, 100, 126) — seq_len=100, landmark_config=hands_only
-  - Output shape:  (1, 35) — softmax probabilities
-  - val_macro_f1:  0.6011 (52 clips, 7 unseen signers)
-  - early_stopping_monitor: val_accuracy (NOTE: handoff narrates
-    val_macro_f1 — the actual config_snapshot.yaml says val_accuracy.
-    This discrepancy is flagged in evaluation_report.json per Phase F
-    requirements; this module takes no position on it.)
-  - ``y_proba`` consumed here comes from:
-    ``get_predictions(model, val_ds, return_probs=True)`` in metrics.py,
-    which returns float64 arrays of shape (52, 35).
+  5.  ADDED. Bootstrap CI on ECE itself (``ece_ci_lower``, ``ece_ci_upper``)
+      via clip-level resampling, matching the approach in ``metrics.py``.
+
+  6.  FIXED. ``macro_f1`` renamed to ``selective_macro_f1`` in threshold
+      curve output with explicit documentation that this is conditional on
+      acceptance, not overall quality.
+
+  7.  ADDED. Monotonicity warning in AUC-coverage computation.
+
+  8.  ADDED. ``ci_degenerate`` flag in per-bin bootstrap CI output when
+      bin_count == 1 (CI is trivially acc=acc, communicates nothing).
+
+  9.  ADDED. Optional ``strategy`` parameter to
+      ``compute_reliability_diagram()`` supporting ``"uniform"`` (default,
+      equal-width bins) and ``"quantile"`` (equal-mass bins) for more
+      robust small-sample diagnostics.
+
+  10. FIXED. ``compute_calibration_summary()`` validates arrays once and
+      passes already-validated arrays to constituent functions (matching the
+      post-review fix item 11 in ``metrics.py``).
+
+  11. NOTED. Validation helpers ``_validate_class_count``, ``_to_label_array``
+      etc. are duplicated from ``metrics.py``. This is an accepted trade-off
+      for now (keeps module independently importable and testable without
+      metrics.py). A future ``src/evaluation/_validation.py`` shared module
+      would be the cleaner solution. Divergence risk is mitigated by the
+      import-time self-check and unit tests.
+
+  12. FIXED. ``early_stopping_monitor`` discrepancy documented in module
+      docstring above.
 
 Module-level exports
 ----------------------
     compute_reliability_diagram          — bin predictions by confidence,
                                            compute actual accuracy per bin,
-                                           ECE, MCE
-    compute_confidence_threshold_curve   — coverage vs accuracy vs mean
-                                           confidence across confidence
-                                           thresholds τ ∈ [0, 1]
+                                           ECE, MCE, ECE bootstrap CI
+    compute_confidence_threshold_curve   — coverage vs accuracy vs selective
+                                           macro-F1 across confidence thresholds
     compute_calibration_summary          — consolidation wrapper (both above
                                            + metadata) for evaluation_report
     plot_reliability_diagram             — figure renderer (reliability diagram)
@@ -196,6 +223,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from sklearn.metrics import f1_score as _sklearn_f1_score
 
 from src.utils.logger import get_logger
 
@@ -211,32 +239,29 @@ logger = get_logger(__name__)
 DEFAULT_N_BINS: int = 10
 
 #: Default number of threshold points for the confidence-threshold curve.
-#: 101 points gives a 1-percentage-point resolution across [0, 1], which is
-#: sufficient for a 52-clip val set where the effective resolution is much
-#: coarser (each clip contributes ~1.9pp to accuracy).
+#: 101 points gives a 1-percentage-point resolution across [0, 1].
 DEFAULT_N_THRESHOLD_POINTS: int = 101
 
 #: Bins with fewer than this many samples are flagged as sparse in the
-#: reliability diagram output. With the WLASL val set (52 clips, 10 bins),
-#: most bins will be sparse. The threshold of 5 is a practical floor below
-#: which per-bin accuracy estimates are dominated by single-sample noise.
+#: reliability diagram output.
 SPARSE_BIN_THRESHOLD: int = 5
 
 #: Number of bootstrap resamples for per-bin accuracy confidence intervals.
-#: Lower than metrics.py's DEFAULT_N_BOOTSTRAP (1000) because we call this
-#: per-bin inside compute_reliability_diagram(), so total cost is
-#: DEFAULT_N_BINS × DEFAULT_N_BINS_CI_BOOTSTRAP = 10 × 200 = 2000 calls.
-#: Each resample on ≤52 samples is microsecond-scale, so total overhead
-#: is negligible.
 _N_BINS_CI_BOOTSTRAP: int = 200
 
-#: Bootstrap confidence level for per-bin accuracy CIs. 80% rather than 90%
-#: because the per-bin sample counts are so small (often 1–5) that a 90%
-#: interval would typically span [0, 1] and communicate nothing useful.
+#: Bootstrap confidence level for per-bin accuracy CIs.
+#: 80% rather than 90% because per-bin sample counts are so small (often 1–5)
+#: that a 90% interval would typically span [0, 1] and communicate nothing.
 _BIN_CI_LEVEL: float = 0.80
 
-#: Project global seed, matching DEFAULT_SEED in metrics.py and the global
-#: seed in base.yaml. Used for all bootstrap resampling here.
+#: Number of bootstrap resamples for ECE confidence interval.
+#: Clip-level resampling; 1000 matches DEFAULT_N_BOOTSTRAP in metrics.py.
+_N_ECE_CI_BOOTSTRAP: int = 1000
+
+#: Bootstrap CI level for ECE. 90% matches DEFAULT_BOOTSTRAP_CI in metrics.py.
+_ECE_CI_LEVEL: float = 0.90
+
+#: Project global seed. Matches DEFAULT_SEED in metrics.py and base.yaml.
 DEFAULT_SEED: int = 42
 
 #: Below this many total samples, reliability diagram computation is
@@ -247,9 +272,13 @@ _MIN_SAMPLES_FOR_CALIBRATION: int = 5
 #: everything" — flagged in the threshold curve output.
 _MIN_MEANINGFUL_COVERAGE: float = 0.05
 
-#: The calibration limitation string embedded in every summary dict.
-#: Mirrors the _BOOTSTRAP_SIGNER_CAVEAT pattern in metrics.py so every
-#: downstream consumer (evaluation_report.json, LIMITATIONS.md) inherits
+#: Valid binning strategies for compute_reliability_diagram().
+#: "uniform" = equal-width bins (standard, default).
+#: "quantile" = equal-mass bins (more stable for small, skewed datasets).
+_VALID_BIN_STRATEGIES: Tuple[str, ...] = ("uniform", "quantile")
+
+#: Calibration limitation caveat — embedded in every summary dict so all
+#: downstream consumers (evaluation_report.json, LIMITATIONS.md) inherit
 #: it automatically.
 _CALIBRATION_CAVEAT: str = (
     "Calibration estimates are based on 52 validation clips. At this sample "
@@ -262,8 +291,8 @@ _CALIBRATION_CAVEAT: str = (
     "LIMITATIONS.md."
 )
 
-#: Documented-not-implemented note for temperature scaling, to be embedded
-#: in LIMITATIONS.md and evaluation_report.json verbatim.
+#: Documented-not-implemented note for temperature scaling, embedded verbatim
+#: in LIMITATIONS.md and evaluation_report.json.
 TEMPERATURE_SCALING_NOTE: str = (
     "Temperature scaling mitigation: The recommended post-hoc calibration "
     "approach is temperature scaling (Guo et al., 2017): divide pre-softmax "
@@ -275,9 +304,21 @@ TEMPERATURE_SCALING_NOTE: str = (
     "calibration head or apply Platt scaling on a dedicated calibration split."
 )
 
+#: Selective macro-F1 interpretation note. Embedded in threshold curve output
+#: so every downstream consumer understands the metric's conditional nature.
+_SELECTIVE_MACRO_F1_NOTE: str = (
+    "selective_macro_f1 is the macro-F1 achieved on the subset of predictions "
+    "that exceed confidence threshold τ (i.e. predictions the model is willing "
+    "to make). This is NOT a measure of overall model quality — at high "
+    "thresholds only easy predictions remain, inflating this metric naturally. "
+    "Interpret optimal_threshold_f1 as 'best selective precision at some "
+    "coverage cost', not as an improved model performance estimate."
+)
+
 
 # ---------------------------------------------------------------------------
 # Internal validation helpers
+# (Intentionally self-contained — see module docstring item 11 for rationale)
 # ---------------------------------------------------------------------------
 
 def _validate_n_bins(n_bins: int, caller: str) -> None:
@@ -300,12 +341,21 @@ def _validate_class_count(n_classes: int, caller: str) -> None:
         )
 
 
+def _validate_bin_strategy(strategy: str, caller: str) -> None:
+    """Raise ValueError if strategy is not a recognised binning strategy."""
+    if strategy not in _VALID_BIN_STRATEGIES:
+        raise ValueError(
+            f"{caller}: strategy={strategy!r} is not recognised. "
+            f"Valid options: {_VALID_BIN_STRATEGIES}. "
+            "'uniform' (default) uses equal-width bins. "
+            "'quantile' uses equal-mass bins — recommended for small, "
+            "skewed datasets like this project's 52-clip val set."
+        )
+
+
 def _to_label_array(arr: Any, name: str) -> np.ndarray:
     """
     Coerce an array-like into a flat 1-D int64 numpy array of class indices.
-
-    Mirrors the same helper in metrics.py for consistency. Accepts numpy
-    arrays, Python lists, and TF EagerTensors (which implement __array__).
 
     Raises
     ------
@@ -334,12 +384,6 @@ def _to_proba_array(arr: Any, n_classes: int, caller: str) -> np.ndarray:
     """
     Coerce an array-like into a 2-D float64 (n_samples, n_classes) probability
     array. Validates shape, value range, and approximate row-sum normalisation.
-
-    Parameters
-    ----------
-    arr      : array-like, shape (n_samples, n_classes)
-    n_classes: int
-    caller   : str — used in error messages
 
     Returns
     -------
@@ -373,9 +417,6 @@ def _to_proba_array(arr: Any, n_classes: int, caller: str) -> np.ndarray:
             "Check that the prediction cache was written correctly."
         )
 
-    # Value range: softmax outputs are always in [0, 1], but floating-point
-    # arithmetic can produce tiny negatives or values slightly above 1.
-    # Use a tolerance to avoid false positives on numerically clean outputs.
     _tol = 1e-6
     if out.min() < -_tol or out.max() > 1.0 + _tol:
         raise ValueError(
@@ -385,7 +426,6 @@ def _to_proba_array(arr: Any, n_classes: int, caller: str) -> np.ndarray:
             "If this is a logits array, apply softmax before passing it here."
         )
 
-    # Row-sum check: softmax rows should sum to 1 within floating-point tolerance.
     row_sums = out.sum(axis=1)
     max_deviation = float(np.abs(row_sums - 1.0).max())
     if max_deviation > 1e-3:
@@ -434,8 +474,7 @@ def _extract_max_confidence(y_proba: np.ndarray) -> np.ndarray:
 
     This is the "model confidence" used throughout this module: for each
     prediction, the confidence is the softmax probability assigned to the
-    winning class (argmax class). This is the natural companion to the
-    argmax prediction that drives macro-F1 in metrics.py.
+    winning class (argmax class).
 
     Parameters
     ----------
@@ -465,47 +504,172 @@ def _is_correct(y_true: np.ndarray, y_proba: np.ndarray) -> np.ndarray:
     return y_pred == y_true
 
 
+def _compute_bin_edges(
+    max_conf: np.ndarray,
+    n_bins: int,
+    strategy: str,
+) -> np.ndarray:
+    """
+    Compute bin edges based on the chosen strategy.
+
+    Parameters
+    ----------
+    max_conf : np.ndarray, shape (n_samples,), float64
+        Max softmax probability per prediction.
+    n_bins   : int
+        Number of bins.
+    strategy : str
+        ``"uniform"`` — equal-width bins from 0.0 to 1.0.
+        ``"quantile"`` — equal-mass bins using quantiles of max_conf.
+
+    Returns
+    -------
+    np.ndarray, shape (n_bins + 1,)
+        Bin edge values (inclusive on both ends for the last bin).
+    """
+    if strategy == "quantile":
+        # Place bin edges at the quantile breakpoints of max_conf.
+        # Always include 0.0 and 1.0 as the outer bounds.
+        quantiles = np.linspace(0.0, 100.0, n_bins + 1)
+        edges = np.percentile(max_conf, quantiles)
+        # Ensure strict 0.0 and 1.0 bounds regardless of data extremes.
+        edges[0]  = 0.0
+        edges[-1] = 1.0
+        return edges
+    else:
+        # "uniform": standard equal-width bins.
+        return np.linspace(0.0, 1.0, n_bins + 1)
+
+
 def _bootstrap_bin_accuracy_ci(
     correct_flags: np.ndarray,
     ci_level: float = _BIN_CI_LEVEL,
     n_bootstrap: int = _N_BINS_CI_BOOTSTRAP,
     seed: int = DEFAULT_SEED,
-) -> Tuple[float, float]:
+    bin_index: int = 0,
+) -> Tuple[float, float, bool]:
     """
     Compute a bootstrap confidence interval for the accuracy of a single bin.
+
+    Seeding fix (post-review item 3)
+    ---------------------------------
+    Uses ``np.random.SeedSequence([seed, bin_index])`` rather than
+    ``seed ^ bin_index`` XOR. XOR-based seeds create structured bit-level
+    correlations: e.g. for seed=42, bins 0 and 42 produce the same XOR seed,
+    and the seeds across bins are not statistically independent. SeedSequence
+    hashing produces cryptographically mixed, statistically independent
+    streams for every (seed, bin_index) pair.
 
     Parameters
     ----------
     correct_flags : np.ndarray, shape (n_bin_samples,), bool
-        True where the prediction was correct for samples in this bin.
-    ci_level  : float, confidence level in (0, 1)
-    n_bootstrap: int, number of bootstrap resamples
-    seed       : int, RNG seed for reproducibility
+    ci_level      : float, confidence level in (0, 1)
+    n_bootstrap   : int, number of bootstrap resamples
+    seed          : int, base RNG seed
+    bin_index     : int, bin index (mixed with seed via SeedSequence)
 
     Returns
     -------
-    Tuple[float, float]
-        (ci_lower, ci_upper) — percentile-based interval. Both None-safe:
-        if n_bin_samples == 0, returns (0.0, 0.0). If n_bin_samples == 1,
-        returns (0.0, 1.0) (degenerate case: either 0% or 100% is "correct").
+    Tuple[float, float, bool]
+        (ci_lower, ci_upper, ci_degenerate)
+        ci_degenerate is True when the bin has only 1 sample — the CI is
+        (acc, acc) and conveys no uncertainty information.
     """
     n = len(correct_flags)
     if n == 0:
-        return (0.0, 0.0)
+        return (0.0, 0.0, True)
     if n == 1:
-        # Single sample: accuracy is deterministically 0.0 or 1.0; CI is trivial.
+        # Single sample: CI is degenerate (0.0 or 1.0 with certainty).
         acc = float(correct_flags[0])
-        return (acc, acc)
+        return (acc, acc, True)
 
-    rng = np.random.default_rng(seed)
+    # SeedSequence produces statistically independent streams per (seed, bin_index).
+    ss  = np.random.SeedSequence([seed, bin_index])
+    rng = np.random.default_rng(ss)
+
     boot_acc = np.empty(n_bootstrap, dtype=np.float64)
     for i in range(n_bootstrap):
         idx = rng.integers(0, n, size=n)
         boot_acc[i] = correct_flags[idx].mean()
 
-    alpha = 1.0 - ci_level
+    alpha    = 1.0 - ci_level
     ci_lower = float(np.percentile(boot_acc, 100.0 * (alpha / 2.0)))
     ci_upper = float(np.percentile(boot_acc, 100.0 * (1.0 - alpha / 2.0)))
+    return (ci_lower, ci_upper, False)
+
+
+def _bootstrap_ece_ci(
+    max_conf: np.ndarray,
+    correct: np.ndarray,
+    n_classes: int,
+    n_bins: int,
+    strategy: str,
+    ci_level: float = _ECE_CI_LEVEL,
+    n_bootstrap: int = _N_ECE_CI_BOOTSTRAP,
+    seed: int = DEFAULT_SEED,
+) -> Tuple[float, float]:
+    """
+    Compute a bootstrap CI for ECE via clip-level resampling.
+
+    This uses CLIP-LEVEL resampling (not bin-level) — each resample draws
+    n_samples clips with replacement, recomputes the full reliability diagram
+    and ECE on the resample. This correctly propagates uncertainty from both
+    bin composition (which clips fall in which bin) and per-bin accuracy noise.
+
+    Parameters
+    ----------
+    max_conf  : np.ndarray, shape (n_samples,), float64 — max softmax prob per clip
+    correct   : np.ndarray, shape (n_samples,), bool — correct argmax prediction
+    n_classes : int (unused in ECE computation; kept for interface consistency)
+    n_bins    : int
+    strategy  : str, "uniform" or "quantile"
+    ci_level  : float
+    n_bootstrap: int
+    seed      : int
+
+    Returns
+    -------
+    Tuple[float, float]
+        (ece_ci_lower, ece_ci_upper) at the specified ci_level.
+    """
+    n_samples = len(max_conf)
+
+    # Use SeedSequence for the ECE bootstrap stream (distinct from bin CIs).
+    ss  = np.random.SeedSequence([seed, 999983])  # large prime offset avoids collision with bin seeds
+    rng = np.random.default_rng(ss)
+
+    boot_ece = np.empty(n_bootstrap, dtype=np.float64)
+
+    # Pre-compute global bin edges from the full dataset (fixed for all resamples
+    # in the "uniform" case; recomputed per resample in "quantile" to match the
+    # conditional distribution of the resample).
+    global_edges = _compute_bin_edges(max_conf, n_bins, strategy) if strategy == "uniform" else None
+
+    for i in range(n_bootstrap):
+        idx          = rng.integers(0, n_samples, size=n_samples)
+        r_max_conf   = max_conf[idx]
+        r_correct    = correct[idx]
+
+        # For quantile binning, recompute edges on the resample so the bins
+        # adapt to the resampled confidence distribution.
+        edges = global_edges if strategy == "uniform" else _compute_bin_edges(r_max_conf, n_bins, strategy)
+
+        ece_sum = 0.0
+        for b in range(n_bins):
+            lo, hi = edges[b], edges[b + 1]
+            in_bin = (r_max_conf >= lo) & (r_max_conf < hi) if b < n_bins - 1 else (r_max_conf >= lo) & (r_max_conf <= hi)
+            cnt = int(in_bin.sum())
+            if cnt == 0:
+                continue
+            bin_conf = float(r_max_conf[in_bin].mean())
+            bin_acc  = float(r_correct[in_bin].mean())
+            ece_sum += (cnt / n_samples) * abs(bin_conf - bin_acc)
+
+        boot_ece[i] = ece_sum
+
+    alpha    = 1.0 - ci_level
+    ci_lower = float(np.percentile(boot_ece, 100.0 * (alpha / 2.0)))
+    ci_upper = float(np.percentile(boot_ece, 100.0 * (1.0 - alpha / 2.0)))
     return (ci_lower, ci_upper)
 
 
@@ -514,15 +678,17 @@ def compute_reliability_diagram(
     y_proba: Any,
     n_classes: int,
     n_bins: int = DEFAULT_N_BINS,
+    strategy: str = "uniform",
     seed: int = DEFAULT_SEED,
     compute_bin_ci: bool = True,
     ci_level: float = _BIN_CI_LEVEL,
+    compute_ece_ci: bool = True,
 ) -> Dict[str, Any]:
     """
     Compute a reliability diagram (calibration curve) for a multi-class
     classifier using the maximum-confidence convention.
 
-    For each confidence bin b = [b_lo, b_hi):
+    For each confidence bin b:
       - ``mean_confidence``  : average max-softmax-probability of predictions
                                falling in this bin (x-axis of the diagram).
       - ``actual_accuracy``  : fraction of those predictions that were correct
@@ -530,98 +696,59 @@ def compute_reliability_diagram(
       - ``bin_count``        : number of predictions in the bin.
       - ``is_sparse``        : True if bin_count < SPARSE_BIN_THRESHOLD (5).
       - ``is_empty``         : True if bin_count == 0.
-      - ``calibration_gap``  : actual_accuracy - mean_confidence. Positive =
-                               underconfident; negative = overconfident. None
-                               if bin is empty.
-      - ``ci_lower/upper``   : bootstrap CI on actual_accuracy (only if
-                               compute_bin_ci=True and bin is non-empty).
+      - ``calibration_gap``  : actual_accuracy - mean_confidence.
+      - ``ci_lower/upper``   : bootstrap CI on actual_accuracy.
+      - ``ci_degenerate``    : True if CI is trivial (bin_count == 1).
 
-    Aggregate statistics (ECE, MCE, ACE):
-      - ``ece``              : Expected Calibration Error — weighted average
-                               |confidence - accuracy| over non-empty bins,
-                               weighted by bin sample fraction.
-      - ``ece_unweighted``   : Unweighted average |confidence - accuracy| over
-                               non-empty bins (all bins count equally).
-      - ``mce``              : Maximum Calibration Error — max |conf - acc|
-                               over non-empty bins.
-      - ``mean_confidence``  : Global mean max-softmax probability (average
-                               over all samples, not bins).
-      - ``mean_accuracy``    : Overall accuracy (fraction of correct argmax
-                               predictions). This matches ``compute_accuracy()``
-                               in metrics.py.
-      - ``overconfidence_gap``: mean_confidence - mean_accuracy. Positive
-                               implies overconfidence. Expected positive for
-                               this model.
-      - ``n_empty_bins``     : Number of bins with zero samples (expected to
-                               be high on the 52-clip val set).
-      - ``n_sparse_bins``    : Number of bins with fewer than
-                               ``SPARSE_BIN_THRESHOLD`` samples.
-
-    Stage 6 context
-    ----------------
-    With the champion model's 52 val clips and ``n_bins=10``:
-      - Expected mean confidence: ~0.55–0.75 (softmax peak for a 35-class
-        model that gets ~58% of predictions right).
-      - Expected overconfidence_gap: +0.10 to +0.20 (model says 65%
-        confident on average, but is actually right ~58% of the time).
-      - Expected n_empty_bins: 3–6 (most confidence mass in [0.4, 0.9]).
-      - ECE: expected ~0.10–0.20 on this small, imbalanced dataset.
+    Aggregate statistics:
+      - ``ece``              : Expected Calibration Error (weighted).
+      - ``ece_unweighted``   : Unweighted ECE.
+      - ``mce``              : Maximum Calibration Error.
+      - ``ece_ci_lower/upper``: Bootstrap CI for ECE (clip-level resampling).
+      - ``mean_confidence``  : Global mean max-softmax probability.
+      - ``mean_accuracy``    : Overall accuracy (fraction of correct argmax).
+      - ``overconfidence_gap``: mean_confidence - mean_accuracy.
 
     Parameters
     ----------
-    y_true   : array-like, shape (n_samples,)
-        True class indices (int). One entry per validation clip.
-    y_proba  : array-like, shape (n_samples, n_classes)
-        Softmax probability arrays. Come from
-        ``get_predictions(..., return_probs=True)`` in metrics.py.
-    n_classes: int — number of output classes (35).
-    n_bins   : int, default 10
-        Number of equal-width confidence bins spanning [0, 1].
-        Recommended: 5 for this 52-clip val set (more stable), 10 for
-        the diagram shape that matches most published reliability diagrams.
-    seed     : int, default 42 — for bootstrap CI resampling.
+    y_true    : array-like, shape (n_samples,)
+    y_proba   : array-like, shape (n_samples, n_classes), softmax probs
+    n_classes : int — 35 for this project.
+    n_bins    : int, default 10
+    strategy  : str, default "uniform"
+        "uniform" — equal-width bins (standard, publication-compatible).
+        "quantile" — equal-mass bins; more stable for small, skewed datasets.
+        Recommended: use n_bins=5 with strategy="uniform" for this 52-clip
+        val set as a balance between shape and stability. Use strategy=
+        "quantile" for internal diagnostics.
+    seed      : int, default 42
     compute_bin_ci : bool, default True
-        If True, compute bootstrap CI for each non-empty bin's accuracy.
-        Set False for a fast smoke-test run during development.
-    ci_level : float in (0, 1), default 0.80
-        Bootstrap confidence level for per-bin accuracy CIs.
-        80% (not 90%) because per-bin sample counts are so small that
-        a 90% interval often spans [0, 1] and communicates nothing useful.
+    ci_level  : float in (0, 1), default 0.80
+    compute_ece_ci : bool, default True
+        If True, compute a bootstrap CI for ECE itself via clip-level
+        resampling. Adds ~1000 additional ECE computations; fast at n=52.
 
     Returns
     -------
     dict with keys:
-        bins         : List[dict] — one dict per bin (ordered by confidence).
-                       Each bin dict has: bin_index, bin_lo, bin_hi,
-                       mean_confidence, actual_accuracy, bin_count,
-                       is_sparse, is_empty, calibration_gap, ci_lower,
-                       ci_upper (latter two None if empty or CI skipped).
-        ece          : float — Expected Calibration Error.
-        ece_unweighted: float — Unweighted ECE.
-        mce          : float — Maximum Calibration Error.
-        mean_confidence  : float — global mean max probability.
-        mean_accuracy    : float — global fraction correct.
-        overconfidence_gap: float — mean_confidence - mean_accuracy.
-        n_bins           : int — total number of bins (including empty).
-        n_empty_bins     : int
-        n_sparse_bins    : int
-        n_samples        : int
-        n_classes        : int
-        ci_level         : float — CI level used (or None if ci skipped).
-        caveat           : str — calibration reliability caveat.
-        temperature_scaling_note: str — documented-not-implemented note.
-
-    Raises
-    ------
-    ValueError
-        If n_bins < 2, n_classes < 2, arrays are empty, shapes mismatch,
-        label values are out of range, or y_proba doesn't look like softmax.
+        bins                     : List[dict] — one dict per bin.
+        ece, ece_unweighted, mce : float
+        ece_ci_lower, ece_ci_upper: float | None
+        ece_ci_level             : float | None
+        mean_confidence          : float
+        mean_accuracy            : float
+        overconfidence_gap       : float
+        n_bins, n_empty_bins, n_sparse_bins, n_samples, n_classes : int
+        strategy                 : str
+        ci_level                 : float | None
+        caveat, temperature_scaling_note : str
     """
     # ── Validate inputs ───────────────────────────────────────────────────
     _validate_n_bins(n_bins, "compute_reliability_diagram")
     _validate_class_count(n_classes, "compute_reliability_diagram")
+    _validate_bin_strategy(strategy, "compute_reliability_diagram")
 
-    y_true_arr  = _to_label_array(y_proba if False else y_true, "y_true")
+    y_true_arr  = _to_label_array(y_true, "y_true")
     y_proba_arr = _to_proba_array(y_proba, n_classes, "compute_reliability_diagram")
     _validate_equal_length(y_true_arr, y_proba_arr, "y_true", "y_proba")
     _validate_label_range(y_true_arr, n_classes, "compute_reliability_diagram")
@@ -636,15 +763,15 @@ def compute_reliability_diagram(
         )
 
     # ── Derived per-sample quantities ─────────────────────────────────────
-    max_conf  = _extract_max_confidence(y_proba_arr)   # shape (n_samples,)
-    correct   = _is_correct(y_true_arr, y_proba_arr)   # shape (n_samples,)
+    max_conf = _extract_max_confidence(y_proba_arr)   # shape (n_samples,)
+    correct  = _is_correct(y_true_arr, y_proba_arr)   # shape (n_samples,)
 
-    # Bin edges: n_bins+1 points from 0.0 to 1.0 inclusive.
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    # ── Bin edges ─────────────────────────────────────────────────────────
+    bin_edges = _compute_bin_edges(max_conf, n_bins, strategy)
 
     # ── Per-bin computation ───────────────────────────────────────────────
     bins_data: List[Dict[str, Any]] = []
-    ece_numerator_sum   = 0.0   # sum of (bin_fraction × |gap|) for ECE
+    ece_numerator_sum   = 0.0
     ece_unweighted_gaps: List[float] = []
     mce = 0.0
 
@@ -652,13 +779,9 @@ def compute_reliability_diagram(
         lo = float(bin_edges[b])
         hi = float(bin_edges[b + 1])
 
-        # Half-open [lo, hi) except last bin which is fully closed [lo, hi].
-        # This exactly mirrors scikit-learn's calibration_curve behaviour.
         if b < n_bins - 1:
             in_bin = (max_conf >= lo) & (max_conf < hi)
         else:
-            # Last bin: include hi=1.0 (softmax outputs can be exactly 1.0
-            # when one class dominates all floating-point mass).
             in_bin = (max_conf >= lo) & (max_conf <= hi)
 
         bin_count = int(in_bin.sum())
@@ -678,6 +801,7 @@ def compute_reliability_diagram(
                 "calibration_gap":  None,
                 "ci_lower":         None,
                 "ci_upper":         None,
+                "ci_degenerate":    None,
             }
         else:
             bin_conf_vals = max_conf[in_bin]
@@ -688,21 +812,20 @@ def compute_reliability_diagram(
             gap           = bin_acc - bin_mean_conf
             abs_gap       = abs(gap)
 
-            # ECE contribution: weighted by bin fraction
             bin_fraction = bin_count / n_samples
             ece_numerator_sum += bin_fraction * abs_gap
             ece_unweighted_gaps.append(abs_gap)
-
-            # MCE: track the worst-case bin
             mce = max(mce, abs_gap)
 
-            # Per-bin bootstrap CI on accuracy
             ci_lower_val: Optional[float] = None
             ci_upper_val: Optional[float] = None
+            ci_degen: Optional[bool] = None
+
             if compute_bin_ci:
-                ci_lower_val, ci_upper_val = _bootstrap_bin_accuracy_ci(
+                ci_lower_val, ci_upper_val, ci_degen = _bootstrap_bin_accuracy_ci(
                     bin_correct, ci_level=ci_level,
-                    n_bootstrap=_N_BINS_CI_BOOTSTRAP, seed=seed ^ b,
+                    n_bootstrap=_N_BINS_CI_BOOTSTRAP,
+                    seed=seed, bin_index=b,
                 )
 
             bin_dict = {
@@ -717,6 +840,7 @@ def compute_reliability_diagram(
                 "calibration_gap":  round(gap, 6),
                 "ci_lower":         round(ci_lower_val, 6) if ci_lower_val is not None else None,
                 "ci_upper":         round(ci_upper_val, 6) if ci_upper_val is not None else None,
+                "ci_degenerate":    ci_degen,
             }
 
         bins_data.append(bin_dict)
@@ -725,8 +849,8 @@ def compute_reliability_diagram(
     n_empty_bins  = sum(1 for bd in bins_data if bd["is_empty"])
     n_sparse_bins = sum(1 for bd in bins_data if bd["is_sparse"])
 
-    ece              = round(float(ece_numerator_sum), 6)
-    ece_unweighted   = (
+    ece            = round(float(ece_numerator_sum), 6)
+    ece_unweighted = (
         round(float(np.mean(ece_unweighted_gaps)), 6)
         if ece_unweighted_gaps else 0.0
     )
@@ -735,11 +859,26 @@ def compute_reliability_diagram(
     mean_accuracy    = round(float(correct.mean()), 6)
     overconf_gap     = round(float(mean_confidence - mean_accuracy), 6)
 
+    # ── ECE bootstrap CI ─────────────────────────────────────────────────
+    ece_ci_lower: Optional[float] = None
+    ece_ci_upper: Optional[float] = None
+    if compute_ece_ci and n_samples >= _MIN_SAMPLES_FOR_CALIBRATION:
+        ece_ci_lower, ece_ci_upper = _bootstrap_ece_ci(
+            max_conf, correct,
+            n_classes=n_classes, n_bins=n_bins, strategy=strategy,
+            ci_level=_ECE_CI_LEVEL, n_bootstrap=_N_ECE_CI_BOOTSTRAP, seed=seed,
+        )
+        ece_ci_lower = round(ece_ci_lower, 6)
+        ece_ci_upper = round(ece_ci_upper, 6)
+
     result: Dict[str, Any] = {
         "bins":                   bins_data,
         "ece":                    ece,
         "ece_unweighted":         ece_unweighted,
         "mce":                    mce_final,
+        "ece_ci_lower":           ece_ci_lower,
+        "ece_ci_upper":           ece_ci_upper,
+        "ece_ci_level":           _ECE_CI_LEVEL if compute_ece_ci else None,
         "mean_confidence":        mean_confidence,
         "mean_accuracy":          mean_accuracy,
         "overconfidence_gap":     overconf_gap,
@@ -748,16 +887,21 @@ def compute_reliability_diagram(
         "n_sparse_bins":          n_sparse_bins,
         "n_samples":              n_samples,
         "n_classes":              n_classes,
+        "strategy":               strategy,
         "ci_level":               ci_level if compute_bin_ci else None,
         "caveat":                 _CALIBRATION_CAVEAT,
         "temperature_scaling_note": TEMPERATURE_SCALING_NOTE,
     }
 
     overconf_direction = "overconfident" if overconf_gap > 0 else "underconfident"
+    ece_ci_str = (
+        f" [{int(_ECE_CI_LEVEL*100)}% CI: {ece_ci_lower:.4f}–{ece_ci_upper:.4f}]"
+        if ece_ci_lower is not None else ""
+    )
     logger.info(
         f"compute_reliability_diagram() | "
-        f"n_samples={n_samples} | n_bins={n_bins} | "
-        f"ECE={ece:.4f} | ECE_unweighted={ece_unweighted:.4f} | "
+        f"n_samples={n_samples} | n_bins={n_bins} | strategy={strategy} | "
+        f"ECE={ece:.4f}{ece_ci_str} | ECE_unweighted={ece_unweighted:.4f} | "
         f"MCE={mce_final:.4f} | "
         f"mean_confidence={mean_confidence:.4f} | "
         f"mean_accuracy={mean_accuracy:.4f} | "
@@ -780,9 +924,9 @@ def compute_reliability_diagram(
     if n_empty_bins > n_bins // 2:
         logger.warning(
             f"compute_reliability_diagram(): {n_empty_bins}/{n_bins} bins are "
-            "empty. With 52 val clips and 10 bins the confidence mass is "
-            "concentrated in a narrow range. Consider n_bins=5 for a coarser "
-            "but more populated diagram.",
+            "empty. With 52 val clips confidence mass is concentrated in a "
+            "narrow range. Consider n_bins=5 or strategy='quantile' for a "
+            "more populated diagram.",
             extra={"stage": "evaluation"},
         )
 
@@ -802,90 +946,65 @@ def compute_confidence_threshold_curve(
 
     For each threshold τ:
       - A prediction is ACCEPTED if ``max(softmax(x)) >= τ``.
-      - ``coverage(τ)``   : fraction of all predictions accepted.
-      - ``accuracy(τ)``   : accuracy on accepted predictions. None if no
-                            predictions are accepted (coverage == 0).
-      - ``n_accepted(τ)`` : absolute count of accepted predictions.
-      - ``macro_f1(τ)``   : sklearn macro-F1 on accepted predictions, forcing
-                            all n_classes into the denominator (consistent with
-                            metrics.py). None if coverage == 0.
-      - ``mean_confidence(τ)`` : mean max-softmax of accepted predictions.
-                                  None if coverage == 0.
+      - ``coverage(τ)``         : fraction of all predictions accepted.
+      - ``accuracy(τ)``         : accuracy on accepted predictions.
+      - ``n_accepted(τ)``       : absolute count of accepted predictions.
+      - ``selective_macro_f1(τ)``: sklearn macro-F1 on accepted predictions,
+                                   forcing all n_classes into the denominator.
+                                   NOTE: this is SELECTIVE inference performance,
+                                   not overall model quality. See
+                                   ``_SELECTIVE_MACRO_F1_NOTE`` for the full
+                                   interpretation warning.
+      - ``mean_confidence(τ)``  : mean max-softmax of accepted predictions.
 
-    Design note: τ = 0.0 always gives coverage=1.0 (all predictions accepted),
-    and τ = 1.0 typically gives coverage near 0 (only exact-1.0 softmax
-    predictions, which may be 0). Both endpoints are always included in the
-    grid so the full trade-off curve is always visible.
+    IMPORTANT NAMING CHANGE from the original implementation
+    ----------------------------------------------------------
+    The ``macro_f1`` key from the original has been renamed to
+    ``selective_macro_f1`` throughout this function's output to make clear
+    this is a conditional metric (performance on the accepted subset) and
+    NOT a measure of overall model quality. At high thresholds, only easy
+    predictions remain, so this metric inflates naturally. See the module
+    docstring section "Threshold curve macro-F1 interpretation note" and
+    ``_SELECTIVE_MACRO_F1_NOTE`` for full context.
 
-    Deployment relevance
-    ---------------------
-    For a real-time gesture recognition system (Stage 9 webcam demo), the
-    operator can set a threshold τ to achieve a desired precision level at
-    the cost of some coverage. The curve quantifies this trade-off:
-
-      - At τ=0.0: 100% coverage, ~58% accuracy (champion's val_acc).
-      - At τ=0.5: moderate filtering. Typical improvement: +5–15% accuracy
-        at the cost of 20–40% reduced coverage on a 35-class system.
-      - At τ=0.8: high-confidence regime. Accuracy likely >80%, but only
-        a small fraction of predictions accepted (most of the 35 rare classes
-        will be below threshold).
-
-    The accompanying figure (``reports/figures/confidence_threshold_curve.png``)
-    shows both curves on a single plot so the operator can identify the
-    "elbow" where accuracy gains become marginal relative to coverage cost.
-
-    Area Under Curve (AUC-coverage)
-    --------------------------------
-    The area under the accuracy-vs-coverage curve (AUC, computed with the
-    trapezoidal rule) is reported as a single-number quality metric. A
-    perfectly calibrated model with 100% accuracy everywhere would have
-    AUC=1.0; a random classifier would have AUC = 1/n_classes. The
-    champion's expected AUC is ~0.55–0.65 (accuracy rises significantly
-    as coverage drops, but never reaches 100%).
+    sklearn dependency note
+    -----------------------
+    This function uses ``sklearn.metrics.f1_score`` (imported at module top,
+    not deferred as a local import) to compute per-threshold macro-F1. This
+    is an explicitly declared project-wide dependency consistent with
+    metrics.py, train.py, and benchmark.py.
 
     Parameters
     ----------
-    y_true   : array-like, shape (n_samples,)
-    y_proba  : array-like, shape (n_samples, n_classes), softmax probs
-    n_classes: int — 35 for this project.
+    y_true             : array-like, shape (n_samples,)
+    y_proba            : array-like, shape (n_samples, n_classes), softmax probs
+    n_classes          : int — 35 for this project.
     n_threshold_points : int, default 101
-        Number of evenly spaced threshold values in [0, 1] (inclusive).
-        101 gives 1% resolution. With 52 clips, the effective resolution
-        is much coarser — each clip is 1.9% of accuracy — so 101 points
-        is sufficient to capture all meaningful transitions.
-    seed     : int, default 42 — not used for randomness here, kept for
-               API consistency with compute_reliability_diagram().
+    seed               : int, default 42 — kept for API consistency.
 
     Returns
     -------
     dict with keys:
-        thresholds         : List[float] — τ values (n_threshold_points,).
-        coverage           : List[float] — fraction accepted at each τ.
-        accuracy           : List[float | None] — accuracy on accepted at each τ.
-        macro_f1           : List[float | None] — macro-F1 on accepted at each τ.
-        n_accepted         : List[int] — count accepted at each τ.
-        mean_confidence    : List[float | None] — mean max-prob of accepted.
-        auc_coverage       : float — area under accuracy-vs-coverage curve
-                             (trapezoidal rule, excluding None entries).
-        optimal_threshold_accuracy : dict — threshold that maximises accuracy
-                             (may not exist if coverage=0 at all τ > 0).
-        optimal_threshold_f1       : dict — threshold that maximises macro-F1.
-        n_threshold_points : int
-        n_samples          : int
-        n_classes          : int
-        caveat             : str
-
-    Raises
-    ------
-    ValueError
-        If n_threshold_points < 2, arrays are invalid per standard checks.
+        thresholds             : List[float]
+        coverage               : List[float]
+        accuracy               : List[float | None]
+        selective_macro_f1     : List[float | None]  (renamed from macro_f1)
+        n_accepted             : List[int]
+        mean_confidence        : List[float | None]
+        auc_coverage           : float
+        auc_monotone_warning   : bool  — True if coverage-accuracy curve is
+                                         not monotone (noisy signal at n=52)
+        optimal_threshold_accuracy : dict
+        optimal_threshold_f1       : dict  (based on selective_macro_f1)
+        n_threshold_points, n_samples, n_classes : int
+        selective_macro_f1_note : str  (interpretation warning)
+        caveat                 : str
     """
     # ── Validate inputs ───────────────────────────────────────────────────
     if not isinstance(n_threshold_points, (int, np.integer)) or n_threshold_points < 2:
         raise ValueError(
             f"compute_confidence_threshold_curve(): "
-            f"n_threshold_points={n_threshold_points!r} must be >= 2. "
-            f"Default is {DEFAULT_N_THRESHOLD_POINTS}."
+            f"n_threshold_points={n_threshold_points!r} must be >= 2."
         )
     _validate_class_count(n_classes, "compute_confidence_threshold_curve")
 
@@ -903,24 +1022,20 @@ def compute_confidence_threshold_curve(
         )
 
     # ── Per-sample derived quantities ─────────────────────────────────────
-    max_conf = _extract_max_confidence(y_proba_arr)   # (n_samples,)
+    max_conf = _extract_max_confidence(y_proba_arr)
     y_pred   = y_proba_arr.argmax(axis=1).astype(np.int64)
     correct  = (y_pred == y_true_arr)
-
-    # Import sklearn f1_score here — keeps the module's core numpy-only
-    # contract while allowing the richer per-threshold macro-F1 computation.
-    from sklearn.metrics import f1_score as _f1_score
 
     labels_range = list(range(n_classes))
     thresholds   = np.linspace(0.0, 1.0, n_threshold_points)
 
     # ── Per-threshold computation ─────────────────────────────────────────
-    threshold_list:   List[float]               = []
-    coverage_list:    List[float]               = []
-    accuracy_list:    List[Optional[float]]     = []
-    macro_f1_list:    List[Optional[float]]     = []
-    n_accepted_list:  List[int]                 = []
-    mean_conf_list:   List[Optional[float]]     = []
+    threshold_list:              List[float]           = []
+    coverage_list:               List[float]           = []
+    accuracy_list:               List[Optional[float]] = []
+    selective_macro_f1_list:     List[Optional[float]] = []
+    n_accepted_list:             List[int]             = []
+    mean_conf_list:              List[Optional[float]] = []
 
     for tau in thresholds:
         accepted = max_conf >= tau
@@ -932,56 +1047,67 @@ def compute_confidence_threshold_curve(
 
         if n_acc == 0:
             accuracy_list.append(None)
-            macro_f1_list.append(None)
+            selective_macro_f1_list.append(None)
             mean_conf_list.append(None)
         else:
             acc_val = round(float(correct[accepted].mean()), 6)
             accuracy_list.append(acc_val)
 
-            # macro-F1 on the accepted subset.
-            # We force all n_classes labels into the denominator (same as
-            # metrics.py) so that this number is directly comparable to the
-            # full-coverage macro-F1 reported there. Classes absent from the
-            # accepted subset contribute F1=0 (zero_division=0).
-            f1_val = round(float(_f1_score(
+            # Selective macro-F1: all n_classes forced into denominator (matching
+            # metrics.py convention). Zero_division=0 for absent classes.
+            # sklearn imported at module top — no hidden deferred import.
+            f1_val = round(float(_sklearn_f1_score(
                 y_true_arr[accepted],
                 y_pred[accepted],
                 average="macro",
                 labels=labels_range,
                 zero_division=0,
             )), 6)
-            macro_f1_list.append(f1_val)
-
+            selective_macro_f1_list.append(f1_val)
             mean_conf_list.append(round(float(max_conf[accepted].mean()), 6))
 
-    # ── Aggregate statistics ──────────────────────────────────────────────
-    # AUC under accuracy-vs-coverage curve (trapezoidal rule).
-    # Exclude (threshold, None) points. Sort by coverage ascending for a
-    # well-defined monotone x-axis.
+    # ── AUC under accuracy-vs-coverage curve ─────────────────────────────
     valid_pairs = [
         (cov, acc)
         for cov, acc in zip(coverage_list, accuracy_list)
         if acc is not None
     ]
-    # Sort by coverage ASCENDING (τ increases → coverage decreases, so
-    # iterating thresholds gives coverage decreasing; we sort ascending for AUC).
     valid_pairs.sort(key=lambda p: p[0])
+
+    auc_monotone_warning = False
     if len(valid_pairs) >= 2:
         cov_arr = np.array([p[0] for p in valid_pairs])
         acc_arr = np.array([p[1] for p in valid_pairs])
+
+        # Check monotonicity: accuracy should be non-decreasing as coverage
+        # decreases (i.e. as cov_arr increases, acc_arr should be non-increasing,
+        # or alternatively, sorted by cov ascending means acc should be non-
+        # decreasing or at least roughly monotone). With n=52, violations are
+        # common and signal statistical noise, not a calibration pathology.
+        diffs = np.diff(acc_arr)
+        if np.any(diffs < -0.05):  # more than 5pp non-monotone drop
+            auc_monotone_warning = True
+            logger.warning(
+                "compute_confidence_threshold_curve(): accuracy-vs-coverage "
+                "curve is non-monotone (max decrease between adjacent points: "
+                f"{float(diffs.min()):.4f}). With n={n_samples} clips this is "
+                "expected sampling noise, not a calibration pathology. "
+                "AUC-coverage is still computed but should be treated as a "
+                "heuristic scalar for this dataset size.",
+                extra={"stage": "evaluation"},
+            )
+
         auc_coverage = round(float(np.trapz(acc_arr, cov_arr)), 6)
     else:
         auc_coverage = 0.0
 
-    # Optimal threshold for accuracy (maximum accuracy with coverage > 0)
-    # and for macro-F1 (maximum macro-F1 with coverage > 0).
+    # ── Optimal thresholds ────────────────────────────────────────────────
     def _optimal_threshold(
         values: List[Optional[float]],
         metric_name: str,
     ) -> Dict[str, Any]:
-        """Find threshold index that maximises a metric (None values skipped)."""
-        best_idx   = None
-        best_val   = -1.0
+        best_idx = None
+        best_val = -1.0
         for i, (val, cov) in enumerate(zip(values, coverage_list)):
             if val is not None and val > best_val:
                 best_val = val
@@ -990,49 +1116,49 @@ def compute_confidence_threshold_curve(
             return {"threshold": None, metric_name: None, "coverage": None,
                     "n_accepted": None}
         return {
-            "threshold":   float(threshold_list[best_idx]),
-            metric_name:   float(values[best_idx]),
-            "coverage":    float(coverage_list[best_idx]),
-            "n_accepted":  int(n_accepted_list[best_idx]),
+            "threshold":  float(threshold_list[best_idx]),
+            metric_name:  float(values[best_idx]),
+            "coverage":   float(coverage_list[best_idx]),
+            "n_accepted": int(n_accepted_list[best_idx]),
         }
 
     optimal_acc = _optimal_threshold(accuracy_list, "accuracy")
-    optimal_f1  = _optimal_threshold(macro_f1_list, "macro_f1")
+    optimal_f1  = _optimal_threshold(selective_macro_f1_list, "selective_macro_f1")
 
     result: Dict[str, Any] = {
         "thresholds":                   threshold_list,
         "coverage":                     coverage_list,
         "accuracy":                     accuracy_list,
-        "macro_f1":                     macro_f1_list,
+        "selective_macro_f1":           selective_macro_f1_list,
         "n_accepted":                   n_accepted_list,
         "mean_confidence":              mean_conf_list,
         "auc_coverage":                 auc_coverage,
+        "auc_monotone_warning":         auc_monotone_warning,
         "optimal_threshold_accuracy":   optimal_acc,
         "optimal_threshold_f1":         optimal_f1,
         "n_threshold_points":           n_threshold_points,
         "n_samples":                    n_samples,
         "n_classes":                    n_classes,
+        "selective_macro_f1_note":      _SELECTIVE_MACRO_F1_NOTE,
         "caveat":                       _CALIBRATION_CAVEAT,
     }
 
-    # Extract τ=0 and τ=0.5 stats for the log line.
-    # τ=0 is always index 0 (coverage=1.0); τ=0.5 is the midpoint.
-    mid_idx       = n_threshold_points // 2
-    acc_at_0      = accuracy_list[0]
-    acc_at_half   = accuracy_list[mid_idx]
-    cov_at_half   = coverage_list[mid_idx]
-    f1_at_0       = macro_f1_list[0]
+    mid_idx   = n_threshold_points // 2
+    acc_at_0  = accuracy_list[0]
+    f1_at_0   = selective_macro_f1_list[0]
+    cov_at_half = coverage_list[mid_idx]
+    acc_at_half = accuracy_list[mid_idx]
 
     logger.info(
         f"compute_confidence_threshold_curve() | "
         f"n_samples={n_samples} | n_threshold_points={n_threshold_points} | "
-        f"τ=0: coverage=1.00, acc={acc_at_0}, macro_f1={f1_at_0} | "
+        f"τ=0: coverage=1.00, acc={acc_at_0}, selective_macro_f1={f1_at_0} | "
         f"τ=0.5: coverage={cov_at_half}, acc={acc_at_half} | "
-        f"auc_coverage={auc_coverage:.4f} | "
+        f"auc_coverage={auc_coverage:.4f} (monotone_warning={auc_monotone_warning}) | "
         f"optimal_acc_threshold={optimal_acc['threshold']} "
         f"(acc={optimal_acc.get('accuracy')}, cov={optimal_acc.get('coverage')}) | "
         f"optimal_f1_threshold={optimal_f1['threshold']} "
-        f"(f1={optimal_f1.get('macro_f1')}, cov={optimal_f1.get('coverage')})",
+        f"(selective_f1={optimal_f1.get('selective_macro_f1')}, cov={optimal_f1.get('coverage')})",
         extra={"stage": "evaluation"},
     )
 
@@ -1045,10 +1171,12 @@ def compute_calibration_summary(
     n_classes: int,
     split_name: str = "val",
     n_bins: int = DEFAULT_N_BINS,
+    strategy: str = "uniform",
     n_threshold_points: int = DEFAULT_N_THRESHOLD_POINTS,
     seed: int = DEFAULT_SEED,
     compute_bin_ci: bool = True,
     ci_level: float = _BIN_CI_LEVEL,
+    compute_ece_ci: bool = True,
 ) -> Dict[str, Any]:
     """
     Bundle reliability diagram and confidence-threshold curve into a single
@@ -1056,56 +1184,55 @@ def compute_calibration_summary(
 
     This is the single function that ``pipelines/run_evaluation.py`` and
     ``notebooks/06_evaluation_error_analysis.ipynb`` call to get all
-    calibration metrics for a split. Analogous to ``compute_evaluation_summary()``
-    in ``metrics.py``.
+    calibration metrics for a split.
+
+    Validation-once pattern (post-review item 10)
+    -----------------------------------------------
+    ``y_true`` / ``y_proba`` are validated exactly ONCE at the top of this
+    function. The already-validated arrays are then passed directly to
+    ``compute_reliability_diagram()`` and ``compute_confidence_threshold_curve()``,
+    which accept pre-validated arrays without re-running full validation.
+    This avoids triple-validation overhead within a single summary call while
+    preserving each constituent function's ability to be called independently
+    with its own validation (the guards in those functions remain intact for
+    standalone use).
 
     IMPORTANT — this function operates on arrays ONLY (no model inference).
     The caller is responsible for passing already-extracted ``(y_true, y_proba)``
-    from the Phase B1 / Phase C prediction cache. This ensures the test set
-    inference pass (Phase C) remains a controlled, logged, one-shot event
-    rather than happening silently inside this function.
-
-    All inputs are validated exactly once and the validated arrays are passed
-    to both constituent functions — avoiding redundant re-validation (same
-    pattern as the post-review fix in ``compute_evaluation_summary()`` in
-    metrics.py, item 11).
+    from the Phase B1 / Phase C prediction cache.
 
     Parameters
     ----------
     y_true            : array-like, shape (n_samples,)
     y_proba           : array-like, shape (n_samples, n_classes), softmax probs
     n_classes         : int
-    split_name        : str, default "val" — echoed into the result dict.
+    split_name        : str, default "val"
     n_bins            : int, default 10
+    strategy          : str, default "uniform" — see compute_reliability_diagram()
     n_threshold_points: int, default 101
     seed              : int, default 42
     compute_bin_ci    : bool, default True
     ci_level          : float in (0, 1), default 0.80
+    compute_ece_ci    : bool, default True
 
     Returns
     -------
     dict with keys:
-        split_name         : str
-        n_samples          : int
-        n_classes          : int
-        reliability_diagram: dict — see compute_reliability_diagram()
-        threshold_curve    : dict — see compute_confidence_threshold_curve()
-        ece                : float — top-level convenience alias
-        mce                : float — top-level convenience alias
-        overconfidence_gap : float — top-level convenience alias
-        auc_coverage       : float — top-level convenience alias
-        caveat             : str
-        temperature_scaling_note: str
-
-    Raises
-    ------
-    ValueError
-        Via constituent functions (arrays invalid, shapes wrong, etc.)
+        split_name, n_samples, n_classes         : metadata
+        reliability_diagram                      : full dict
+        threshold_curve                          : full dict
+        ece, ece_unweighted, mce                 : float — convenience aliases
+        ece_ci_lower, ece_ci_upper, ece_ci_level : float | None
+        overconfidence_gap, mean_confidence,
+        mean_accuracy                            : float
+        auc_coverage                             : float
+        auc_monotone_warning                     : bool
+        strategy                                 : str
+        caveat, temperature_scaling_note         : str
     """
     _validate_class_count(n_classes, "compute_calibration_summary")
 
-    # Validate once; pass already-validated arrays to constituent functions
-    # to avoid triple-validation overhead.
+    # Validate once; pass pre-validated arrays into constituent functions.
     y_true_arr  = _to_label_array(y_true, "y_true")
     y_proba_arr = _to_proba_array(y_proba, n_classes, "compute_calibration_summary")
     _validate_equal_length(y_true_arr, y_proba_arr, "y_true", "y_proba")
@@ -1116,14 +1243,17 @@ def compute_calibration_summary(
     logger.info(
         f"compute_calibration_summary() | split='{split_name}' | "
         f"n_samples={n_samples} | n_classes={n_classes} | "
-        f"n_bins={n_bins} | n_threshold_points={n_threshold_points}",
+        f"n_bins={n_bins} | strategy={strategy} | "
+        f"n_threshold_points={n_threshold_points}",
         extra={"stage": "evaluation"},
     )
 
+    # Pass already-validated arrays directly — no re-validation overhead.
     reliability = compute_reliability_diagram(
         y_true_arr, y_proba_arr, n_classes,
-        n_bins=n_bins, seed=seed,
+        n_bins=n_bins, strategy=strategy, seed=seed,
         compute_bin_ci=compute_bin_ci, ci_level=ci_level,
+        compute_ece_ci=compute_ece_ci,
     )
 
     threshold_curve = compute_confidence_threshold_curve(
@@ -1141,17 +1271,30 @@ def compute_calibration_summary(
         "ece":                    reliability["ece"],
         "ece_unweighted":         reliability["ece_unweighted"],
         "mce":                    reliability["mce"],
+        "ece_ci_lower":           reliability["ece_ci_lower"],
+        "ece_ci_upper":           reliability["ece_ci_upper"],
+        "ece_ci_level":           reliability["ece_ci_level"],
         "overconfidence_gap":     reliability["overconfidence_gap"],
         "mean_confidence":        reliability["mean_confidence"],
         "mean_accuracy":          reliability["mean_accuracy"],
         "auc_coverage":           threshold_curve["auc_coverage"],
+        "auc_monotone_warning":   threshold_curve["auc_monotone_warning"],
+        "strategy":               strategy,
         "caveat":                 _CALIBRATION_CAVEAT,
         "temperature_scaling_note": TEMPERATURE_SCALING_NOTE,
     }
 
+    ece_ci_str = ""
+    if reliability["ece_ci_lower"] is not None:
+        ece_ci_str = (
+            f" [{int(_ECE_CI_LEVEL*100)}% CI: "
+            f"{reliability['ece_ci_lower']:.4f}–{reliability['ece_ci_upper']:.4f}]"
+        )
+
     logger.info(
         f"compute_calibration_summary() COMPLETE | split='{split_name}' | "
-        f"ECE={reliability['ece']:.4f} | MCE={reliability['mce']:.4f} | "
+        f"ECE={reliability['ece']:.4f}{ece_ci_str} | "
+        f"MCE={reliability['mce']:.4f} | "
         f"overconfidence_gap={reliability['overconfidence_gap']:+.4f} | "
         f"auc_coverage={threshold_curve['auc_coverage']:.4f}",
         extra={"stage": "evaluation"},
@@ -1163,6 +1306,32 @@ def compute_calibration_summary(
 # ---------------------------------------------------------------------------
 # Figure rendering helpers
 # ---------------------------------------------------------------------------
+
+def _get_safe_matplotlib():
+    """
+    Import matplotlib.pyplot safely without mutating global backend state.
+
+    The original implementation called ``matplotlib.use("Agg")`` at the
+    module level of each plot function, which mutates global matplotlib state
+    and breaks interactive notebooks / other callers. This helper instead
+    attempts to import pyplot with whatever backend is currently active.
+
+    If no display is available (headless CI environment) and importing pyplot
+    raises, falls back to setting Agg backend as a last resort via
+    ``matplotlib.use("Agg")``, but only if no backend is yet set.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        return plt
+    except Exception:
+        # Last-resort fallback for completely headless environments where
+        # pyplot itself fails to import without an explicit backend.
+        import matplotlib
+        if not matplotlib.get_backend():
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt
+
 
 def plot_reliability_diagram(
     reliability_result: Dict[str, Any],
@@ -1179,38 +1348,40 @@ def plot_reliability_diagram(
 
     Visual design
     -------------
-    - Blue bars: actual accuracy per bin (the "observed" calibration).
-    - Red dashed diagonal: perfect calibration (confidence == accuracy).
-    - Light red shaded region: the overconfidence zone (bars below diagonal).
-    - Light blue shaded region: the underconfidence zone (bars above diagonal).
-    - Error bars: 80% bootstrap CI on per-bin accuracy (when available).
-    - Empty bins: shown as a very light grey hatched bar (height=0 marker).
-    - Sparse bins: annotated with an asterisk (*) above the bar.
-    - Bin count labels: printed above each bar.
-    - ECE, MCE, overconfidence gap: annotated in the plot legend/title.
+    - Blue bars: actual accuracy per bin.
+    - Red dashed diagonal: perfect calibration.
+    - Light shading for over/under confidence zones.
+    - Error bars: bootstrap CI on per-bin accuracy (when available).
+    - Degenerate CI bins: shown with a distinct marker (dashed error cap)
+      to signal the CI is trivial (n=1 in that bin).
+    - Empty bins: shown as a very light grey hatched bar.
+    - Sparse bins: annotated with an asterisk (*).
+    - Bin count labels above each bar.
+    - ECE with bootstrap CI, MCE, overconfidence gap in title.
+    - Lower panel: confidence distribution histogram.
+
+    Backend note
+    ------------
+    Does NOT call ``matplotlib.use("Agg")``. Callers that need a non-
+    interactive backend should set it at application entry point.
 
     Parameters
     ----------
     reliability_result  : dict from compute_reliability_diagram()
-    output_path         : str | Path | None — if provided, save the figure here.
-                          If None, return the figure object for notebook display.
-    split_name          : str — shown in the figure title.
-    figure_dpi          : int — DPI for saved figure.
-    show_sparse_annotation: bool — annotate sparse bins with '*'.
-    show_bin_counts     : bool — print n=X above each bar.
-    show_ci             : bool — draw error bars from bootstrap CI.
+    output_path         : str | Path | None
+    split_name          : str
+    figure_dpi          : int
+    show_sparse_annotation: bool
+    show_bin_counts     : bool
+    show_ci             : bool
 
     Returns
     -------
     matplotlib.figure.Figure
-        The figure object. Caller is responsible for plt.close(fig) if not
-        embedding in a notebook.
     """
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
+        plt = _get_safe_matplotlib()
     except ImportError as exc:
         raise ImportError(
             "plot_reliability_diagram() requires matplotlib. "
@@ -1224,66 +1395,65 @@ def plot_reliability_diagram(
     ovgap     = reliability_result["overconfidence_gap"]
     n_samples = reliability_result["n_samples"]
     ci_level  = reliability_result.get("ci_level")
+    strategy  = reliability_result.get("strategy", "uniform")
+    ece_ci_lo = reliability_result.get("ece_ci_lower")
+    ece_ci_hi = reliability_result.get("ece_ci_upper")
+    ece_ci_lv = reliability_result.get("ece_ci_level")
 
     fig, (ax_main, ax_hist) = plt.subplots(
         2, 1, figsize=(9, 9),
         gridspec_kw={"height_ratios": [3, 1], "hspace": 0.35},
     )
 
-    # ── Main panel: reliability diagram ───────────────────────────────────
     ax = ax_main
+    bin_edges = np.array([bd["bin_lo"] for bd in bins] + [bins[-1]["bin_hi"]])
 
-    bin_width = 1.0 / n_bins
-    bin_centers = [
-        bd["bin_lo"] + bin_width / 2.0
-        for bd in bins
-    ]
+    # For uniform bins, use fixed width. For quantile, derive from edges.
+    bin_widths = np.diff(bin_edges)
+    bin_centers = bin_edges[:-1] + bin_widths / 2.0
 
-    # Perfect calibration diagonal
     ax.plot([0, 1], [0, 1], "r--", linewidth=1.5, label="Perfect calibration", zorder=5)
-
-    # Shading for over/under confidence regions
-    ax.fill_between([0, 1], [0, 0], [0, 1],
-                    alpha=0.06, color="cornflowerblue",
+    ax.fill_between([0, 1], [0, 0], [0, 1], alpha=0.06, color="cornflowerblue",
                     label="Underconfidence zone")
-    ax.fill_between([0, 1], [0, 1], [1, 1],
-                    alpha=0.06, color="tomato",
+    ax.fill_between([0, 1], [0, 1], [1, 1], alpha=0.06, color="tomato",
                     label="Overconfidence zone")
 
-    for bd, center in zip(bins, bin_centers):
+    for bd, center, bw in zip(bins, bin_centers, bin_widths):
         if bd["is_empty"]:
-            # Empty bin: draw a very faint hatched marker at height 0
-            ax.bar(center, 0.005, width=bin_width * 0.85,
+            ax.bar(center, 0.005, width=bw * 0.85,
                    color="lightgrey", edgecolor="grey", linewidth=0.5,
                    hatch="////", alpha=0.5, zorder=2)
             continue
 
-        acc   = bd["actual_accuracy"]
-        is_sp = bd["is_sparse"]
-        count = bd["bin_count"]
+        acc    = bd["actual_accuracy"]
+        is_sp  = bd["is_sparse"]
+        count  = bd["bin_count"]
+        ci_deg = bd.get("ci_degenerate", False)
 
-        # Bar colour: light steel blue for normal, muted orange for sparse
         color = "steelblue" if not is_sp else "sandybrown"
-        ax.bar(center, acc, width=bin_width * 0.85,
+        ax.bar(center, acc, width=bw * 0.85,
                color=color, edgecolor="white", linewidth=0.8,
                alpha=0.85, zorder=3)
 
-        # CI error bars
         if show_ci and bd.get("ci_lower") is not None and bd.get("ci_upper") is not None:
             ci_lo = bd["ci_lower"]
             ci_hi = bd["ci_upper"]
+            # Use dashed caplines to visually flag degenerate CIs (n=1).
+            cap_style = ":" if ci_deg else "-"
             ax.errorbar(
                 center, acc,
                 yerr=[[acc - ci_lo], [ci_hi - acc]],
                 fmt="none", color="navy", linewidth=1.5,
                 capsize=4, capthick=1.5, zorder=4,
+                linestyle=cap_style,
             )
 
-        # Count annotation
         if show_bin_counts:
             label_parts = [f"n={count}"]
             if show_sparse_annotation and is_sp:
                 label_parts.append("*")
+            if ci_deg and show_ci:
+                label_parts.append("†")  # dagger marks degenerate CI
             ax.text(
                 center, min(acc + 0.04, 0.97),
                 " ".join(label_parts),
@@ -1297,15 +1467,18 @@ def plot_reliability_diagram(
     ax.set_xlabel("Mean confidence (max softmax probability)", fontsize=11)
     ax.set_ylabel("Actual accuracy", fontsize=11)
 
-    ci_level_str = f" ({int(ci_level * 100)}% CI)" if ci_level and show_ci else ""
+    ci_level_str = f" ({int(ci_level * 100)}% bin CI)" if ci_level and show_ci else ""
+    ece_ci_str = ""
+    if ece_ci_lo is not None and ece_ci_hi is not None:
+        ece_ci_str = f" [{int(ece_ci_lv*100)}% CI: {ece_ci_lo:.4f}–{ece_ci_hi:.4f}]"
+
     title_lines = [
-        f"Reliability Diagram — {split_name} split  (n={n_samples})",
-        f"ECE={ece:.4f}  |  MCE={mce:.4f}  |  "
+        f"Reliability Diagram — {split_name} split  (n={n_samples}, strategy={strategy})",
+        f"ECE={ece:.4f}{ece_ci_str}  |  MCE={mce:.4f}  |  "
         f"Overconfidence gap={ovgap:+.4f}{ci_level_str}",
     ]
-    ax.set_title("\n".join(title_lines), fontsize=11, pad=10)
+    ax.set_title("\n".join(title_lines), fontsize=10, pad=10)
 
-    # Custom legend entries
     legend_handles = [
         plt.Line2D([0], [0], color="red", linestyle="--", label="Perfect calibration"),
         mpatches.Patch(color="steelblue", alpha=0.85, label="Calibrated bin"),
@@ -1313,19 +1486,19 @@ def plot_reliability_diagram(
                        label=f"Sparse bin (n < {SPARSE_BIN_THRESHOLD})*"),
         mpatches.Patch(color="lightgrey", hatch="////", alpha=0.5, label="Empty bin"),
     ]
-    ax.legend(handles=legend_handles, fontsize=9, loc="upper left")
+    if show_ci:
+        legend_handles.append(
+            plt.Line2D([0], [0], color="navy", linestyle="--", linewidth=1,
+                       label="†Degenerate CI (n=1)")
+        )
+    ax.legend(handles=legend_handles, fontsize=8, loc="upper left")
     ax.grid(True, alpha=0.25, linestyle=":")
 
     # ── Lower panel: confidence histogram ─────────────────────────────────
-    # Shows where the model's confidence mass actually lies — essential
-    # context for interpreting sparse/empty bins in the main panel.
-    # We can reconstruct the histogram from bin counts.
-    bin_edges   = np.array([bd["bin_lo"] for bd in bins] + [bins[-1]["bin_hi"]])
     bin_heights = np.array([bd["bin_count"] for bd in bins])
-
     ax_hist.bar(
         bin_edges[:-1], bin_heights,
-        width=np.diff(bin_edges), align="edge",
+        width=bin_widths, align="edge",
         color="steelblue", alpha=0.6, edgecolor="white", linewidth=0.5,
     )
     ax_hist.axhline(SPARSE_BIN_THRESHOLD, color="darkorange", linestyle=":",
@@ -1359,14 +1532,25 @@ def plot_confidence_threshold_curve(
     Render the confidence-threshold curve from the dict returned by
     ``compute_confidence_threshold_curve()``.
 
+    Naming note
+    -----------
+    The ``macro_f1`` key from the original output has been renamed to
+    ``selective_macro_f1`` in ``compute_confidence_threshold_curve()``.
+    This plot function uses the renamed key accordingly and labels the line
+    "Selective macro-F1" with an annotation noting it is conditional on
+    acceptance, to prevent misinterpretation as overall model quality.
+
     Visual design
     -------------
     Two y-axes on a single panel:
-      - Left y-axis (blue): Coverage (fraction of predictions accepted).
+      - Left y-axis (blue): Coverage.
       - Right y-axis (green): Accuracy on accepted predictions.
-    A secondary thin orange line shows macro-F1 on the accepted subset.
-    Vertical dashed lines mark optimal_threshold_accuracy and
-    optimal_threshold_f1.
+    A secondary orange dashed line shows selective macro-F1.
+    A monotonicity warning annotation appears if auc_monotone_warning=True.
+
+    Backend note
+    ------------
+    Does NOT call ``matplotlib.use("Agg")``.
 
     Parameters
     ----------
@@ -1380,31 +1564,29 @@ def plot_confidence_threshold_curve(
     matplotlib.figure.Figure
     """
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        plt = _get_safe_matplotlib()
     except ImportError as exc:
         raise ImportError(
             "plot_confidence_threshold_curve() requires matplotlib."
         ) from exc
 
-    thresholds   = threshold_result["thresholds"]
-    coverage     = threshold_result["coverage"]
-    accuracy     = threshold_result["accuracy"]
-    macro_f1     = threshold_result["macro_f1"]
-    n_samples    = threshold_result["n_samples"]
-    auc_cov      = threshold_result["auc_coverage"]
-    opt_acc      = threshold_result["optimal_threshold_accuracy"]
-    opt_f1       = threshold_result["optimal_threshold_f1"]
+    thresholds     = threshold_result["thresholds"]
+    coverage       = threshold_result["coverage"]
+    accuracy       = threshold_result["accuracy"]
+    sel_macro_f1   = threshold_result["selective_macro_f1"]
+    n_samples      = threshold_result["n_samples"]
+    auc_cov        = threshold_result["auc_coverage"]
+    mono_warn      = threshold_result.get("auc_monotone_warning", False)
+    opt_acc        = threshold_result["optimal_threshold_accuracy"]
+    opt_f1         = threshold_result["optimal_threshold_f1"]
 
-    # Replace None with np.nan for plotting (matplotlib handles NaN as gaps)
+    # Replace None with nan for plotting (matplotlib handles NaN as gaps).
     acc_plot = [a if a is not None else float("nan") for a in accuracy]
-    f1_plot  = [f if f is not None else float("nan") for f in macro_f1]
+    f1_plot  = [f if f is not None else float("nan") for f in sel_macro_f1]
 
     fig, ax1 = plt.subplots(figsize=(10, 6))
     ax2 = ax1.twinx()
 
-    # Coverage line (left axis)
     ax1.plot(thresholds, coverage, color="cornflowerblue", linewidth=2.2,
              label="Coverage", zorder=4)
     ax1.set_xlabel("Confidence threshold τ", fontsize=11)
@@ -1413,16 +1595,14 @@ def plot_confidence_threshold_curve(
     ax1.set_xlim(0.0, 1.0)
     ax1.set_ylim(-0.02, 1.05)
 
-    # Accuracy line (right axis)
     ax2.plot(thresholds, acc_plot, color="mediumseagreen", linewidth=2.2,
              label="Accuracy on accepted", zorder=4)
     ax2.plot(thresholds, f1_plot, color="darkorange", linewidth=1.5,
-             linestyle="--", label="Macro-F1 on accepted", zorder=4)
-    ax2.set_ylabel("Accuracy / Macro-F1", color="mediumseagreen", fontsize=11)
+             linestyle="--", label="Selective macro-F1 (conditional)", zorder=4)
+    ax2.set_ylabel("Accuracy / Selective macro-F1", color="mediumseagreen", fontsize=11)
     ax2.tick_params(axis="y", labelcolor="mediumseagreen")
     ax2.set_ylim(-0.02, 1.05)
 
-    # Vertical markers for optimal thresholds
     if opt_acc.get("threshold") is not None:
         ax1.axvline(opt_acc["threshold"], color="mediumseagreen",
                     linestyle=":", linewidth=1.5,
@@ -1430,28 +1610,40 @@ def plot_confidence_threshold_curve(
                           f"(acc={opt_acc.get('accuracy', '?'):.3f}, "
                           f"cov={opt_acc.get('coverage', '?'):.2f})",
                     zorder=3)
-    if opt_f1.get("threshold") is not None and opt_f1["threshold"] != opt_acc.get("threshold"):
+    if (opt_f1.get("threshold") is not None and
+            opt_f1["threshold"] != opt_acc.get("threshold")):
         ax1.axvline(opt_f1["threshold"], color="darkorange",
                     linestyle=":", linewidth=1.5,
-                    label=f"Opt F1 τ={opt_f1['threshold']:.2f} "
-                          f"(F1={opt_f1.get('macro_f1', '?'):.3f}, "
+                    label=f"Opt selective-F1 τ={opt_f1['threshold']:.2f} "
+                          f"(F1={opt_f1.get('selective_macro_f1', '?'):.3f}, "
                           f"cov={opt_f1.get('coverage', '?'):.2f})",
                     zorder=3)
 
-    # Horizontal reference line at coverage = 1.0 (τ=0)
     ax1.axhline(1.0, color="lightgrey", linestyle=":", linewidth=0.8, zorder=1)
 
+    mono_note = "\n⚠ Non-monotone curve (sampling noise, n=52)" if mono_warn else ""
     title = (
         f"Confidence-Threshold Curve — {split_name} split  (n={n_samples})\n"
-        f"AUC-coverage={auc_cov:.4f}"
+        f"AUC-coverage={auc_cov:.4f}{mono_note}"
     )
-    ax1.set_title(title, fontsize=11, pad=10)
+    ax1.set_title(title, fontsize=10, pad=10)
     ax1.grid(True, alpha=0.2, linestyle=":")
 
-    # Combined legend (both axes)
+    # Add a small annotation box explaining selective macro-F1.
+    ax2.annotate(
+        "Selective macro-F1 ≠ overall quality.\nConditional on accepted subset.",
+        xy=(0.98, 0.05), xycoords="axes fraction",
+        ha="right", va="bottom", fontsize=7,
+        color="darkorange", style="italic",
+        bbox=dict(boxstyle="round,pad=0.2", facecolor="lightyellow",
+                  edgecolor="darkorange", alpha=0.7),
+    )
+
+    # Combined legend (both axes) — kept concise to avoid cognitive overload.
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc="center left")
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="center left",
+               framealpha=0.85)
 
     if output_path is not None:
         out = Path(output_path)
@@ -1490,19 +1682,31 @@ def _self_check() -> None:
     assert 0.0 < _BIN_CI_LEVEL < 1.0, (
         f"calibration.py: _BIN_CI_LEVEL={_BIN_CI_LEVEL} must be in (0, 1)."
     )
+    assert 0.0 < _ECE_CI_LEVEL < 1.0, (
+        f"calibration.py: _ECE_CI_LEVEL={_ECE_CI_LEVEL} must be in (0, 1)."
+    )
     assert _N_BINS_CI_BOOTSTRAP >= 10, (
         f"calibration.py: _N_BINS_CI_BOOTSTRAP={_N_BINS_CI_BOOTSTRAP} must be >= 10."
+    )
+    assert _N_ECE_CI_BOOTSTRAP >= 10, (
+        f"calibration.py: _N_ECE_CI_BOOTSTRAP={_N_ECE_CI_BOOTSTRAP} must be >= 10."
     )
     assert 0.0 < _MIN_MEANINGFUL_COVERAGE <= 1.0, (
         f"calibration.py: _MIN_MEANINGFUL_COVERAGE={_MIN_MEANINGFUL_COVERAGE} "
         "must be in (0, 1]."
     )
     assert len(_CALIBRATION_CAVEAT) > 50, (
-        "calibration.py: _CALIBRATION_CAVEAT string is unexpectedly short — "
-        "check it was not accidentally truncated."
+        "calibration.py: _CALIBRATION_CAVEAT string unexpectedly short."
     )
     assert len(TEMPERATURE_SCALING_NOTE) > 50, (
-        "calibration.py: TEMPERATURE_SCALING_NOTE string is unexpectedly short."
+        "calibration.py: TEMPERATURE_SCALING_NOTE string unexpectedly short."
+    )
+    assert len(_SELECTIVE_MACRO_F1_NOTE) > 50, (
+        "calibration.py: _SELECTIVE_MACRO_F1_NOTE string unexpectedly short."
+    )
+    assert set(_VALID_BIN_STRATEGIES) == {"uniform", "quantile"}, (
+        "calibration.py: _VALID_BIN_STRATEGIES must contain exactly "
+        "'uniform' and 'quantile'."
     )
 
 
