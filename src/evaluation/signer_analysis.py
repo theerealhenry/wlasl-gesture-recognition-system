@@ -34,7 +34,7 @@ Concretely, this module:
      concern, not a metric concern.
 
 Why this module's framing differs from the original handoff template
---------------------------------------------------------------------
+----------------------------------------------------------------------
 The Stage 5 handoff (Part 6.4) describes per-signer analysis using the
 language of "familiar vs. novel" signers and frames the val signer spread
 as revealing "generalisation quality" in a way that implicitly assumes some
@@ -47,17 +47,13 @@ plan explicitly corrects this (Phase D3):
 
 Stage 1 (Part 4, Finding F3) confirms zero signer overlap across
 train/val/test with signer-aware greedy bin-packing (seed=42). Every
-val and test signer is, by construction, equally "unseen" — there is no
-subset of signers the model has ever seen sign anything. This module
-therefore:
+val and test signer is, by construction, equally "unseen". This module:
 
   - NEVER computes or reports a "familiar" vs "novel" split.
   - Always labels signer-level results as "unseen-signer accuracy", not
     "generalisation to new signers" framed as if some baseline of
     "known signers" existed for comparison.
-  - Surfaces the n_signers / clips-per-signer ratio prominently, because
-    that ratio (not familiarity) is what determines how trustworthy any
-    individual signer's accuracy estimate is.
+  - Surfaces the n_signers / clips-per-signer ratio prominently.
 
 Why per-signer estimates are extremely noisy (and this module says so)
 ------------------------------------------------------------------------
@@ -65,125 +61,184 @@ The val split has 52 clips across 7 signers — roughly 7-8 clips per
 signer on average, but Stage 1's signer-aware bin-packing does not
 guarantee an even split: some signers may contribute 3 clips, others 12.
 A signer with 3 clips has only 4 possible accuracy values (0/3, 1/3, 2/3,
-3/3) — far too coarse to support any claim stronger than "this is a rough
-indicator." This module:
+3/3). This module:
 
   - Reports ``n_clips`` alongside every per-signer accuracy, never as an
     afterthought.
   - Flags signers with ``n_clips < SPARSE_SIGNER_THRESHOLD`` as
-    ``is_sparse`` (default threshold: 5), mirroring the ``is_sparse`` /
-    ``SPARSE_BIN_THRESHOLD`` pattern already established in
-    ``calibration.py``.
-  - Computes a bootstrap CI for cross-signer accuracy SPREAD (not just a
-    point estimate of each signer's accuracy) so "how much do signers
-    differ" is a quantified, reproducible number rather than an eyeballed
-    box-plot impression.
-  - Embeds a caveat string in every returned dict, exactly mirroring the
-    ``_CALIBRATION_CAVEAT`` / ``_BOOTSTRAP_SIGNER_CAVEAT`` pattern in
-    ``calibration.py`` / ``metrics.py``, so every downstream consumer
-    (``evaluation_report.json``, ``LIMITATIONS.md``, the Stage 11 report)
-    inherits the small-sample warning automatically.
+    ``is_sparse`` (default threshold: 5).
+  - Computes Wilson score confidence intervals per signer (``accuracy_ci_lower``,
+    ``accuracy_ci_upper``) so the individual-signer uncertainty is quantified
+    rather than implicit.
+  - Computes a bootstrap CI for cross-signer accuracy SPREAD so "how much do
+    signers differ" is a quantified, reproducible number.
+  - Embeds a caveat string in every returned dict, mirroring the pattern
+    in ``calibration.py`` and ``metrics.py``.
 
-Relationship to metrics.py's bootstrap caveat
-------------------------------------------------
-``metrics.py::bootstrap_macro_f1_ci()`` already documents (Revision history
-item 1) that its clip-level bootstrap is NOT signer-aware and likely
-UNDERSTATES true uncertainty because validation clips cluster by signer.
-That module explicitly defers a signer-stratified treatment to this one.
-This module is the natural home for that signer-grouped view, but it does
-NOT implement a signer-stratified block-bootstrap replacement for
-``bootstrap_macro_f1_ci()`` — that would conflate two different questions
-("what is the CI on overall macro-F1, accounting for signer clustering?"
-vs "how much does per-signer accuracy vary across signers, unconditional
-on overall macro-F1?"). This module answers the second question only.
-``compute_signer_spread_bootstrap_ci()`` here resamples SIGNERS (not
-clips) to quantify how much the spread of per-signer accuracy would change
-under a different random sample of signers — which is the complementary,
-signer-level diagnostic ``metrics.py`` defers to this module.
+Dual macro-F1 reporting (Review Issue H1)
+-------------------------------------------
+``compute_per_signer_accuracy()`` now reports both:
 
-Failure-mode hypothesis testing (Stage 6 Revised, Phase D3 + D4)
---------------------------------------------------------------------
-The Stage 6 (Revised) plan asks two specific questions of this module's
-output:
+  ``macro_f1_global``:
+      sklearn macro-F1 with ``labels=list(range(n_classes))`` forced
+      (Part 8, Critical Rule #2 — consistent with every other macro-F1
+      in this project). For a signer with 7 clips covering 4 distinct
+      classes, 31 of the 35 classes contribute F1=0.0 to this average,
+      making it low by construction. This is the project-standard metric,
+      kept for cross-run comparability.
 
-    "Cross-check: do low-accuracy signers disproportionately produce the
-    known high-risk classes (think, clothes, birthday, name, book)?"
+  ``macro_f1_present_classes``:
+      sklearn macro-F1 computed only over the classes actually present in
+      ``y_true`` for this signer (``labels=np.unique(yt_s)``). A signer
+      who perfectly classifies all of their 4 distinct signs gets
+      ``macro_f1_present_classes=1.0``, not ~0.11. This is the metric
+      that answers "how well did the model perform on the signs this
+      signer actually produced?" and is always reported alongside
+      ``macro_f1_global`` with an explicit label so neither is mistaken
+      for the other.
 
-    (Phase D4) "Use the cache's detected_frame_count / missing_pct fields
-    to test whether errors cluster in heavily zero-filled or short clips."
+Both values are reported because neither alone is sufficient: global
+correctly penalises failure to cover the full label space; present-classes
+correctly rewards per-sign quality without penalising the model for signs
+the signer simply didn't produce.
 
-``compute_signer_high_risk_correlation()`` answers the first question
-directly: for each signer, what fraction of their clips are one of the
-five Stage 5 Finding 8 high-risk classes, and does that fraction correlate
-with the signer's accuracy? ``compute_per_signer_accuracy()`` accepts
-optional ``detected_frame_count`` / ``missing_pct`` metadata (mirroring
-the optional ``metadata`` passthrough already established in
-``metrics.py::compute_evaluation_summary()``) so the second question can
-be answered without a second data-joining step.
+Weighted spread statistics (Review Issue H2)
+----------------------------------------------
+``compute_signer_spread_bootstrap_ci()`` now reports both unweighted spread
+(equal weight per signer — answers "how variable are signers as individuals?")
+and clip-count-weighted spread statistics (``weighted_observed_std``,
+``weighted_observed_mean`` — answers "how variable is performance across
+clips, accounting for differing signer contributions?"). Both are provided
+because a signer with 3 clips and one with 12 clips are legitimately different
+amounts of evidence.
 
-Design decisions worth flagging explicitly
----------------------------------------------
-Framework-agnostic by construction
-    Identical principle to ``metrics.py`` / ``calibration.py``: every
-    function here operates on plain numpy arrays already extracted by the
-    caller. No model, dataset, or TensorFlow dependency anywhere in this
-    module — confirmed independently testable with synthetic arrays.
+Correlation methodology (Review Issue H3)
+-------------------------------------------
+``compute_signer_high_risk_correlation()`` now reports both Pearson r and
+Spearman rho. Spearman is generally more appropriate for small n (n=7),
+nonlinear relationships, and outlier-prone settings. Both are provided;
+the caller can select the appropriate one for their analysis.
 
-Per-signer accuracy AND per-signer macro-F1 are both computed
-    The handoff (Part 6.4) asks only for per-signer accuracy. This module
-    also computes per-signer macro-F1 (forced over all n_classes, the same
-    ``labels=list(range(n_classes))`` discipline as every other metric in
-    this project — Part 8, Critical Rule #2) because a signer's 7-8 clips
-    typically touch only a handful of distinct signs; accuracy alone can
-    look deceptively high or low depending on which few classes that
-    signer happens to have signed. Per-signer macro-F1 is reported
-    alongside accuracy, never as a replacement for it, since macro-F1 over
-    a 7-8 clip, ~5-distinct-class subset is itself a very coarse number —
-    both are presented together with their respective caveats so neither
-    is over-read in isolation.
+Revision history
+-----------------
+Post-review revision addressing the following issues from the critical review:
 
-Signer IDs are treated as opaque labels, never assumed numeric or ordered
-    ``signer_ids`` may be strings (e.g. "signer_014") or integers depending
-    on how the Phase B1 cache joins ``data/splits/val.csv``. Every function
-    here accepts ``Sequence[Any]`` for signer ids and converts to a numpy
-    object array internally rather than assuming a numeric dtype — this
-    avoids a silent ``astype(int)`` truncation bug if signer IDs are ever
-    zero-padded strings (the Stage 1 handoff explicitly notes a previous
-    leading-zero video_id bug; signer IDs are not assumed immune to the
-    same class of issue).
+  H1 FIXED. ``compute_per_signer_accuracy()`` now reports both
+     ``macro_f1_global`` (labels forced to full range, project standard)
+     and ``macro_f1_present_classes`` (labels restricted to classes the
+     signer actually produced). The original single ``macro_f1`` key is
+     retained as an alias for ``macro_f1_global`` for backward compatibility.
 
-No I/O, anywhere
-    Like ``metrics.py`` and ``calibration.py``, this module performs zero
-    file I/O. ``pipelines/run_evaluation.py`` is responsible for loading
-    ``val_predictions.npz`` / ``test_predictions.npz`` and joining
-    ``signer_ids`` from ``data/splits/{val,test}.csv`` before calling into
-    this module.
+  H2 FIXED. ``compute_signer_spread_bootstrap_ci()`` now additionally
+     computes ``weighted_observed_std`` and ``weighted_observed_mean``
+     using clip counts as weights, alongside the original unweighted
+     statistics.
+
+  H3 FIXED. ``compute_signer_high_risk_correlation()`` now computes and
+     reports both Pearson r and Spearman rho. Full-precision (unrounded)
+     accuracy and high_risk_clip_fraction values are used in the correlation
+     computation (M6 fix), with rounding applied only in the returned dict.
+
+  M1 FIXED. ``compute_signer_failure_mode_summary()`` now validates that
+     ``missing_pct`` values lie in [0, 1] (or [0, 100] — detected and
+     rescaled automatically) and that ``detected_frame_count`` values are
+     non-negative.
+
+  M2 FIXED. All mean computations in failure-mode summary now use
+     ``np.nanmean()`` and explicitly report the count of NaN values found,
+     so downstream consumers know when a mean is based on partial data.
+
+  M3 FIXED. ``sign_names`` validation in ``compute_per_signer_accuracy()``
+     now checks for None entries, empty strings, and duplicate names —
+     not just length.
+
+  M4 FIXED. ``compute_per_signer_accuracy()`` now emits a WARNING when
+     ``high_risk_class_indices`` is empty after the name-matching step,
+     preventing silent all-zero high_risk_clip_fraction values that would
+     make the Phase D3 correlation meaningless.
+
+  M5 FIXED. Signer ID keys now use ``repr(signer)`` instead of
+     ``str(signer)`` to prevent collision between numeric ``1`` and string
+     ``"1"`` IDs — the same class of leading-zero bug Stage 1 already fixed
+     for video IDs. Plain-string representation is still used for display
+     in figures; ``repr()`` is used for dict keying only.
+
+  M6 FIXED. Full-precision (unrounded) per-signer accuracy and
+     high_risk_clip_fraction values are stored internally and used in all
+     correlation computations. Rounding is applied only in the final output
+     dict.
+
+  M7 FIXED. Wilson score confidence intervals are now computed per signer
+     (``accuracy_ci_lower``, ``accuracy_ci_upper``) at the 90% level,
+     matching the project's DEFAULT_BOOTSTRAP_CI. A signer with n_clips=3
+     correctly gets a wide CI; a signer with n_clips=12 gets a narrower one.
+
+  M8 FIXED. ``compute_signer_spread_bootstrap_ci()`` now explicitly detects
+     and reports when all signer accuracies are identical (degenerate case —
+     zero variance), setting ``spread_is_degenerate=True`` and a descriptive
+     note in the result, rather than silently returning zero CI bounds.
+
+  L1 FIXED. Unused ``Mapping`` and ``Tuple`` typing imports removed.
+
+  L2 NOTED. Plot title updated to "Per-signer accuracy variation" rather than
+     "generalisation" — the latter implies a familiar/novel comparison that
+     doesn't exist in this zero-overlap split.
+
+  L3 NOTED. Marker size scaling documented; the formula ``40 + 20*c`` is
+     retained but capped at a maximum to prevent large signers dominating.
+
+  L4 FIXED. Legend construction in ``plot_signer_generalisation()`` now
+     uses explicit proxy artists rather than sequential ``ax.legend()``
+     calls, preventing duplicate entries.
+
+  L5 NOTED. Sort order in the plot is by value (ascending) for readability;
+     signer labels on the x-axis preserve identity. A stable secondary sort
+     key (signer id string) is added to make the ordering deterministic when
+     multiple signers have identical values.
+
+  L8 NOTED. Validation helpers are intentionally duplicated (not imported)
+     from metrics.py/calibration.py for independent testability — accepted
+     trade-off, documented in module docstring.
+
+Champion model context (for reference)
+-----------------------------------------
+The champion model (``bilstm_hands_only_v4_aug``) config_snapshot.yaml
+confirms:
+  - ``early_stopping_monitor: val_accuracy``  (NOT val_macro_f1 as narrated
+    in the Stage 5 handoff — this discrepancy is flagged in
+    evaluation_report.json per Phase F requirements; this module takes no
+    position on it).
+  - Input shape: (1, 100, 126) — seq_len=100, landmark_config=hands_only.
+  - Parameters: 68,771. val_macro_f1: 0.6011.
+  - This module operates purely on (y_true, y_pred, signer_ids) produced
+    from running this champion model over the val/test splits.
 
 Module-level exports
 ----------------------
-    compute_per_signer_accuracy           — per-signer accuracy + macro-F1
-                                              + support, exactly the
-                                              handoff-specified function
+    compute_per_signer_accuracy           — per-signer accuracy + dual
+                                              macro-F1 + Wilson CI + support
     compute_signer_spread_bootstrap_ci    — bootstrap CI on cross-signer
-                                              accuracy spread (std / range)
-    compute_signer_high_risk_correlation  — does low accuracy correlate
-                                              with high-risk class exposure?
-    compute_signer_failure_mode_summary   — optional detected_frame_count /
-                                              missing_pct correlation (Phase D4)
+                                              spread (weighted + unweighted)
+    compute_signer_high_risk_correlation  — Pearson + Spearman correlation
+                                              of accuracy vs high-risk exposure
+    compute_signer_failure_mode_summary   — NaN-safe metadata correlation
     compute_signer_analysis_summary       — consolidation wrapper for
                                               evaluation_report.json
     plot_signer_generalisation            — figure renderer (box/strip plot)
-    SPARSE_SIGNER_THRESHOLD               — public constant: signers with
-                                              fewer clips than this are
-                                              flagged sparse
+    SPARSE_SIGNER_THRESHOLD               — public constant
     UNSEEN_SIGNER_FRAMING_NOTE            — the "no familiar/novel axis"
                                               caveat, ready to embed verbatim
+    DEFAULT_N_BOOTSTRAP                   — project-standard resample count
+    DEFAULT_BOOTSTRAP_CI                  — project-standard CI level (0.90)
+    DEFAULT_SEED                          — project global seed (42)
+    HIGH_RISK_SIGNS                       — Stage 5 Finding 8 classes
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 from sklearn.metrics import f1_score as _sklearn_f1_score
@@ -200,44 +255,46 @@ logger = get_logger(__name__)
 #: Signers with fewer clips than this are flagged ``is_sparse`` in
 #: per-signer output. Mirrors ``calibration.py::SPARSE_BIN_THRESHOLD``.
 #: With 52 val clips / 7 signers (mean ~7.4 clips/signer), a signer at or
-#: below this threshold has too few clips for its accuracy to be read as
-#: more than a rough indicator.
+#: below this threshold has too few clips for accuracy to be read as more
+#: than a rough indicator.
 SPARSE_SIGNER_THRESHOLD: int = 5
 
 #: Project global seed. Matches DEFAULT_SEED in metrics.py / calibration.py
-#: and base.yaml's top-level `seed: 42`.
+#: and base.yaml's top-level ``seed: 42``.
 DEFAULT_SEED: int = 42
 
-#: Default bootstrap resample count for signer-spread CI. Matches the
-#: project-wide convention in metrics.py (DEFAULT_N_BOOTSTRAP).
+#: Default bootstrap resample count. Matches DEFAULT_N_BOOTSTRAP in
+#: metrics.py — 1000 resamples of a ~7-signer array is fast.
 DEFAULT_N_BOOTSTRAP: int = 1000
 
-#: Default confidence level for the signer-spread bootstrap, matching
-#: metrics.py's DEFAULT_BOOTSTRAP_CI (90%, not the more conventional 95%,
-#: because a 95% interval on 7 signers would be too wide to be informative).
+#: Default CI level — 90%, not 95%, because a 95% interval on 7 signers
+#: would be too wide to be informative. Matches DEFAULT_BOOTSTRAP_CI in
+#: metrics.py and calibration.py.
 DEFAULT_BOOTSTRAP_CI: float = 0.90
 
-#: Below this many distinct signers, resampling SIGNERS (not clips) for a
-#: spread CI is close to meaningless — warn rather than error, since 7
-#: signers (this project's actual val signer count) is a legitimate,
-#: expected call and must not raise.
+#: Wilson score CI level for per-signer accuracy. Set equal to
+#: DEFAULT_BOOTSTRAP_CI for consistency across the evaluation suite.
+_WILSON_CI_LEVEL: float = 0.90
+
+#: z-value for Wilson CI. z(0.95) ≈ 1.6449 gives a 90% two-sided interval.
+_WILSON_Z: float = 1.6448536269514729  # scipy.stats.norm.ppf(0.95)
+
+#: Below this many distinct signers, resampling signers for a spread CI is
+#: statistically marginal — warn rather than error (7 signers is the
+#: project's actual val count and a legitimate call).
 _MIN_SIGNERS_FOR_BOOTSTRAP: int = 3
 
 #: Below this many bootstrap resamples, percentile CI bounds are unreliable.
 _MIN_BOOTSTRAP_FOR_STABLE_CI: int = 100
 
 #: The five smallest, most failure-prone training classes identified in
-#: Stage 5 Finding 8. Matches metrics.py::HIGH_RISK_SIGNS exactly — kept
-#: as an independent module-level constant (not imported from metrics.py)
-#: so this module remains independently importable/testable without a
-#: hard dependency on metrics.py, mirroring the accepted trade-off already
-#: documented in calibration.py (item 11 in its revision history).
-HIGH_RISK_SIGNS: Tuple[str, ...] = ("clothes", "think", "birthday", "name", "book")
+#: Stage 5 Finding 8. Intentionally duplicated from metrics.py (not
+#: imported) so this module remains independently testable — accepted
+#: trade-off documented in calibration.py revision history item 11.
+HIGH_RISK_SIGNS: tuple = ("clothes", "think", "birthday", "name", "book")
 
 #: Embedded verbatim in every per-signer / summary result so every
-#: downstream consumer (evaluation_report.json, LIMITATIONS.md, the
-#: Stage 11 report) inherits the correct framing automatically, without
-#: depending on someone reading this module's docstring.
+#: downstream consumer inherits the correct framing automatically.
 UNSEEN_SIGNER_FRAMING_NOTE: str = (
     "All validation and test signers are unseen by construction: Stage 1's "
     "signer-aware split (zero overlap across train/val/test, confirmed in "
@@ -250,7 +307,7 @@ UNSEEN_SIGNER_FRAMING_NOTE: str = (
 )
 
 #: Embedded in every per-signer result. Mirrors the small-sample caveat
-#: pattern already established by _CALIBRATION_CAVEAT in calibration.py.
+#: pattern established by _CALIBRATION_CAVEAT in calibration.py.
 _SIGNER_SAMPLE_SIZE_CAVEAT: str = (
     "Per-signer accuracy and macro-F1 estimates are based on a small number "
     "of clips per signer (this project: ~7-8 clips/signer on average across "
@@ -258,15 +315,29 @@ _SIGNER_SAMPLE_SIZE_CAVEAT: str = (
     "n_clips=3 has only 4 possible accuracy values (0/3, 1/3, 2/3, 3/3) — "
     "treat any individual signer's accuracy as a rough indicator, not a "
     "precise estimate. Signers flagged is_sparse (n_clips < "
-    f"{SPARSE_SIGNER_THRESHOLD}) should be interpreted with particular caution."
+    f"{SPARSE_SIGNER_THRESHOLD}) should be interpreted with particular caution. "
+    "Wilson score confidence intervals are provided per signer to quantify "
+    "this uncertainty explicitly."
+)
+
+#: Documented note on dual macro-F1 reporting (Review Issue H1).
+_DUAL_MACRO_F1_NOTE: str = (
+    "Two macro-F1 values are reported per signer. macro_f1_global forces "
+    "labels=list(range(n_classes)) — the project standard (Part 8, Critical "
+    "Rule #2) — and is dominated by zero-F1 for classes the signer did not "
+    "produce. macro_f1_present_classes is computed only over classes appearing "
+    "in this signer's y_true subset, and better reflects per-sign quality "
+    "for the signs they actually produced. Neither alone is sufficient: use "
+    "global for cross-signer comparability; use present_classes for diagnosing "
+    "which specific signs a signer struggled with."
 )
 
 
 # ---------------------------------------------------------------------------
 # Internal validation helpers
-# (Intentionally self-contained, mirroring calibration.py item 11 —
-#  keeps this module independently importable/testable without a hard
-#  dependency on metrics.py.)
+# (Intentionally self-contained — keeps this module independently
+#  importable/testable. Accepted trade-off, documented in calibration.py
+#  revision history item 11.)
 # ---------------------------------------------------------------------------
 
 def _validate_class_count(n_classes: int, caller: str) -> None:
@@ -283,9 +354,9 @@ def _to_label_array(arr: Any, name: str) -> np.ndarray:
     """
     Coerce an array-like into a flat 1-D int64 numpy array of class indices.
 
-    Identical contract to the equivalent helper in metrics.py / calibration.py:
-    rejects multi-dimensional (e.g. one-hot) label arrays rather than
-    silently flattening them.
+    Rejects multi-dimensional (e.g. one-hot) label arrays rather than
+    silently flattening them — matching the contract in metrics.py and
+    calibration.py.
 
     Raises
     ------
@@ -294,7 +365,9 @@ def _to_label_array(arr: Any, name: str) -> np.ndarray:
     """
     out = np.asarray(arr)
     if out.size == 0:
-        raise ValueError(f"{name} is empty. Cannot compute signer metrics on zero samples.")
+        raise ValueError(
+            f"{name} is empty. Cannot compute signer metrics on zero samples."
+        )
     if out.ndim > 1:
         squeezed = np.squeeze(out)
         if squeezed.ndim > 1:
@@ -335,14 +408,9 @@ def _to_signer_id_array(signer_ids: Any, caller: str) -> np.ndarray:
     arbitrary labels (e.g. "signer_014") depending on how the Phase B1 cache
     joins data/splits/{val,test}.csv. Using ``np.asarray(arr)`` (no explicit
     dtype) preserves whatever dtype the caller supplied — converting to
-    ``int`` here would silently and incorrectly truncate a zero-padded
-    string ID, echoing the exact class of bug Stage 1 already had to fix
-    once for video_ids (handoff Part 6.1, "Fixed Bugs" table).
-
-    Parameters
-    ----------
-    signer_ids : array-like
-    caller     : str — used only in error messages.
+    ``int`` would silently truncate a zero-padded string ID, echoing the
+    exact class of bug Stage 1 already fixed for video IDs (handoff Part
+    6.1, "Fixed Bugs" table, "Leading-zero video_id mismatch").
 
     Returns
     -------
@@ -392,6 +460,115 @@ def _validate_ci_level(ci_level: float, caller: str) -> None:
         raise ValueError(f"{caller}: ci_level={ci_level} must be in (0, 1).")
 
 
+def _validate_sign_names(
+    sign_names: Sequence[str], n_classes: int, caller: str
+) -> None:
+    """
+    Validate sign_names for length, None entries, empty strings, and
+    duplicates. (Review Issues M3, M4 — previously only length was checked.)
+
+    Raises
+    ------
+    ValueError
+        If length mismatches n_classes, any entry is None or an empty
+        string, or any name is duplicated.
+    """
+    if len(sign_names) != n_classes:
+        raise ValueError(
+            f"{caller}: len(sign_names)={len(sign_names)} must equal "
+            f"n_classes={n_classes}. Check the sign_names list was built as "
+            "[label_map.get_name_safe(i, ...) for i in range(n_classes)]."
+        )
+
+    none_indices = [i for i, n in enumerate(sign_names) if n is None]
+    if none_indices:
+        raise ValueError(
+            f"{caller}: sign_names contains None at indices {none_indices}. "
+            "Every class must have a non-None string name. Check "
+            "label_map.get_name_safe() for those class indices."
+        )
+
+    empty_indices = [i for i, n in enumerate(sign_names) if isinstance(n, str) and n.strip() == ""]
+    if empty_indices:
+        raise ValueError(
+            f"{caller}: sign_names contains empty strings at indices "
+            f"{empty_indices}. Every class must have a non-empty name."
+        )
+
+    seen: Dict[str, int] = {}
+    for name in sign_names:
+        seen[str(name)] = seen.get(str(name), 0) + 1
+    duplicates = {n: c for n, c in seen.items() if c > 1}
+    if duplicates:
+        raise ValueError(
+            f"{caller}: sign_names contains duplicate entries: {duplicates}. "
+            "Duplicate class names cause silent metric loss — check "
+            "label_map_v1.json for corrupted or repeated label entries."
+        )
+
+
+def _signer_key(signer: Any) -> str:
+    """
+    Produce a collision-safe dict key for a signer identifier.
+
+    Uses ``repr()`` rather than ``str()`` to prevent collision between
+    numeric ``1`` (int) and string ``"1"`` — the exact class of leading-zero
+    / type-ambiguity bug Stage 1 already experienced with video IDs.
+
+    Examples
+    --------
+    _signer_key(1)    → "1"     (int repr, no quotes in output)
+    _signer_key("1")  → "'1'"   (str repr, with quotes — unambiguous)
+    _signer_key("014") → "'014'" (zero-padded string preserved)
+    """
+    return repr(signer)
+
+
+# ---------------------------------------------------------------------------
+# Wilson score confidence interval helper
+# ---------------------------------------------------------------------------
+
+def _wilson_ci(n_correct: int, n_total: int) -> tuple:
+    """
+    Compute a Wilson score confidence interval for a binomial proportion.
+
+    The Wilson interval is recommended over the Wald (normal approximation)
+    interval for small sample sizes and extreme probabilities (p near 0 or 1),
+    both of which are common for per-signer evaluation on 3-12 clips.
+
+    Uses z = _WILSON_Z, corresponding to a 90% two-sided interval
+    (z ≈ 1.6449 = norminv(0.95)).
+
+    Parameters
+    ----------
+    n_correct : int — number of correct predictions.
+    n_total   : int — total clip count for this signer.
+
+    Returns
+    -------
+    (ci_lower, ci_upper) : both float, in [0, 1].
+        Both are 0.0 when n_total == 0.
+
+    References
+    ----------
+    Wilson, E.B. (1927). Probable inference, the law of succession, and
+    statistical inference. JASA 22(158), 209-212.
+    """
+    if n_total == 0:
+        return (0.0, 0.0)
+
+    z   = _WILSON_Z
+    z2  = z * z
+    p   = n_correct / n_total
+    n   = n_total
+    denom = 1.0 + z2 / n
+    centre = (p + z2 / (2.0 * n)) / denom
+    margin = (z / denom) * math.sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n))
+    ci_lower = max(0.0, centre - margin)
+    ci_upper = min(1.0, centre + margin)
+    return (round(ci_lower, 6), round(ci_upper, 6))
+
+
 # ---------------------------------------------------------------------------
 # Core per-signer computation
 # ---------------------------------------------------------------------------
@@ -406,92 +583,76 @@ def compute_per_signer_accuracy(
     high_risk_signs: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Compute per-signer accuracy, macro-F1, and support for every distinct
-    signer in ``signer_ids``.
+    Compute per-signer accuracy, dual macro-F1, Wilson CI, and support for
+    every distinct signer in ``signer_ids``.
 
     Matches the function name and signature called for in the Stage 6
-    (Revised) plan Phase A4: ``compute_per_signer_accuracy() — operates on
-    (y_true, y_pred, signer_ids)``. Also satisfies the original handoff's
-    Part 6.4 specification ("group val/test clips by signer_id; for each
-    signer: n_clips, n_correct, accuracy") while extending it with
-    macro-F1, high-risk-class exposure, and explicit small-sample flags —
-    see module docstring "Per-signer accuracy AND per-signer macro-F1".
+    (Revised) plan Phase A4. Extends the original handoff's Part 6.4
+    specification with dual macro-F1 (Review H1), Wilson CIs (Review M7),
+    improved validation (Review M3, M4), and collision-safe signer keys
+    (Review M5).
 
     For each distinct signer ``s``:
       - ``n_clips``               : total clips from this signer.
       - ``n_correct``              : count where argmax prediction matches
                                       the true label.
-      - ``accuracy``                : n_correct / n_clips.
-      - ``macro_f1``                 : sklearn macro-F1 over this signer's
-                                       clips, with ``labels=list(range(n_classes))``
-                                       forced (Part 8, Critical Rule #2 — the
-                                       same all-classes-forced discipline used
-                                       everywhere else in this project). Because
-                                       a single signer typically only signs a
-                                       handful of distinct classes, this number
-                                       is heavily zero-inflated by construction
-                                       and should be read alongside
-                                       ``n_distinct_true_classes``, not in
-                                       isolation.
-      - ``n_distinct_true_classes``  : how many distinct true classes this
-                                       signer's clips cover — context for
-                                       interpreting this signer's macro_f1.
-      - ``is_sparse``                : True if n_clips < SPARSE_SIGNER_THRESHOLD.
-      - ``high_risk_clip_fraction``  : fraction of this signer's clips whose
-                                       true label is one of HIGH_RISK_SIGNS
-                                       (only computed if ``sign_names`` is
-                                       supplied; otherwise None — see
-                                       ``compute_signer_high_risk_correlation``
-                                       for the dedicated cross-check this
-                                       feeds into).
+      - ``accuracy``                : n_correct / n_clips (full precision
+                                      stored internally; rounded in output).
+      - ``accuracy_ci_lower``        : Wilson score CI lower bound (90%).
+      - ``accuracy_ci_upper``        : Wilson score CI upper bound (90%).
+      - ``macro_f1_global``           : sklearn macro-F1 with labels forced
+                                        to list(range(n_classes)) — the
+                                        project standard. Low by construction
+                                        for signers who don't cover all 35 classes.
+      - ``macro_f1_present_classes``   : sklearn macro-F1 computed only over
+                                        the classes appearing in this signer's
+                                        y_true — reflects per-sign quality
+                                        for signs actually produced.
+      - ``n_distinct_true_classes``    : count of distinct true classes in
+                                        this signer's clips — context for
+                                        interpreting macro_f1_global.
+      - ``is_sparse``                  : True if n_clips < SPARSE_SIGNER_THRESHOLD.
+      - ``high_risk_clip_fraction``    : fraction of clips with a high-risk
+                                        true label. None if sign_names not
+                                        supplied. Computed using case-insensitive
+                                        name matching.
 
     Parameters
     ----------
     y_true, y_pred : array-like, shape (n_samples,)
-        Already-extracted true labels and argmax predictions — one entry
-        per clip. NOT one-hot. This function performs zero inference.
     signer_ids     : array-like, shape (n_samples,)
-        One signer identifier per clip, index-aligned with y_true/y_pred.
-        May be int, str, or any hashable type — see
-        ``_to_signer_id_array()`` docstring for why this is never coerced
-        to a numeric dtype.
+        One signer identifier per clip. May be int, str, or any hashable
+        type — never coerced to a numeric dtype (Review M5).
     n_classes       : int — 35 for this project.
-    split_name       : str, default "val" — carried into the output dict
-                       and log line only.
+    split_name       : str, default "val"
     sign_names        : Sequence[str], length n_classes, optional
-        If supplied, enables ``high_risk_clip_fraction`` per signer (which
-        class index each clip's true label corresponds to is otherwise
-        unrecoverable without the name mapping). Omit to skip this field
-        (it will be ``None`` for every signer).
+        Validated for None entries, empty strings, and duplicates (Review M3).
+        If supplied, enables ``high_risk_clip_fraction`` per signer using
+        case-insensitive name matching (Review M4).
     high_risk_signs    : Sequence[str], optional
-        Defaults to module-level ``HIGH_RISK_SIGNS`` (the 5 Stage 5
-        Finding 8 classes). Only used if ``sign_names`` is also supplied.
+        Defaults to module-level HIGH_RISK_SIGNS. Case-insensitive matching.
 
     Returns
     -------
     dict with keys:
-        split_name              : str
-        n_samples                : int
-        n_classes                : int
-        n_signers                : int
-        per_signer                : dict[signer_id_str -> {n_clips, n_correct,
-                                    accuracy, macro_f1, n_distinct_true_classes,
-                                    is_sparse, high_risk_clip_fraction}]
-        n_sparse_signers           : int — count of is_sparse signers
-        mean_clips_per_signer       : float
-        min_clips_per_signer        : int
-        max_clips_per_signer        : int
-        overall_accuracy             : float — same n_samples denominator,
-                                       sanity-check value (should equal
-                                       sklearn accuracy_score(y_true, y_pred))
-        unseen_signer_framing_note    : str — see UNSEEN_SIGNER_FRAMING_NOTE
-        caveat                        : str — see _SIGNER_SAMPLE_SIZE_CAVEAT
+        split_name, n_samples, n_classes, n_signers      : metadata
+        per_signer                                        : dict keyed by
+          repr(signer_id) — collision-safe (Review M5). Each value:
+          {n_clips, n_correct, accuracy, accuracy_ci_lower, accuracy_ci_upper,
+           macro_f1_global, macro_f1_present_classes,
+           n_distinct_true_classes, is_sparse, high_risk_clip_fraction}
+        n_sparse_signers, mean_clips_per_signer          : int / float
+        min_clips_per_signer, max_clips_per_signer        : int
+        overall_accuracy                                   : float
+        dual_macro_f1_note                                  : str
+        unseen_signer_framing_note                           : str
+        caveat                                               : str
 
     Raises
     ------
     ValueError
         If arrays are empty, mismatched in length, contain out-of-range
-        labels, or ``sign_names`` is supplied with the wrong length.
+        labels, or ``sign_names`` validation fails.
     """
     _validate_class_count(n_classes, "compute_per_signer_accuracy")
 
@@ -504,18 +665,32 @@ def compute_per_signer_accuracy(
     signer_arr = _to_signer_id_array(signer_ids, "compute_per_signer_accuracy")
     _validate_equal_length(y_true_arr, signer_arr, "y_true", "signer_ids")
 
-    if sign_names is not None and len(sign_names) != n_classes:
-        raise ValueError(
-            f"compute_per_signer_accuracy(): len(sign_names)={len(sign_names)} "
-            f"must equal n_classes={n_classes} when sign_names is supplied."
-        )
+    # sign_names validation — length, None, empty, duplicates (Review M3)
+    if sign_names is not None:
+        _validate_sign_names(sign_names, n_classes, "compute_per_signer_accuracy")
 
-    high_risk = set(high_risk_signs) if high_risk_signs is not None else set(HIGH_RISK_SIGNS)
+    # Build high-risk class index set with CASE-INSENSITIVE matching (Review M4)
+    high_risk_lower = {
+        s.lower() for s in (high_risk_signs if high_risk_signs is not None else HIGH_RISK_SIGNS)
+    }
     high_risk_class_indices: Optional[set] = None
     if sign_names is not None:
         high_risk_class_indices = {
-            idx for idx, name in enumerate(sign_names) if name in high_risk
+            idx for idx, name in enumerate(sign_names)
+            if str(name).lower() in high_risk_lower
         }
+        if not high_risk_class_indices:
+            logger.warning(
+                "compute_per_signer_accuracy(): high_risk_class_indices is "
+                "EMPTY after case-insensitive name matching against sign_names. "
+                f"high_risk_signs={list(high_risk_lower)}, "
+                f"sign_names_lower_sample={[str(n).lower() for n in sign_names[:5]]}... "
+                "high_risk_clip_fraction will be 0.0 for every signer — the "
+                "Phase D3 correlation cross-check will be meaningless. "
+                "Check that sign_names entries match HIGH_RISK_SIGNS (possibly "
+                "with different capitalisation) in artifacts/label_map_v1.json.",
+                extra={"stage": "evaluation"},
+            )
 
     n_samples    = len(y_true_arr)
     labels_range = list(range(n_classes))
@@ -526,44 +701,65 @@ def compute_per_signer_accuracy(
     clip_counts: List[int] = []
 
     for signer in unique_signers:
-        mask = (signer_arr == signer)
+        mask      = (signer_arr == signer)
         n_clips_s = int(mask.sum())
         clip_counts.append(n_clips_s)
 
-        yt_s = y_true_arr[mask]
-        yp_s = y_pred_arr[mask]
+        yt_s       = y_true_arr[mask]
+        yp_s       = y_pred_arr[mask]
         n_correct_s = int(correct[mask].sum())
-        accuracy_s  = n_correct_s / n_clips_s if n_clips_s > 0 else 0.0
 
-        macro_f1_s = float(_sklearn_f1_score(
+        # Full-precision accuracy stored internally (Review M6)
+        accuracy_s_full = n_correct_s / n_clips_s if n_clips_s > 0 else 0.0
+
+        # Wilson score CI (Review M7)
+        ci_lower_s, ci_upper_s = _wilson_ci(n_correct_s, n_clips_s)
+
+        # macro_f1_global: all classes forced (project standard, Part 8 Rule #2)
+        macro_f1_global_s = float(_sklearn_f1_score(
             yt_s, yp_s,
             average="macro",
             labels=labels_range,
             zero_division=0,
         ))
 
-        n_distinct_s = int(np.unique(yt_s).size)
+        # macro_f1_present_classes: only classes in this signer's y_true (Review H1)
+        present_labels = np.unique(yt_s).tolist()
+        if len(present_labels) >= 1:
+            macro_f1_present_s = float(_sklearn_f1_score(
+                yt_s, yp_s,
+                average="macro",
+                labels=present_labels,
+                zero_division=0,
+            ))
+        else:
+            macro_f1_present_s = 0.0
+
+        n_distinct_s = len(present_labels)
         is_sparse_s  = n_clips_s < SPARSE_SIGNER_THRESHOLD
 
+        # High-risk fraction — uses case-insensitive matched indices (Review M4)
         high_risk_fraction_s: Optional[float] = None
         if high_risk_class_indices is not None:
-            n_high_risk_clips = int(np.isin(yt_s, list(high_risk_class_indices)).sum())
-            high_risk_fraction_s = n_high_risk_clips / n_clips_s if n_clips_s > 0 else 0.0
+            n_hr = int(np.isin(yt_s, list(high_risk_class_indices)).sum())
+            high_risk_fraction_s = n_hr / n_clips_s if n_clips_s > 0 else 0.0
 
-        # Signer IDs may be numpy scalar types (e.g. np.str_, np.int64) —
-        # cast to a plain Python str for a JSON-serialisable, stable dict key.
-        signer_key = str(signer)
+        # collision-safe key using repr() (Review M5)
+        signer_key = _signer_key(signer)
 
         per_signer[signer_key] = {
-            "n_clips":                  n_clips_s,
-            "n_correct":                n_correct_s,
-            "accuracy":                 round(accuracy_s, 6),
-            "macro_f1":                 round(macro_f1_s, 6),
-            "n_distinct_true_classes":  n_distinct_s,
-            "is_sparse":                is_sparse_s,
-            "high_risk_clip_fraction":  (
-                round(high_risk_fraction_s, 6) if high_risk_fraction_s is not None else None
-            ),
+            "n_clips":                    n_clips_s,
+            "n_correct":                  n_correct_s,
+            # Full-precision values stored; callers can round for display
+            "accuracy":                   accuracy_s_full,
+            "accuracy_ci_lower":          ci_lower_s,
+            "accuracy_ci_upper":          ci_upper_s,
+            "accuracy_ci_level":          _WILSON_CI_LEVEL,
+            "macro_f1_global":            macro_f1_global_s,
+            "macro_f1_present_classes":   macro_f1_present_s,
+            "n_distinct_true_classes":    n_distinct_s,
+            "is_sparse":                  is_sparse_s,
+            "high_risk_clip_fraction":    high_risk_fraction_s,
         }
 
     n_signers        = len(unique_signers)
@@ -571,16 +767,17 @@ def compute_per_signer_accuracy(
     overall_accuracy = float(correct.mean())
 
     result: Dict[str, Any] = {
-        "split_name":                 split_name,
-        "n_samples":                  n_samples,
-        "n_classes":                  n_classes,
-        "n_signers":                  n_signers,
-        "per_signer":                 per_signer,
+        "split_name":                  split_name,
+        "n_samples":                   n_samples,
+        "n_classes":                   n_classes,
+        "n_signers":                   n_signers,
+        "per_signer":                  per_signer,
         "n_sparse_signers":            n_sparse_signers,
         "mean_clips_per_signer":       round(float(np.mean(clip_counts)), 4),
         "min_clips_per_signer":        int(np.min(clip_counts)),
         "max_clips_per_signer":        int(np.max(clip_counts)),
         "overall_accuracy":            round(overall_accuracy, 6),
+        "dual_macro_f1_note":          _DUAL_MACRO_F1_NOTE,
         "unseen_signer_framing_note":  UNSEEN_SIGNER_FRAMING_NOTE,
         "caveat":                      _SIGNER_SAMPLE_SIZE_CAVEAT,
     }
@@ -602,8 +799,9 @@ def compute_per_signer_accuracy(
         logger.warning(
             f"compute_per_signer_accuracy(): {n_sparse_signers}/{n_signers} "
             f"signers have fewer than {SPARSE_SIGNER_THRESHOLD} clips. Their "
-            "accuracy/macro_f1 should be treated as rough indicators only — "
-            "see result['caveat'].",
+            "accuracy/macro_f1 should be treated as rough indicators — "
+            "see result['caveat'] and result['per_signer'][id]['accuracy_ci_*'] "
+            "for quantified uncertainty.",
             extra={"stage": "evaluation"},
         )
 
@@ -611,7 +809,7 @@ def compute_per_signer_accuracy(
 
 
 # ---------------------------------------------------------------------------
-# Signer-level spread bootstrap (complements metrics.py's clip-level bootstrap)
+# Signer-level spread bootstrap
 # ---------------------------------------------------------------------------
 
 def compute_signer_spread_bootstrap_ci(
@@ -621,74 +819,72 @@ def compute_signer_spread_bootstrap_ci(
     seed: int = DEFAULT_SEED,
 ) -> Dict[str, Any]:
     """
-    Quantify how much cross-signer accuracy SPREAD would change under a
-    different random sample of signers, via a signer-level bootstrap.
+    Quantify cross-signer accuracy SPREAD via a signer-level bootstrap,
+    reporting both unweighted and clip-count-weighted statistics.
 
-    This is the complementary diagnostic ``metrics.py::bootstrap_macro_f1_ci()``
-    explicitly defers to this module (see that function's Revision history
-    item 1 and its ``caveat`` field): that function resamples clips and
-    likely UNDERSTATES uncertainty because clips cluster by signer. This
-    function instead resamples SIGNERS — answering "if we drew a different
+    This complements ``metrics.py::bootstrap_macro_f1_ci()`` (which
+    resamples clips and likely understates uncertainty due to signer
+    clustering) by answering a different question: "if we drew a different
     set of 7 unseen signers, how much would the spread of their individual
-    accuracies vary?" rather than "what is the CI on the pooled macro-F1?".
-    The two are different questions and neither replaces the other.
+    accuracies vary?"
 
-    Procedure
-    ---------
-    1. Treat each signer's per-signer accuracy (from
-       ``compute_per_signer_accuracy()``) as one observation.
-    2. Resample ``n_signers`` signer-accuracies with replacement,
-       ``n_bootstrap`` times.
-    3. For each resample, compute the spread statistic: standard deviation
-       of the resampled accuracies (``ddof=1`` when n>=2, else 0.0) and the
-       range (max - min).
-    4. Report the empirical percentile interval of both statistics.
+    Weighted vs. unweighted spread (Review Issue H2)
+    --------------------------------------------------
+    Two sets of spread statistics are reported:
 
-    Weighting note
-    -----------------
-    This function resamples signers UNWEIGHTED by their clip count — a
-    signer with 3 clips and a signer with 12 clips are each one observation
-    in the resample. This is deliberate: the question being asked is about
-    variability ACROSS signers as individuals, not variability across
-    clips. A clip-weighted version would just reduce back toward the
-    clip-level bootstrap that ``metrics.py`` already provides.
+    UNWEIGHTED (equal weight per signer):
+        ``observed_std``, ``observed_range``, ``std_ci_*``, ``range_ci_*``
+        These answer: "how variable are signers AS INDIVIDUALS?"
+        Each signer counts as one data point regardless of how many clips
+        they contributed. A signer with 3 clips and one with 12 clips are
+        given equal weight.
 
-    With only 7 (this project's actual val signer count) input observations,
-    bootstrap resampling of signers is itself a coarse instrument — there
-    are only a finite number of distinct resamples possible, and percentile
-    estimates from such a small base population are inherently approximate.
-    This is documented in the returned ``caveat`` field.
+    WEIGHTED (clip-count weighted):
+        ``weighted_observed_std``, ``weighted_observed_mean``
+        These answer: "how variable is model performance across CLIPS,
+        accounting for different signer contributions?"
+        Uses numpy's standard weighted standard deviation formula.
+        Not bootstrapped (weights change meaning under resample) but
+        reported as companion statistics. The weighted mean is also
+        a sanity-check against ``overall_accuracy`` from
+        ``compute_per_signer_accuracy()``.
+
+    Degenerate case detection (Review Issue M8)
+    --------------------------------------------
+    When all signer accuracies are identical (zero variance), the bootstrap
+    will always return zero spread. This degenerate case is explicitly
+    detected and flagged with ``spread_is_degenerate=True`` and a note,
+    rather than silently returning zero CI bounds that might be mistaken
+    for a well-calibrated zero-uncertainty result.
 
     Parameters
     ----------
-    per_signer_result : dict
-        The dict returned by ``compute_per_signer_accuracy()`` — must
-        contain a ``"per_signer"`` key.
-    n_bootstrap        : int, default 1000
-    ci_level             : float in (0, 1), default 0.90
-    seed                 : int, default 42
+    per_signer_result : dict from compute_per_signer_accuracy()
+    n_bootstrap       : int, default 1000
+    ci_level          : float in (0, 1), default 0.90
+    seed              : int, default 42
 
     Returns
     -------
     dict with keys:
-        n_signers                       : int
-        observed_std                     : float — std of the actual
-                                            (non-resampled) per-signer
-                                            accuracies
-        observed_range                    : float — max - min of the actual
-                                            per-signer accuracies
-        std_ci_lower, std_ci_upper          : float
-        range_ci_lower, range_ci_upper       : float
-        ci_level                              : float
-        n_bootstrap                           : int
-        seed                                   : int
-        caveat                                  : str
+        n_signers                : int
+        observed_std              : float — unweighted std
+        observed_range             : float — unweighted range (max - min)
+        std_ci_lower, std_ci_upper  : float — bootstrap CI on unweighted std
+        range_ci_lower, range_ci_upper : float
+        weighted_observed_mean     : float — clip-count weighted mean accuracy
+        weighted_observed_std       : float — clip-count weighted std
+        ci_level                     : float
+        n_bootstrap                   : int
+        seed                           : int
+        spread_is_degenerate            : bool
+        caveat                           : str
 
     Raises
     ------
     ValueError
         If ``per_signer_result`` lacks a ``"per_signer"`` key, or if
-        ``n_bootstrap`` / ``ci_level`` are out of range.
+        ``n_bootstrap`` / ``ci_level`` are invalid.
     """
     per_signer = per_signer_result.get("per_signer")
     if per_signer is None:
@@ -701,8 +897,12 @@ def compute_signer_spread_bootstrap_ci(
     _validate_n_bootstrap(n_bootstrap, "compute_signer_spread_bootstrap_ci")
     _validate_ci_level(ci_level, "compute_signer_spread_bootstrap_ci")
 
+    # Use full-precision accuracy values (Review M6)
     accuracies = np.array(
         [v["accuracy"] for v in per_signer.values()], dtype=np.float64,
+    )
+    clip_counts = np.array(
+        [v["n_clips"] for v in per_signer.values()], dtype=np.float64,
     )
     n_signers = len(accuracies)
 
@@ -710,8 +910,7 @@ def compute_signer_spread_bootstrap_ci(
         logger.warning(
             f"compute_signer_spread_bootstrap_ci(): n_signers={n_signers} is "
             f"below {_MIN_SIGNERS_FOR_BOOTSTRAP}. Spread statistics will be "
-            "extremely unstable. Proceeding anyway, but treat the result as "
-            "illustrative only.",
+            "extremely unstable. Treat as illustrative only.",
             extra={"stage": "evaluation"},
         )
 
@@ -723,8 +922,35 @@ def compute_signer_spread_bootstrap_ci(
             extra={"stage": "evaluation"},
         )
 
+    # Unweighted statistics
     observed_std   = float(np.std(accuracies, ddof=1)) if n_signers > 1 else 0.0
     observed_range = float(np.max(accuracies) - np.min(accuracies)) if n_signers > 0 else 0.0
+
+    # Weighted statistics (clip-count weighted) — Review H2
+    total_clips = clip_counts.sum()
+    if total_clips > 0 and n_signers > 1:
+        weights = clip_counts / total_clips
+        weighted_mean = float(np.dot(weights, accuracies))
+        # Weighted std: sqrt(sum(w_i * (x_i - mu_w)^2))
+        weighted_std = float(
+            np.sqrt(np.dot(weights, (accuracies - weighted_mean) ** 2))
+        )
+    else:
+        weighted_mean = float(accuracies.mean()) if n_signers > 0 else 0.0
+        weighted_std  = 0.0
+
+    # Degenerate case detection (Review M8)
+    spread_is_degenerate = observed_std == 0.0
+    if spread_is_degenerate and n_signers > 1:
+        logger.warning(
+            "compute_signer_spread_bootstrap_ci(): all signer accuracies are "
+            "identical (spread_is_degenerate=True). Bootstrap resamples will "
+            "all return zero spread — CI bounds of [0.0, 0.0] do not indicate "
+            "a well-calibrated zero-uncertainty result; they reflect a data "
+            "artifact (all signers happen to have the same accuracy on this "
+            "small val set).",
+            extra={"stage": "evaluation"},
+        )
 
     rng = np.random.default_rng(seed)
     boot_std   = np.empty(n_bootstrap, dtype=np.float64)
@@ -734,31 +960,41 @@ def compute_signer_spread_bootstrap_ci(
         idx       = rng.integers(0, n_signers, size=n_signers)
         resampled = accuracies[idx]
         boot_std[i]   = np.std(resampled, ddof=1) if n_signers > 1 else 0.0
-        boot_range[i] = np.max(resampled) - np.min(resampled)
+        boot_range[i] = np.max(resampled) - np.min(resampled) if n_signers > 0 else 0.0
 
     alpha     = 1.0 - ci_level
     lower_pct = 100.0 * (alpha / 2.0)
     upper_pct = 100.0 * (1.0 - alpha / 2.0)
 
+    degenerate_note = (
+        " NOTE: spread_is_degenerate=True — all signer accuracies are "
+        "identical; CI bounds [0.0, 0.0] reflect this data artifact, not a "
+        "meaningful uncertainty estimate."
+        if spread_is_degenerate else ""
+    )
+
     result: Dict[str, Any] = {
-        "n_signers":        n_signers,
-        "observed_std":      round(observed_std, 6),
-        "observed_range":     round(observed_range, 6),
-        "std_ci_lower":        round(float(np.percentile(boot_std, lower_pct)), 6),
-        "std_ci_upper":         round(float(np.percentile(boot_std, upper_pct)), 6),
-        "range_ci_lower":        round(float(np.percentile(boot_range, lower_pct)), 6),
-        "range_ci_upper":         round(float(np.percentile(boot_range, upper_pct)), 6),
-        "ci_level":                ci_level,
-        "n_bootstrap":              n_bootstrap,
-        "seed":                      seed,
+        "n_signers":              n_signers,
+        "observed_std":            round(observed_std, 6),
+        "observed_range":           round(observed_range, 6),
+        "std_ci_lower":              round(float(np.percentile(boot_std, lower_pct)), 6),
+        "std_ci_upper":               round(float(np.percentile(boot_std, upper_pct)), 6),
+        "range_ci_lower":              round(float(np.percentile(boot_range, lower_pct)), 6),
+        "range_ci_upper":               round(float(np.percentile(boot_range, upper_pct)), 6),
+        "weighted_observed_mean":        round(weighted_mean, 6),
+        "weighted_observed_std":          round(weighted_std, 6),
+        "ci_level":                        ci_level,
+        "n_bootstrap":                      n_bootstrap,
+        "seed":                              seed,
+        "spread_is_degenerate":              spread_is_degenerate,
         "caveat": (
             f"This bootstrap resamples only {n_signers} signer-level "
-            "observations (unweighted by clip count). With this few "
+            "observations (unweighted by clip count — see weighted_observed_* "
+            "for clip-count-weighted companion statistics). With this few "
             "signers, the resample space is small and percentile estimates "
             "are approximate. This is a signer-level complement to "
-            "metrics.py::bootstrap_macro_f1_ci()'s clip-level CI, not a "
-            "replacement for it — see this module's docstring for the "
-            "distinction between the two questions each answers."
+            "metrics.py::bootstrap_macro_f1_ci()'s clip-level CI — not a "
+            "replacement for it." + degenerate_note
         ),
     }
 
@@ -767,7 +1003,9 @@ def compute_signer_spread_bootstrap_ci(
         f"observed_std={observed_std:.4f} "
         f"[{int(ci_level*100)}% CI: {result['std_ci_lower']:.4f}, {result['std_ci_upper']:.4f}] | "
         f"observed_range={observed_range:.4f} "
-        f"[{int(ci_level*100)}% CI: {result['range_ci_lower']:.4f}, {result['range_ci_upper']:.4f}]",
+        f"[{int(ci_level*100)}% CI: {result['range_ci_lower']:.4f}, {result['range_ci_upper']:.4f}] | "
+        f"weighted_mean={weighted_mean:.4f} | weighted_std={weighted_std:.4f} | "
+        f"spread_is_degenerate={spread_is_degenerate}",
         extra={"stage": "evaluation"},
     )
 
@@ -784,69 +1022,40 @@ def compute_signer_high_risk_correlation(
     """
     Test whether low-accuracy signers disproportionately produce the five
     Stage 5 Finding 8 high-risk classes (clothes, think, birthday, name,
-    book), per the Stage 6 (Revised) plan's Phase D3 cross-check:
+    book), per the Stage 6 (Revised) plan's Phase D3 cross-check.
 
-        "Cross-check: do low-accuracy signers disproportionately produce
-        the known high-risk classes (think, clothes, birthday, name,
-        book)?"
+    Now reports both Pearson r and Spearman rho (Review Issue H3).
+    Spearman is generally more appropriate for small n (n=7), nonlinear
+    relationships, and outlier-prone settings. Both are provided; neither
+    is claimed as the definitive statistic over 7 data points.
 
-    Requires ``per_signer_result`` to have been produced by
-    ``compute_per_signer_accuracy(..., sign_names=...)`` — i.e.
-    ``high_risk_clip_fraction`` must be populated (non-None) for every
-    signer. This function does NOT have access to the raw label arrays;
-    it operates purely on the already-computed per-signer summary,
-    consistent with this module's "no I/O, pure computation" design.
-
-    Methodology
-    -----------
-    Computes the Pearson correlation coefficient between each signer's
-    ``accuracy`` and their ``high_risk_clip_fraction`` across all signers.
-    A negative correlation is the expected-and-unsurprising direction
-    (more high-risk clips → lower accuracy, since high-risk classes are
-    failure-prone by construction — Stage 5 Finding 8). This function
-    reports the correlation as a DESCRIPTIVE statistic, not a causal claim,
-    and explicitly flags when n_signers is too small for the correlation
-    to be statistically meaningful (this project: 7 val signers — a
-    Pearson r computed over 7 points should be treated as suggestive at
-    best, never confirmatory).
+    Uses full-precision (unrounded) accuracy and high_risk_clip_fraction
+    values for the correlation computation (Review Issue M6).
 
     Parameters
     ----------
-    per_signer_result : dict
-        The dict returned by ``compute_per_signer_accuracy(...,
-        sign_names=...)``. Must contain a ``"per_signer"`` key whose
-        entries have a non-None ``high_risk_clip_fraction``.
+    per_signer_result : dict from compute_per_signer_accuracy()
+        Must have been called with sign_names= to populate
+        high_risk_clip_fraction.
 
     Returns
     -------
     dict with keys:
-        n_signers                        : int
-        pearson_r                          : float | None — None if
-                                            high_risk_clip_fraction was not
-                                            computed (sign_names was omitted
-                                            upstream) or if fewer than 2
-                                            signers have variance in either
-                                            variable.
-        interpretation                      : str — plain-language direction
-                                            and magnitude descriptor
-        is_underpowered                      : bool — True if n_signers < 10
-                                            (an arbitrary but explicit floor
-                                            below which any correlation
-                                            coefficient is unreliable)
-        per_signer_table                      : List[dict] — [{signer_id,
-                                            accuracy, high_risk_clip_fraction}]
-                                            sorted by accuracy ascending, for
-                                            direct visual/tabular inspection
-                                            alongside the correlation
-        caveat                                  : str
+        n_signers             : int
+        pearson_r               : float | None
+        spearman_rho             : float | None
+        interpretation            : str — plain-language description
+        is_underpowered             : bool — True if n_signers < 10
+        per_signer_table             : List[dict] — sorted ascending by
+                                       accuracy, using full-precision values
+        caveat                        : str
 
     Raises
     ------
     ValueError
-        If ``per_signer_result`` lacks a ``"per_signer"`` key, or if no
-        signer has a non-None ``high_risk_clip_fraction`` (indicating
-        ``compute_per_signer_accuracy()`` was called without
-        ``sign_names``).
+        If per_signer_result lacks 'per_signer', or if no signer has a
+        non-None high_risk_clip_fraction (sign_names was not supplied
+        upstream).
     """
     per_signer = per_signer_result.get("per_signer")
     if per_signer is None:
@@ -859,10 +1068,10 @@ def compute_signer_high_risk_correlation(
     rows = [
         {
             "signer_id":               signer_id,
-            "accuracy":                 stats["accuracy"],
-            "high_risk_clip_fraction":   stats.get("high_risk_clip_fraction"),
+            "accuracy":                 v["accuracy"],          # full precision (Review M6)
+            "high_risk_clip_fraction":   v.get("high_risk_clip_fraction"),
         }
-        for signer_id, stats in per_signer.items()
+        for signer_id, v in per_signer.items()
     ]
 
     if all(r["high_risk_clip_fraction"] is None for r in rows):
@@ -877,58 +1086,111 @@ def compute_signer_high_risk_correlation(
     valid_rows = [r for r in rows if r["high_risk_clip_fraction"] is not None]
     n_signers  = len(valid_rows)
 
+    # Full-precision arrays for correlation (Review M6)
     acc_vals = np.array([r["accuracy"] for r in valid_rows], dtype=np.float64)
     hr_vals  = np.array([r["high_risk_clip_fraction"] for r in valid_rows], dtype=np.float64)
 
+    # Pearson r
     pearson_r: Optional[float] = None
     if n_signers >= 2 and np.std(acc_vals) > 0 and np.std(hr_vals) > 0:
         pearson_r = float(np.corrcoef(acc_vals, hr_vals)[0, 1])
 
+    # Spearman rho — computed via rank correlation (Review H3)
+    spearman_rho: Optional[float] = None
+    if n_signers >= 2:
+        # Compute Spearman as Pearson on ranks (avoids scipy dependency)
+        # Average ties using scipy-style rank (midrank method)
+        def _rank_midpoint(arr: np.ndarray) -> np.ndarray:
+            n = len(arr)
+            idx_sort = np.argsort(arr, kind="mergesort")
+            ranks    = np.empty(n, dtype=np.float64)
+            i = 0
+            while i < n:
+                j = i + 1
+                while j < n and arr[idx_sort[j]] == arr[idx_sort[i]]:
+                    j += 1
+                mid_rank = (i + j - 1) / 2.0 + 1.0  # 1-indexed midpoint
+                for k in range(i, j):
+                    ranks[idx_sort[k]] = mid_rank
+                i = j
+            return ranks
+
+        acc_ranks = _rank_midpoint(acc_vals)
+        hr_ranks  = _rank_midpoint(hr_vals)
+
+        std_acc = np.std(acc_ranks)
+        std_hr  = np.std(hr_ranks)
+        if std_acc > 0 and std_hr > 0:
+            spearman_rho = float(np.corrcoef(acc_ranks, hr_ranks)[0, 1])
+        else:
+            # Zero-variance in ranks means all values tied — Spearman undefined
+            spearman_rho = None
+
     is_underpowered = n_signers < 10
 
-    if pearson_r is None:
-        interpretation = (
-            "Correlation undefined: fewer than 2 signers, or no variance in "
-            "accuracy or high_risk_clip_fraction across signers (e.g. every "
-            "signer has the same accuracy, or none of their clips are "
-            "high-risk classes)."
-        )
-    else:
-        direction = "negative (lower accuracy ↔ more high-risk-class exposure)" \
-            if pearson_r < 0 else \
+    def _interpret(r_val: Optional[float], r_name: str) -> str:
+        if r_val is None:
+            return (
+                f"{r_name} undefined: insufficient signer count, or no variance "
+                "in accuracy or high_risk_clip_fraction across signers."
+            )
+        direction = (
+            "negative (lower accuracy ↔ more high-risk-class exposure — expected direction)"
+            if r_val < 0 else
             "positive (higher accuracy ↔ more high-risk-class exposure — counter to expectation)"
+        )
         magnitude = (
-            "weak" if abs(pearson_r) < 0.3 else
-            "moderate" if abs(pearson_r) < 0.6 else
+            "weak" if abs(r_val) < 0.3 else
+            "moderate" if abs(r_val) < 0.6 else
             "strong"
         )
-        interpretation = (
-            f"{magnitude.capitalize()} {direction}, r={pearson_r:.3f}."
-        )
+        return f"{magnitude.capitalize()} {direction}, {r_name}={r_val:.3f}."
 
-    sorted_rows = sorted(rows, key=lambda r: r["accuracy"])
+    pearson_interp  = _interpret(pearson_r,   "r")
+    spearman_interp = _interpret(spearman_rho, "rho")
+    interpretation  = f"Pearson: {pearson_interp} | Spearman: {spearman_interp}"
+
+    # Sort ascending by accuracy for display; stable secondary sort by signer_id
+    sorted_rows = sorted(
+        rows,
+        key=lambda r: (r["accuracy"], str(r["signer_id"])),
+    )
+    # Round for display output only — computation already done above
+    display_rows = [
+        {
+            "signer_id":              r["signer_id"],
+            "accuracy":               round(r["accuracy"], 6),
+            "high_risk_clip_fraction": (
+                round(r["high_risk_clip_fraction"], 6)
+                if r["high_risk_clip_fraction"] is not None else None
+            ),
+        }
+        for r in sorted_rows
+    ]
 
     result: Dict[str, Any] = {
-        "n_signers":          n_signers,
-        "pearson_r":           round(pearson_r, 6) if pearson_r is not None else None,
-        "interpretation":        interpretation,
-        "is_underpowered":         is_underpowered,
-        "per_signer_table":          sorted_rows,
+        "n_signers":        n_signers,
+        "pearson_r":         round(pearson_r, 6) if pearson_r is not None else None,
+        "spearman_rho":       round(spearman_rho, 6) if spearman_rho is not None else None,
+        "interpretation":      interpretation,
+        "is_underpowered":      is_underpowered,
+        "per_signer_table":      display_rows,
         "caveat": (
-            f"Computed over n_signers={n_signers}. Pearson correlation over "
-            "this few points is descriptive/exploratory only — treat as "
-            "suggestive, not statistically confirmatory. A negative "
-            "correlation is the expected direction (Stage 5 Finding 8: "
-            "high-risk classes are failure-prone by construction, mostly "
-            "due to their own tiny training-clip counts, not the signer's "
-            "general skill) and should not be over-interpreted as a finding "
-            "about signer quality."
+            f"Computed over n_signers={n_signers}. Both Pearson r and Spearman "
+            "rho are reported; Spearman is generally preferred for small n and "
+            "possible outliers. Over {n_signers} data points, both coefficients "
+            "are descriptive/exploratory only — treat as suggestive, not "
+            "statistically confirmatory. A negative correlation is the expected "
+            "direction (Stage 5 Finding 8: high-risk classes fail due to tiny "
+            "training-clip counts, not signer skill) and should not be "
+            "over-interpreted as a finding about signer quality."
         ),
     }
 
     logger.info(
         f"compute_signer_high_risk_correlation() | n_signers={n_signers} | "
         f"pearson_r={pearson_r if pearson_r is not None else 'undefined'} | "
+        f"spearman_rho={spearman_rho if spearman_rho is not None else 'undefined'} | "
         f"is_underpowered={is_underpowered}",
         extra={"stage": "evaluation"},
     )
@@ -936,8 +1198,9 @@ def compute_signer_high_risk_correlation(
     if is_underpowered:
         logger.warning(
             f"compute_signer_high_risk_correlation(): n_signers={n_signers} "
-            "< 10. This correlation is exploratory only and must not be "
-            "reported as a statistically robust finding.",
+            "< 10. Both correlation coefficients are exploratory only and "
+            "must not be reported as statistically robust findings. "
+            "Prefer Spearman rho over Pearson r at this sample size.",
             extra={"stage": "evaluation"},
         )
 
@@ -947,6 +1210,97 @@ def compute_signer_high_risk_correlation(
 # ---------------------------------------------------------------------------
 # Failure-mode metadata correlation (Stage 6 Revised, Phase D4)
 # ---------------------------------------------------------------------------
+
+def _validate_metadata_array(
+    arr: Any,
+    name: str,
+    n_expected: int,
+    caller: str,
+    expected_min: Optional[float] = None,
+    expected_max: Optional[float] = None,
+    allow_nan: bool = True,
+    rescale_range: Optional[tuple] = None,
+) -> np.ndarray:
+    """
+    Validate and coerce a metadata array (detected_frame_count or missing_pct).
+
+    Handles NaN detection and optional range rescaling. (Review Issues M1, M2.)
+
+    Parameters
+    ----------
+    arr           : array-like
+    name          : str — field name for error messages
+    n_expected    : int — expected length
+    caller        : str — calling function name
+    expected_min  : float, optional — warn if any value < expected_min
+    expected_max  : float, optional — warn if any value > expected_max
+    allow_nan     : bool, default True — if True, NaNs are preserved and
+                    reported; if False, NaN presence raises ValueError
+    rescale_range : tuple (lo, hi), optional — if any value falls within
+                    this range and expected_max < hi, attempt rescaling
+                    (e.g. missing_pct in [0,100] → [0,1])
+
+    Returns
+    -------
+    np.ndarray, float64, shape (n_expected,)
+    """
+    out = np.asarray(arr, dtype=np.float64)
+    if out.ndim != 1 or len(out) != n_expected:
+        raise ValueError(
+            f"{caller}: {name} has shape {out.shape}, expected 1-D array of "
+            f"length {n_expected} (one value per clip)."
+        )
+
+    n_nan = int(np.isnan(out).sum())
+    if n_nan > 0:
+        if not allow_nan:
+            raise ValueError(
+                f"{caller}: {name} contains {n_nan} NaN value(s). "
+                f"Clean the prediction cache before calling {caller}."
+            )
+        logger.warning(
+            f"{caller}: {name} contains {n_nan}/{n_expected} NaN value(s). "
+            "These will be excluded from mean computations via np.nanmean(). "
+            "Check landmark_inventory.csv for missing metadata entries.",
+            extra={"stage": "evaluation"},
+        )
+
+    # Auto-rescaling (e.g. missing_pct in [0,100] → [0,1]) — Review M1
+    if rescale_range is not None and expected_max is not None:
+        lo, hi = rescale_range
+        finite = out[~np.isnan(out)]
+        if finite.size > 0 and finite.max() > expected_max and finite.max() <= hi:
+            out = out / hi
+            logger.info(
+                f"{caller}: {name} values appear to be in [{lo}, {hi}] range; "
+                f"auto-rescaled to [0, 1] by dividing by {hi}. "
+                "If this is incorrect, normalise the array before passing it in.",
+                extra={"stage": "evaluation"},
+            )
+
+    # Range validation after any rescaling
+    if expected_min is not None or expected_max is not None:
+        finite = out[~np.isnan(out)]
+        if finite.size > 0:
+            actual_min = float(finite.min())
+            actual_max = float(finite.max())
+            if expected_min is not None and actual_min < expected_min:
+                logger.warning(
+                    f"{caller}: {name} has min value {actual_min:.4f} < expected "
+                    f"minimum {expected_min}. Negative values are likely a "
+                    "data-pipeline error (e.g. corrupted landmark_inventory.csv).",
+                    extra={"stage": "evaluation"},
+                )
+            if expected_max is not None and actual_max > expected_max:
+                logger.warning(
+                    f"{caller}: {name} has max value {actual_max:.4f} > expected "
+                    f"maximum {expected_max}. Values out of range are likely a "
+                    "data-pipeline error.",
+                    extra={"stage": "evaluation"},
+                )
+
+    return out
+
 
 def compute_signer_failure_mode_summary(
     y_true: Any,
@@ -962,65 +1316,42 @@ def compute_signer_failure_mode_summary(
         "Use the cache's detected_frame_count/missing_pct fields to test
         whether errors cluster in heavily zero-filled or short clips."
 
-    This function answers the SIGNER-conditioned slice of that question:
-    for each signer, what is the mean ``detected_frame_count`` /
-    ``missing_pct`` among their correctly-classified clips versus their
-    misclassified clips? A signer whose errors cluster in heavily
-    zero-filled or short clips (rather than being spread evenly) supports
-    the "errors cluster in heavily zero-filled or short clips" hypothesis
-    being a property of the DATA (specific difficult clips), not of any
-    particular signer being generally harder to classify.
-
-    This function does NOT replace a dataset-wide (non-signer-conditioned)
-    version of this analysis — that belongs in
-    ``src/evaluation/metrics.py`` or a dedicated failure-taxonomy module
-    consuming the full prediction cache directly (Stage 6 Revised, Phase D4
-    "failure taxonomy ... built inductively from D1's actual misclassified
-    clips"). This function exists specifically to let Phase D3's signer
-    analysis and Phase D4's failure taxonomy share one signer-level cut of
-    the same metadata without a second data-join.
+    This version adds NaN-safe mean computation via ``np.nanmean()`` (Review
+    M2) and metadata range validation (Review M1), while preserving the
+    original architecture and scope.
 
     Parameters
     ----------
-    y_true, y_pred         : array-like, shape (n_samples,)
-    signer_ids               : array-like, shape (n_samples,)
-    detected_frame_count       : array-like, shape (n_samples,), optional
-        Number of MediaPipe-detected frames per clip (joined from
-        ``landmark_inventory.csv`` into the Phase B1 cache). If omitted,
-        this metric is skipped (per-signer entries omit the corresponding
-        keys) — this function tolerates partial metadata rather than
-        requiring both fields simultaneously.
-    missing_pct                 : array-like, shape (n_samples,), optional
-        Fraction of both-hands-absent frames per clip. Same omission
-        behaviour as ``detected_frame_count``.
+    y_true, y_pred                   : array-like, shape (n_samples,)
+    signer_ids                        : array-like, shape (n_samples,)
+    detected_frame_count               : array-like, shape (n_samples,), optional
+        Non-negative integers. NaN values warn and are excluded from means.
+    missing_pct                          : array-like, shape (n_samples,), optional
+        Fraction of both-hands-absent frames. Accepts [0,1] or [0,100];
+        if values > 1.0 are detected, auto-rescaled to [0,1] by dividing by 100.
+        NaN values warn and are excluded from means.
 
     Returns
     -------
     dict with keys:
-        n_samples                            : int
-        n_signers                              : int
-        metadata_fields_provided                : List[str] — subset of
-                                                 ["detected_frame_count",
-                                                 "missing_pct"] actually supplied
-        per_signer                               : dict[signer_id_str -> {
-                                                 n_clips, n_correct, n_incorrect,
-                                                 mean_detected_frames_correct,
-                                                 mean_detected_frames_incorrect,
-                                                 mean_missing_pct_correct,
-                                                 mean_missing_pct_incorrect,
-                                                 }] — mean_* keys are only
-                                                 present for fields that were
-                                                 supplied, and are None when
-                                                 a signer has zero clips in
-                                                 the correct/incorrect subset
-                                                 needed to compute that mean.
-        caveat                                    : str
+        n_samples, n_signers           : int
+        metadata_fields_provided        : List[str]
+        n_nan_detected_frame_count       : int — count of NaN values in
+                                           detected_frame_count (0 if not supplied)
+        n_nan_missing_pct                 : int — count of NaN values in missing_pct
+        per_signer                          : dict[repr(signer_id) -> {
+          n_clips, n_correct, n_incorrect,
+          mean_detected_frames_correct,    mean_detected_frames_incorrect,
+          n_detected_frames_nan_correct,   n_detected_frames_nan_incorrect,
+          mean_missing_pct_correct,        mean_missing_pct_incorrect,
+          n_missing_pct_nan_correct,       n_missing_pct_nan_incorrect,
+        }]
+        caveat                               : str
 
     Raises
     ------
     ValueError
-        If neither ``detected_frame_count`` nor ``missing_pct`` is
-        supplied, or via standard array-length validation.
+        If neither metadata field is supplied, or if length validation fails.
     """
     if detected_frame_count is None and missing_pct is None:
         raise ValueError(
@@ -1037,68 +1368,97 @@ def compute_signer_failure_mode_summary(
     signer_arr = _to_signer_id_array(signer_ids, "compute_signer_failure_mode_summary")
     _validate_equal_length(y_true_arr, signer_arr, "y_true", "signer_ids")
 
+    n_samples = len(y_true_arr)
     metadata_fields_provided: List[str] = []
     dfc_arr: Optional[np.ndarray] = None
     mp_arr:  Optional[np.ndarray] = None
+    n_nan_dfc: int = 0
+    n_nan_mp:  int = 0
 
     if detected_frame_count is not None:
-        dfc_arr = np.asarray(detected_frame_count, dtype=np.float64)
-        _validate_equal_length(y_true_arr, dfc_arr, "y_true", "detected_frame_count")
+        dfc_arr = _validate_metadata_array(
+            detected_frame_count, "detected_frame_count", n_samples,
+            "compute_signer_failure_mode_summary",
+            expected_min=0.0, expected_max=None,
+            allow_nan=True,
+        )
+        n_nan_dfc = int(np.isnan(dfc_arr).sum())
         metadata_fields_provided.append("detected_frame_count")
 
     if missing_pct is not None:
-        mp_arr = np.asarray(missing_pct, dtype=np.float64)
-        _validate_equal_length(y_true_arr, mp_arr, "y_true", "missing_pct")
+        mp_arr = _validate_metadata_array(
+            missing_pct, "missing_pct", n_samples,
+            "compute_signer_failure_mode_summary",
+            expected_min=0.0, expected_max=1.0,
+            allow_nan=True,
+            rescale_range=(0.0, 100.0),
+        )
+        n_nan_mp = int(np.isnan(mp_arr).sum())
         metadata_fields_provided.append("missing_pct")
 
     correct = (y_true_arr == y_pred_arr)
     unique_signers = np.unique(signer_arr)
 
-    def _safe_mean(values: np.ndarray) -> Optional[float]:
-        return round(float(values.mean()), 4) if values.size > 0 else None
+    def _nanmean_safe(values: np.ndarray) -> Optional[float]:
+        """NaN-safe mean; returns None if all values are NaN or array is empty."""
+        if values.size == 0:
+            return None
+        finite = values[~np.isnan(values)]
+        return round(float(finite.mean()), 4) if finite.size > 0 else None
+
+    def _n_nan(values: np.ndarray) -> int:
+        return int(np.isnan(values).sum()) if values.size > 0 else 0
 
     per_signer: Dict[str, Dict[str, Any]] = {}
     for signer in unique_signers:
-        mask          = (signer_arr == signer)
-        correct_mask  = mask & correct
+        mask           = (signer_arr == signer)
+        correct_mask   = mask & correct
         incorrect_mask = mask & (~correct)
 
         entry: Dict[str, Any] = {
-            "n_clips":      int(mask.sum()),
-            "n_correct":    int(correct_mask.sum()),
-            "n_incorrect":  int(incorrect_mask.sum()),
+            "n_clips":     int(mask.sum()),
+            "n_correct":   int(correct_mask.sum()),
+            "n_incorrect": int(incorrect_mask.sum()),
         }
 
         if dfc_arr is not None:
-            entry["mean_detected_frames_correct"]   = _safe_mean(dfc_arr[correct_mask])
-            entry["mean_detected_frames_incorrect"] = _safe_mean(dfc_arr[incorrect_mask])
+            entry["mean_detected_frames_correct"]    = _nanmean_safe(dfc_arr[correct_mask])
+            entry["mean_detected_frames_incorrect"]  = _nanmean_safe(dfc_arr[incorrect_mask])
+            entry["n_detected_frames_nan_correct"]   = _n_nan(dfc_arr[correct_mask])
+            entry["n_detected_frames_nan_incorrect"] = _n_nan(dfc_arr[incorrect_mask])
 
         if mp_arr is not None:
-            entry["mean_missing_pct_correct"]    = _safe_mean(mp_arr[correct_mask])
-            entry["mean_missing_pct_incorrect"]  = _safe_mean(mp_arr[incorrect_mask])
+            entry["mean_missing_pct_correct"]    = _nanmean_safe(mp_arr[correct_mask])
+            entry["mean_missing_pct_incorrect"]  = _nanmean_safe(mp_arr[incorrect_mask])
+            entry["n_missing_pct_nan_correct"]   = _n_nan(mp_arr[correct_mask])
+            entry["n_missing_pct_nan_incorrect"] = _n_nan(mp_arr[incorrect_mask])
 
-        per_signer[str(signer)] = entry
+        per_signer[_signer_key(signer)] = entry
 
     result: Dict[str, Any] = {
-        "n_samples":                  len(y_true_arr),
-        "n_signers":                  len(unique_signers),
-        "metadata_fields_provided":    metadata_fields_provided,
-        "per_signer":                  per_signer,
+        "n_samples":                      n_samples,
+        "n_signers":                      len(unique_signers),
+        "metadata_fields_provided":        metadata_fields_provided,
+        "n_nan_detected_frame_count":       n_nan_dfc,
+        "n_nan_missing_pct":                n_nan_mp,
+        "per_signer":                       per_signer,
         "caveat": (
             "Per-signer correct/incorrect metadata means are computed over "
             "very small subsets (often 1-6 clips per signer per correctness "
-            "bucket). Differences between mean_*_correct and "
-            "mean_*_incorrect for any single signer are illustrative, not "
-            "statistically tested. Aggregate across all signers (not "
-            "signer-by-signer) for any claim about whether errors cluster "
-            "in zero-filled or short clips dataset-wide."
+            "bucket) using np.nanmean() — NaN values are excluded and their "
+            "count is reported in n_*_nan_* fields. Differences between "
+            "mean_*_correct and mean_*_incorrect for any single signer are "
+            "illustrative, not statistically tested. Aggregate across all "
+            "signers (not signer-by-signer) for any claim about whether "
+            "errors cluster in zero-filled or short clips dataset-wide."
         ),
     }
 
     logger.info(
         f"compute_signer_failure_mode_summary() | "
-        f"n_samples={result['n_samples']} | n_signers={result['n_signers']} | "
-        f"metadata_fields={metadata_fields_provided}",
+        f"n_samples={n_samples} | n_signers={len(unique_signers)} | "
+        f"metadata_fields={metadata_fields_provided} | "
+        f"n_nan_dfc={n_nan_dfc} | n_nan_mp={n_nan_mp}",
         extra={"stage": "evaluation"},
     )
 
@@ -1126,22 +1486,16 @@ def compute_signer_analysis_summary(
 ) -> Dict[str, Any]:
     """
     Bundle every primitive in this module into a single, JSON-serialisable
-    signer-analysis summary for one split — the one function Notebook 06
-    and ``pipelines/run_evaluation.py`` should call to get "the signer
-    numbers" for a split.
+    signer-analysis summary for one split.
 
-    Mirrors the consolidation pattern already established by
+    Mirrors the consolidation pattern established by
     ``metrics.py::compute_evaluation_summary()`` and
     ``calibration.py::compute_calibration_summary()``: validates inputs
-    once, then composes the other public functions in this module, so no
-    caller has to remember to separately call
-    ``compute_per_signer_accuracy``, ``compute_signer_spread_bootstrap_ci``,
-    ``compute_signer_high_risk_correlation``, and
-    ``compute_signer_failure_mode_summary`` and hand-assemble the result.
+    once, then composes the public functions in this module.
 
     Does NOT run inference itself — callers pass already-extracted
-    ``(y_true, y_pred, signer_ids)`` from the Phase B1 / Phase C prediction
-    cache, exactly like every other Stage 6 consolidation function.
+    ``(y_true, y_pred, signer_ids)`` from the Phase B1 / Phase C
+    prediction cache.
 
     Parameters
     ----------
@@ -1150,41 +1504,25 @@ def compute_signer_analysis_summary(
     n_classes                    : int
     split_name                    : str, default "val"
     sign_names                     : Sequence[str], optional — enables
-                                    high_risk_clip_fraction and therefore
-                                    the high-risk correlation cross-check.
-                                    Strongly recommended; omit only if the
-                                    label map is unavailable.
-    high_risk_signs                 : Sequence[str], optional — see
-                                    compute_per_signer_accuracy().
-    detected_frame_count               : array-like, optional — enables
-                                    compute_signer_failure_mode_summary().
-    missing_pct                          : array-like, optional — same.
-    compute_spread_ci                      : bool, default True — set False
-                                    to skip the signer-level bootstrap
-                                    (e.g. for a fast dev iteration).
-    n_bootstrap, ci_level, seed              : see
-                                    compute_signer_spread_bootstrap_ci().
+                                    high_risk_clip_fraction and the
+                                    high-risk correlation cross-check.
+                                    Validated for None/empty/duplicate entries.
+    high_risk_signs                 : Sequence[str], optional
+    detected_frame_count               : array-like, optional
+    missing_pct                          : array-like, optional
+    compute_spread_ci                      : bool, default True
+    n_bootstrap, ci_level, seed              : see constituent functions
 
     Returns
     -------
     dict with keys:
-        split_name                    : str
-        n_samples, n_classes, n_signers : int
-        per_signer_accuracy              : dict (see compute_per_signer_accuracy())
-        spread_bootstrap_ci               : dict, only if compute_spread_ci=True
-        high_risk_correlation               : dict, only if sign_names was
-                                            supplied (see
-                                            compute_signer_high_risk_correlation())
-        failure_mode_summary                  : dict, only if
-                                            detected_frame_count or
-                                            missing_pct was supplied
-        unseen_signer_framing_note               : str
-        caveat                                     : str
-
-    Raises
-    ------
-    ValueError
-        If any constituent validation fails.
+        split_name, n_samples, n_classes, n_signers
+        per_signer_accuracy
+        spread_bootstrap_ci        (if compute_spread_ci=True)
+        high_risk_correlation       (if sign_names was supplied)
+        failure_mode_summary         (if detected_frame_count or missing_pct)
+        unseen_signer_framing_note
+        caveat
     """
     per_signer_acc = compute_per_signer_accuracy(
         y_true, y_pred, signer_ids, n_classes,
@@ -1199,19 +1537,36 @@ def compute_signer_analysis_summary(
         "n_classes":                   per_signer_acc["n_classes"],
         "n_signers":                   per_signer_acc["n_signers"],
         "per_signer_accuracy":          per_signer_acc,
-        "unseen_signer_framing_note":     UNSEEN_SIGNER_FRAMING_NOTE,
-        "caveat":                          _SIGNER_SAMPLE_SIZE_CAVEAT,
+        "unseen_signer_framing_note":    UNSEEN_SIGNER_FRAMING_NOTE,
+        "caveat":                         _SIGNER_SAMPLE_SIZE_CAVEAT,
     }
 
     if compute_spread_ci:
         summary["spread_bootstrap_ci"] = compute_signer_spread_bootstrap_ci(
-            per_signer_acc, n_bootstrap=n_bootstrap, ci_level=ci_level, seed=seed,
+            per_signer_acc,
+            n_bootstrap=n_bootstrap,
+            ci_level=ci_level,
+            seed=seed,
         )
 
     if sign_names is not None:
-        summary["high_risk_correlation"] = compute_signer_high_risk_correlation(
-            per_signer_acc,
+        # Only run if at least one signer has high_risk_clip_fraction populated
+        any_populated = any(
+            v.get("high_risk_clip_fraction") is not None
+            for v in per_signer_acc["per_signer"].values()
         )
+        if any_populated:
+            summary["high_risk_correlation"] = compute_signer_high_risk_correlation(
+                per_signer_acc,
+            )
+        else:
+            logger.warning(
+                "compute_signer_analysis_summary(): sign_names was supplied but "
+                "no signer has a populated high_risk_clip_fraction "
+                "(likely because high_risk_class_indices was empty — check the "
+                "M4 warning above). high_risk_correlation step skipped.",
+                extra={"stage": "evaluation"},
+            )
 
     if detected_frame_count is not None or missing_pct is not None:
         summary["failure_mode_summary"] = compute_signer_failure_mode_summary(
@@ -1239,10 +1594,9 @@ def compute_signer_analysis_summary(
 def _get_safe_matplotlib():
     """
     Import matplotlib.pyplot safely without unconditionally mutating global
-    backend state. Identical helper to calibration.py's
-    ``_get_safe_matplotlib()`` — duplicated here (not imported) so this
-    module remains independently importable, consistent with this file's
-    "no hard dependency on sibling Stage 6 modules" design choice.
+    backend state. Identical helper to calibration.py::_get_safe_matplotlib()
+    — duplicated here (not imported) so this module remains independently
+    importable. Does NOT call matplotlib.use("Agg") globally (Review L4).
     """
     try:
         import matplotlib.pyplot as plt
@@ -1258,44 +1612,46 @@ def _get_safe_matplotlib():
 def plot_signer_generalisation(
     per_signer_result: Dict[str, Any],
     test_per_signer_result: Optional[Dict[str, Any]] = None,
-    output_path: Optional[Union[str, Path]] = None,
+    output_path=None,
     figure_dpi: int = 150,
     metric: str = "accuracy",
+    show_wilson_ci: bool = True,
+    show_overall_accuracy: bool = True,
 ) -> Any:
     """
-    Render a strip/box plot of per-signer accuracy (or macro-F1), from the
-    dict(s) returned by ``compute_per_signer_accuracy()``.
+    Render a strip plot of per-signer accuracy (or macro-F1), from the dict(s)
+    returned by ``compute_per_signer_accuracy()``.
 
     Visual design
     -------------
     - One panel for val (always present). A second panel for test is added
-      only if ``test_per_signer_result`` is supplied (Stage 6 Revised plan,
-      Phase D3: "optionally 7 test signers as a second panel").
-    - Each signer is one point (strip plot), sized by ``n_clips`` (more
-      clips → larger, more trustworthy-looking marker) and coloured grey
-      if ``is_sparse`` else steelblue, making the small-sample caveat
-      visually legible rather than only textual.
-    - A horizontal dashed line marks the overall (pooled) accuracy for
-      context against the per-signer spread.
-    - NO "familiar" / "novel" colour coding or legend category anywhere in
-      this figure — per the explicit Stage 6 (Revised) correction, every
-      point represents an equally-unseen signer (see
-      ``UNSEEN_SIGNER_FRAMING_NOTE``, also printed in the figure caption).
-
-    Backend note
-    ------------
-    Does NOT call ``matplotlib.use("Agg")`` globally — see
-    ``_get_safe_matplotlib()``, matching the convention in calibration.py.
+      only if ``test_per_signer_result`` is supplied.
+    - Each signer is one point, sized by ``n_clips`` (more clips → larger),
+      capped at a maximum marker size to prevent large-signer visual dominance
+      (Review L3), and coloured grey if ``is_sparse`` else steelblue.
+    - Wilson score CI error bars per signer (when show_wilson_ci=True and
+      metric="accuracy") — quantified uncertainty rather than bare points.
+    - A horizontal dashed line marks the pooled overall accuracy.
+    - NO "familiar" / "novel" colour coding — per the Stage 6 (Revised)
+      explicit correction, every point represents an equally-unseen signer.
+    - Legend uses explicit proxy artists to prevent duplicate entries (Review L4).
+    - Sort order: by metric value ascending for readability, with a stable
+      secondary sort on signer_id string for deterministic tie-breaking (Review L5).
+    - Title says "Per-signer accuracy variation" (not "generalisation") to
+      avoid implying a familiar/novel axis that doesn't exist (Review L2).
 
     Parameters
     ----------
-    per_signer_result        : dict from compute_per_signer_accuracy() — val split.
-    test_per_signer_result     : dict from compute_per_signer_accuracy() —
-                                test split, optional second panel.
+    per_signer_result        : dict from compute_per_signer_accuracy() — val.
+    test_per_signer_result     : dict — test split, optional second panel.
     output_path                  : str | Path | None
-    figure_dpi                    : int
+    figure_dpi                    : int, default 150
     metric                          : str, default "accuracy"
-        Either "accuracy" or "macro_f1" — which per-signer field to plot.
+        Either "accuracy" or "macro_f1_global" or "macro_f1_present_classes".
+    show_wilson_ci                   : bool, default True
+        Show Wilson score CI error bars (only meaningful for metric="accuracy").
+    show_overall_accuracy             : bool, default True
+        Draw a horizontal dashed line at the pooled overall accuracy.
 
     Returns
     -------
@@ -1304,17 +1660,20 @@ def plot_signer_generalisation(
     Raises
     ------
     ValueError
-        If ``metric`` is not "accuracy" or "macro_f1".
+        If ``metric`` is not a valid key in the per_signer entries.
     ImportError
         If matplotlib is not installed.
     """
-    if metric not in ("accuracy", "macro_f1"):
+    valid_metrics = ("accuracy", "macro_f1_global", "macro_f1_present_classes")
+    if metric not in valid_metrics:
         raise ValueError(
-            f"plot_signer_generalisation(): metric={metric!r} must be "
-            "'accuracy' or 'macro_f1'."
+            f"plot_signer_generalisation(): metric={metric!r} must be one of "
+            f"{valid_metrics}."
         )
 
     try:
+        import matplotlib.patches as mpatches
+        import matplotlib.lines as mlines
         plt = _get_safe_matplotlib()
     except ImportError as exc:
         raise ImportError(
@@ -1328,66 +1687,148 @@ def plot_signer_generalisation(
 
     n_panels = len(results)
     fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 6), squeeze=False)
-    axes = axes[0]
+    axes_flat = axes[0]
 
-    metric_label = "Accuracy" if metric == "accuracy" else "Macro-F1"
+    metric_label = {
+        "accuracy":                  "Accuracy",
+        "macro_f1_global":           "Macro-F1 (global, all classes)",
+        "macro_f1_present_classes":  "Macro-F1 (present classes only)",
+    }[metric]
 
-    for ax, (split_label, result) in zip(axes, results):
+    # Maximum marker size to prevent visual dominance of high-clip signers (Review L3)
+    _MAX_MARKER_SIZE = 300
+
+    for ax, (split_label, result) in zip(axes_flat, results):
         per_signer = result["per_signer"]
-        overall    = result["overall_accuracy"] if metric == "accuracy" else None
+        overall    = result.get("overall_accuracy")
 
-        signer_ids = list(per_signer.keys())
-        values     = [per_signer[sid][metric] for sid in signer_ids]
-        n_clips    = [per_signer[sid]["n_clips"] for sid in signer_ids]
-        is_sparse  = [per_signer[sid]["is_sparse"] for sid in signer_ids]
+        signer_ids_list = list(per_signer.keys())
+        values     = [per_signer[sid].get(metric, 0.0) for sid in signer_ids_list]
+        n_clips    = [per_signer[sid]["n_clips"] for sid in signer_ids_list]
+        is_sparse  = [per_signer[sid]["is_sparse"] for sid in signer_ids_list]
 
-        # Sort by value for a readable strip plot.
-        order = np.argsort(values)
-        signer_ids = [signer_ids[i] for i in order]
-        values     = [values[i] for i in order]
-        n_clips    = [n_clips[i] for i in order]
-        is_sparse  = [is_sparse[i] for i in order]
+        # Wilson CI only available for accuracy metric
+        has_ci = (
+            show_wilson_ci
+            and metric == "accuracy"
+            and "accuracy_ci_lower" in per_signer[signer_ids_list[0]]
+        ) if signer_ids_list else False
 
-        x_positions = np.arange(len(signer_ids))
-        sizes  = [40 + 25 * c for c in n_clips]
-        colors = ["darkgrey" if sp else "steelblue" for sp in is_sparse]
+        ci_lowers = [per_signer[sid].get("accuracy_ci_lower", 0.0) for sid in signer_ids_list]
+        ci_uppers = [per_signer[sid].get("accuracy_ci_upper", 0.0) for sid in signer_ids_list]
 
-        ax.scatter(x_positions, values, s=sizes, c=colors, alpha=0.85,
-                   edgecolor="white", linewidth=1.0, zorder=3)
+        # Stable sort: primary by value ascending, secondary by signer_id (Review L5)
+        order = sorted(
+            range(len(values)),
+            key=lambda i: (values[i], str(signer_ids_list[i])),
+        )
+        signer_ids_sorted = [signer_ids_list[i] for i in order]
+        values_sorted     = [values[i] for i in order]
+        n_clips_sorted    = [n_clips[i] for i in order]
+        is_sparse_sorted  = [is_sparse[i] for i in order]
+        ci_lo_sorted      = [ci_lowers[i] for i in order]
+        ci_hi_sorted      = [ci_uppers[i] for i in order]
 
-        for x, v, c in zip(x_positions, values, n_clips):
-            ax.annotate(f"n={c}", (x, v), textcoords="offset points",
-                        xytext=(0, 8), ha="center", fontsize=7.5, color="dimgrey")
+        x_positions = np.arange(len(signer_ids_sorted))
 
-        if overall is not None:
-            ax.axhline(overall, color="tomato", linestyle="--", linewidth=1.3,
-                       label=f"Pooled {metric_label.lower()}={overall:.3f}", zorder=2)
+        # Marker size: proportional to n_clips, capped at _MAX_MARKER_SIZE (Review L3)
+        sizes  = [min(40 + 20 * c, _MAX_MARKER_SIZE) for c in n_clips_sorted]
+        colors = ["darkgrey" if sp else "steelblue" for sp in is_sparse_sorted]
+
+        sc = ax.scatter(
+            x_positions, values_sorted, s=sizes, c=colors,
+            alpha=0.85, edgecolor="white", linewidth=1.0, zorder=3,
+        )
+
+        # Wilson CI error bars (Review M7)
+        if has_ci:
+            for x, v, ci_lo, ci_hi, sp in zip(
+                x_positions, values_sorted, ci_lo_sorted, ci_hi_sorted, is_sparse_sorted
+            ):
+                yerr_lo = max(0.0, v - ci_lo)
+                yerr_hi = max(0.0, ci_hi - v)
+                ax.errorbar(
+                    x, v,
+                    yerr=[[yerr_lo], [yerr_hi]],
+                    fmt="none",
+                    color="darkgrey" if sp else "steelblue",
+                    linewidth=1.2,
+                    capsize=3,
+                    capthick=1.0,
+                    alpha=0.6,
+                    zorder=2,
+                )
+
+        # Clip count annotations
+        for x, v, c in zip(x_positions, values_sorted, n_clips_sorted):
+            ax.annotate(
+                f"n={c}",
+                (x, v),
+                textcoords="offset points",
+                xytext=(0, 8),
+                ha="center",
+                fontsize=7.5,
+                color="dimgrey",
+            )
+
+        # Pooled accuracy line
+        if show_overall_accuracy and overall is not None and metric == "accuracy":
+            ax.axhline(
+                overall,
+                color="tomato",
+                linestyle="--",
+                linewidth=1.3,
+                zorder=2,
+                label=f"_pooled",  # underscore prefix prevents auto-legend entry
+            )
 
         ax.set_xticks(x_positions)
-        ax.set_xticklabels(signer_ids, rotation=45, ha="right", fontsize=8)
+        ax.set_xticklabels(
+            signer_ids_sorted, rotation=45, ha="right", fontsize=8
+        )
         ax.set_ylim(-0.02, 1.05)
         ax.set_ylabel(metric_label, fontsize=11)
         ax.set_xlabel("Signer ID", fontsize=10)
+        # Title avoids "generalisation" language (Review L2)
         ax.set_title(
-            f"{split_label} split — {len(signer_ids)} unseen signers "
+            f"{split_label} split — per-signer accuracy variation\n"
+            f"{len(signer_ids_sorted)} unseen signers "
             f"(n={result['n_samples']} clips)",
             fontsize=10,
         )
         ax.grid(True, axis="y", alpha=0.25, linestyle=":")
-        ax.legend(fontsize=8, loc="lower right")
 
-        # Sparse-signer legend marker, added once via a proxy artist.
-        if any(is_sparse):
-            ax.scatter([], [], s=80, c="darkgrey", edgecolor="white",
-                      label=f"is_sparse (n_clips < {SPARSE_SIGNER_THRESHOLD})")
-            ax.legend(fontsize=8, loc="lower right")
+        # Build legend with explicit proxy artists to prevent duplicates (Review L4)
+        legend_handles = [
+            mpatches.Patch(color="steelblue", alpha=0.85, label="Signer (adequate clips)"),
+            mpatches.Patch(
+                color="darkgrey", alpha=0.85,
+                label=f"Sparse signer (n < {SPARSE_SIGNER_THRESHOLD})",
+            ),
+        ]
+        if show_overall_accuracy and overall is not None and metric == "accuracy":
+            legend_handles.append(
+                mlines.Line2D(
+                    [0], [0], color="tomato", linestyle="--", linewidth=1.3,
+                    label=f"Pooled accuracy={overall:.3f}",
+                ),
+            )
+        if has_ci:
+            legend_handles.append(
+                mlines.Line2D(
+                    [0], [0], color="steelblue", linewidth=1.2, alpha=0.6,
+                    label=f"Wilson {int(_WILSON_CI_LEVEL*100)}% CI (per signer)",
+                ),
+            )
+
+        ax.legend(handles=legend_handles, fontsize=8, loc="lower right", framealpha=0.85)
 
     fig.suptitle(
-        "Per-signer generalisation — all signers unseen by construction "
-        "(zero-overlap split; no familiar/novel axis)",
-        fontsize=11,
+        "Per-signer variation (unseen signers only — zero-overlap split;\n"
+        "no familiar/novel axis exists in this evaluation)",
+        fontsize=10,
     )
-    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+    plt.tight_layout(rect=[0, 0.03, 1, 0.93])
 
     if output_path is not None:
         out = Path(output_path)
@@ -1420,19 +1861,32 @@ def _self_check() -> None:
     )
     assert DEFAULT_N_BOOTSTRAP >= _MIN_BOOTSTRAP_FOR_STABLE_CI, (
         f"signer_analysis.py: DEFAULT_N_BOOTSTRAP={DEFAULT_N_BOOTSTRAP} should "
-        f"be >= _MIN_BOOTSTRAP_FOR_STABLE_CI={_MIN_BOOTSTRAP_FOR_STABLE_CI}."
+        f">= _MIN_BOOTSTRAP_FOR_STABLE_CI={_MIN_BOOTSTRAP_FOR_STABLE_CI}."
+    )
+    assert 0.0 < _WILSON_CI_LEVEL < 1.0, (
+        f"signer_analysis.py: _WILSON_CI_LEVEL={_WILSON_CI_LEVEL} must be in (0, 1)."
+    )
+    assert _WILSON_Z > 0.0, (
+        f"signer_analysis.py: _WILSON_Z={_WILSON_Z} must be positive."
     )
     assert len(HIGH_RISK_SIGNS) == 5, (
-        f"signer_analysis.py: HIGH_RISK_SIGNS has {len(HIGH_RISK_SIGNS)} "
-        "entries; expected the 5 Stage 5 Finding 8 classes (clothes, think, "
-        "birthday, name, book). Keep in sync with metrics.py::HIGH_RISK_SIGNS "
-        "if this was an intentional update."
+        f"signer_analysis.py: HIGH_RISK_SIGNS has {len(HIGH_RISK_SIGNS)} entries; "
+        "expected the 5 Stage 5 Finding 8 classes (clothes, think, birthday, "
+        "name, book). Keep in sync with metrics.py::HIGH_RISK_SIGNS."
     )
     assert len(UNSEEN_SIGNER_FRAMING_NOTE) > 50, (
         "signer_analysis.py: UNSEEN_SIGNER_FRAMING_NOTE string unexpectedly short."
     )
     assert len(_SIGNER_SAMPLE_SIZE_CAVEAT) > 50, (
         "signer_analysis.py: _SIGNER_SAMPLE_SIZE_CAVEAT string unexpectedly short."
+    )
+    assert len(_DUAL_MACRO_F1_NOTE) > 50, (
+        "signer_analysis.py: _DUAL_MACRO_F1_NOTE string unexpectedly short."
+    )
+    # Verify _signer_key differentiates int and string signer IDs (Review M5)
+    assert _signer_key(1) != _signer_key("1"), (
+        "signer_analysis.py: _signer_key() must produce different outputs for "
+        "integer 1 and string '1'. repr()-based approach ensures collision safety."
     )
 
 
