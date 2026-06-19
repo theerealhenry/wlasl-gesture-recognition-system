@@ -235,8 +235,8 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Default number of equal-width confidence bins for the reliability diagram.
-#: 10 bins × 52 val clips ≈ 5.2 clips/bin — very sparse. See module docstring.
-DEFAULT_N_BINS: int = 10
+#: With 52 val clips, n_bins=5 is recommended for more reliable estimates
+DEFAULT_N_BINS: int = 5
 
 #: Default number of threshold points for the confidence-threshold curve.
 #: 101 points gives a 1-percentage-point resolution across [0, 1].
