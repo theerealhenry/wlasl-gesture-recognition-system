@@ -1195,25 +1195,22 @@ def _sanity_check_tflite(
 
     if expected_input_shape is not None:
         if not _shapes_compatible(in_shape, expected_input_shape):
-            # For TFLite with static batch=1, also try the TFLite-specific shape
-            tflite_in = _TFLITE_EXPECTED_INPUT_SHAPE
-            if not _shapes_compatible(in_shape, tflite_in):
-                raise ValueError(
-                    f"_sanity_check_tflite(): TFLite input shape {in_shape} is "
-                    f"incompatible with expected {expected_input_shape} "
-                    f"(also checked TFLite static shape {tflite_in}). "
-                    "The exported file does not match the model's documented contract."
-                )
+            raise ValueError(
+                f"_sanity_check_tflite(): TFLite input shape {in_shape} is "
+                f"incompatible with expected {expected_input_shape}. "
+                "The exported file does not match the model's documented contract. "
+                "_shapes_compatible() already treats None/-1 as a wildcard at any "
+                "position, so a Keras-style (None, seq_len, feature_dim) expectation "
+                "is matched correctly against TFLite's static-batch shape without "
+                "any further fallback."
+            )
 
     if expected_output_shape is not None:
         if not _shapes_compatible(out_shape, expected_output_shape):
-            tflite_out = _TFLITE_EXPECTED_OUTPUT_SHAPE
-            if not _shapes_compatible(out_shape, tflite_out):
-                raise ValueError(
-                    f"_sanity_check_tflite(): TFLite output shape {out_shape} is "
-                    f"incompatible with expected {expected_output_shape} "
-                    f"(also checked TFLite static shape {tflite_out})."
-                )
+            raise ValueError(
+                f"_sanity_check_tflite(): TFLite output shape {out_shape} is "
+                f"incompatible with expected {expected_output_shape}."
+            )
 
     dummy = np.zeros(in_shape, dtype=input_details[0]["dtype"])
     interpreter.set_tensor(input_details[0]["index"], dummy)
