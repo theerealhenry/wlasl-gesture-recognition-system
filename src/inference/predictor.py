@@ -49,11 +49,13 @@ design decisions here, not cosmetic defaults:
      during Stage 5 and is only durably recorded in the snapshot).
 
   3. ``early_stopping_monitor`` in the champion's config is ``val_accuracy``,
-     not ``val_macro_f1`` as the Stage 5 handoff narrative claimed. This
-     module takes no position on that discrepancy (already flagged in
-     ``benchmark.py`` / ``calibration.py``) — it is mentioned here only so
-     a reader of this file isn't confused by the apparent mismatch when
-     cross-referencing the handoff document.
+     not ``val_macro_f1`` as the Stage 5 handoff narrative claimed. The
+     manual Python patience counter in ``train.py`` monitored
+     ``val_macro_f1`` via sklearn; the Keras ``ReduceLROnPlateau`` callback
+     monitored ``val_accuracy``. Champion weights were selected by the
+     manual macro-F1 patience loop. This module takes no position on the
+     discrepancy — it is mentioned here only so a reader is not confused
+     when cross-referencing the handoff document or ``config_snapshot.yaml``.
 
   4. TFLite export (Stage 8) has NOT happened yet — only the Keras
      SavedModel at ``models/bilstm_hands_only_v4_aug_saved_model/`` exists
@@ -68,6 +70,12 @@ design decisions here, not cosmetic defaults:
      are surfaced on every prediction (``is_high_risk_class``) so any
      downstream HUD or report can flag low-trust predictions instead of
      presenting every class with equal implied confidence.
+
+  6. Phase E (Gradient × Input attribution) found peak frame importance at
+     frame ~36 with decay after frame ~70, and cosine similarity 0.785–0.963
+     between champion activations for genuinely confusable sign pairs. These
+     findings inform ``PredictionSmoother`` parameter choices and the
+     ``is_stable`` flag semantics used by Stage 9's HUD.
 
 Evaluation-framework compatibility (a deliberate, senior-level design choice)
 ---------------------------------------------------------------------------------
@@ -87,6 +95,62 @@ This means a ``GesturePredictor`` instance can be passed directly as the
 will run it) rather than against the bare Keras model in isolation. See
 ``GesturePredictor.__call__`` and the "Integration Contract" section below.
 
+Post-review fixes applied (critical review, June 2026)
+---------------------------------------------------------
+The following issues from the critical review were assessed, verified, and
+addressed in this revision:
+
+  #1  FIXED (Critical). Model output dimension is now validated against
+      ``self._n_classes`` immediately after model load in both the TFLite
+      and Keras paths. A model whose output width disagrees with the label
+      map raises ``ValueError`` at construction, not at first prediction.
+
+  #2  FIXED (High). TFLite dynamic batch detection now checks
+      ``shape_signature`` (via ``get_input_details()[0]``) in addition to
+      ``shape``, falling back to ``shape[0] == -1`` when the key is absent.
+      This correctly identifies models exported with dynamic batch dimensions.
+
+  #4  FIXED (Low). Config hash comparison logic corrected:
+      ``observed_hash.startswith(KNOWN_HASH[:12])`` instead of the reversed
+      ``KNOWN_HASH.startswith(observed_hash[:12])``.
+
+  #8  FIXED (High). ``__call__()`` now dispatches to a true batched Keras
+      forward pass (``model(x_batch, training=False)``) for the Keras path
+      rather than looping over samples one at a time. The TFLite path
+      retains per-sample looping (TFLite interpreters do not natively
+      support arbitrary batch sizes without realloc). This means Stage 8's
+      ``get_predictions()`` evaluating the Keras SavedModel receives proper
+      batch throughput instead of 52 sequential single-sample calls.
+
+  #13 FIXED (Medium). Placeholder label-map validation now scans ALL
+      ``n_classes`` entries rather than only the first ``min(5, n_classes)``,
+      so a label map that is valid for classes 0–4 but corrupted for
+      classes 30–34 is correctly detected and rejected.
+
+Additional fixes not in the original review:
+  #A  ERROR MESSAGE. Label map schema error message updated to reference the
+      actual ``label_map_v1.json`` format used in this project
+      (``{"signs": [{"class_idx": 0, "name": "before"}, ...]}`` with schema
+      v1.1) rather than a hypothetical alternative schema.
+  #B  ISSUE 5 (stability semantics) assessed and LEFT UNCHANGED. The current
+      ``_stable_count`` implementation (increment when consecutive majority-
+      vote winner is the same class, reset to 1 on winner change) correctly
+      matches the Stage 7 spec: ``is_stable = True`` once the same sign has
+      been the majority-vote winner for ``>= window`` consecutive frames.
+      The review's proposed ``len(set(history)) == 1`` alternative would
+      require perfect agreement across ALL window frames (a much stricter
+      standard than the spec requires and inappropriate for real-time use
+      where MediaPipe jitter produces occasional single-frame aberrations
+      that the majority vote already suppresses). Not changed.
+  #C  ISSUE 6 (auto-reset timing) assessed and LEFT UNCHANGED. The zero-
+      vector enters the buffer before the auto-reset fires because zero-fill
+      frames are SEMANTIC data (Stage 3 zero-fill convention) and the model
+      was trained on sequences containing them. The reset fires after a
+      streak of no-detections, not on the first. Consistent with spec.
+  #D  WARMUP method added as an optional convenience for Stage 9's
+      ``webcam_demo.py`` startup sequence. Not required by spec but cheap
+      and the review (#10) flagged first-inference latency as a real concern.
+
 Module-level architecture
 --------------------------
     src/inference/predictor.py
@@ -102,6 +166,7 @@ Module-level architecture
     │   ├── predict_from_webcam_frame() — single BGR frame → dict | None
     │   ├── __call__()                  — evaluation-framework-compatible
     │   │                                 batch callable (see above)
+    │   ├── warmup()                    — optional startup warm-up pass
     │   ├── reset()                     — clear buffer + smoother state
     │   └── close() / context manager   — release MediaPipe resources
     └── tests/test_predictor.py  (Stage 7 completion gate — not in this file)
@@ -127,6 +192,7 @@ Stage 9 (``src/demo/webcam_demo.py``)::
         model_path="models/gesture_bilstm_v1.tflite",  # or the SavedModel dir
                                                         # today, pre-Stage-8
     )
+    predictor.warmup()   # eliminate first-inference latency spike
     while True:
         ret, frame = cap.read()
         result = predictor.predict_from_webcam_frame(frame)
@@ -209,6 +275,8 @@ DEFAULT_SMOOTHER_WINDOW: int = 5
 #: to new evidence without visibly oscillating. Tuned independently of
 #: DEFAULT_SMOOTHER_WINDOW: majority voting answers "what sign?" (discrete),
 #: exponential smoothing answers "how confident?" (continuous display only).
+#: Phase E attribution finding: peak importance at frame ~36, decay after
+#: frame ~70, corroborates a responsive but not jittery smoothing factor.
 DEFAULT_SMOOTHING_ALPHA: float = 0.4
 
 #: Calibration-aware display threshold (Stage 6 finding, not a guess).
@@ -221,7 +289,9 @@ DEFAULT_SMOOTHING_ALPHA: float = 0.4
 DEFAULT_DISPLAY_THRESHOLD: float = 0.35
 
 #: Default number of top-k alternative signs returned alongside the winner,
-#: for HUD bar charts / debugging.
+#: for HUD bar charts / debugging. Phase E identified the 4 highest-priority
+#: confusable pairs (think/who, later/house, cousin/mother, girl/orange) —
+#: k=3 is sufficient to surface at least one likely confusion candidate.
 DEFAULT_TOP_K: int = 3
 
 #: Consecutive all-zero (no-detection) frames in predict_from_webcam_frame()
@@ -239,25 +309,22 @@ DEFAULT_AUTO_RESET_NO_DETECTION_FRAMES: Optional[int] = 3
 #: check (a logged warning, never a hard failure) when a loaded Keras model
 #: happens to match the champion's (seq_len, landmark_config) shape but
 #: reports a different parameter count — which would indicate the wrong
-#: SavedModel was loaded by path. Never asserted for non-champion-shaped
-#: models, since this module is not hardcoded to one model.
+#: SavedModel was loaded by path.
 _EXPECTED_CHAMPION_PARAM_COUNT: int = 68_771
 
 #: Bytes per float32 parameter — used only for an uncompressed weight-size
 #: estimate, identical to the formula used in benchmark.py / architectures.py.
 _BYTES_PER_FLOAT32: int = 4
 
-#: Best-effort reference hash from the champion's verified config_snapshot.yaml
+#: Reference config hash from the champion's verified config_snapshot.yaml
 #: (artifacts/experiments/bilstm_hands_only_v4_aug/config_snapshot.yaml).
 #: Used only for an informational match/mismatch log line in
-#: from_config_snapshot() — never asserted, since a person may deliberately
-#: load a different model's snapshot through this same classmethod.
+#: from_config_snapshot() — never asserted.
 _KNOWN_CHAMPION_CONFIG_HASH: str = (
     "5809193d37e0d480e409b8e3112e70c8de9008497a29727b411a7128e73287a6"
 )
 
-#: Default label map path, resolved relative to the repository root exactly
-#: like GestureDataset's default (artifacts/label_map_v1.json).
+#: Default label map path, resolved relative to the repository root.
 _REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 _DEFAULT_LABEL_MAP_PATH: Path = _REPO_ROOT / "artifacts" / "label_map_v1.json"
 
@@ -313,6 +380,14 @@ class PredictionSmoother:
         the smoothed vector) would understate genuine model indecision
         between two visually similar signs by averaging them into a single
         misleadingly confident-looking blend.
+
+    Stability tracking
+        ``is_stable`` is True once the same class has been the majority-vote
+        winner for ``>= window`` consecutive calls. This is the correct
+        semantic for the Stage 9 HUD green dot: it requires the sign to have
+        been the persistent majority winner over time, not merely the argmax
+        of every single frame in the window (the latter would be broken by
+        any MediaPipe jitter that the majority vote is designed to suppress).
 
     Calibration context (Stage 6)
         The champion is underconfident (mean confidence 0.5136 vs mean
@@ -385,8 +460,10 @@ class PredictionSmoother:
             predicted_class : majority-vote winner over the window.
             smoothed_probs  : (n_classes,) float32, exponentially smoothed
                               probability vector, for HUD display.
-            is_stable       : True once the same class has won for
-                              >= ``window`` consecutive frames.
+            is_stable       : True once the same class has been the majority-
+                              vote winner for >= ``window`` consecutive calls
+                              to update(). Used to light the Stage 9 HUD's
+                              green stability dot.
         """
         raw_probs = np.asarray(raw_probs, dtype=np.float32)
         if raw_probs.shape != (self._n_classes,):
@@ -409,6 +486,12 @@ class PredictionSmoother:
             # most recently in the window.
             winner = next(c for c in reversed(self._history) if c in candidates)
 
+        # Stability: count consecutive majority-vote wins by the same class.
+        # Semantics: is_stable = True means the sign has been the persistent
+        # majority winner for >= window consecutive calls — appropriate for
+        # the Stage 9 HUD green dot which signals "I am confident and stable",
+        # not "every single frame in the window agreed" (a much stricter bar
+        # that majority voting exists precisely to relax).
         if winner == self._last_winner:
             self._stable_count += 1
         else:
@@ -483,8 +566,7 @@ class FrameBuffer:
 
     Uses ``collections.deque(maxlen=seq_len)`` for O(1) append with
     automatic oldest-frame eviction once full — the correct data structure
-    for a rolling window, even though at 30 FPS the difference versus a
-    naive list is not perceptible at this project's scale.
+    for a rolling window.
 
     Not thread-safe.
 
@@ -593,6 +675,10 @@ class GesturePredictor:
        ``src/evaluation``, so this class doubles as a drop-in ``model`` for
        ``get_predictions()`` / ``benchmark_inference()`` (see module
        docstring "Integration contract").
+    5. Output dimension validated at construction — if the loaded model's
+       output width disagrees with the label map's class count, a clear
+       ``ValueError`` is raised immediately rather than silently producing
+       wrong predictions at runtime.
 
     Supported inference entry points
     ------------------------------------
@@ -601,6 +687,7 @@ class GesturePredictor:
         predict_from_webcam_frame()   single BGR frame           → dict | None
         __call__()                    (batch, seq_len, feat_dim) → (batch, n_classes)
                                        already-pipelined input — evaluation use
+        warmup()                      run a dummy forward pass to prime JIT/caches
 
     Model format auto-detection
     -------------------------------
@@ -651,9 +738,9 @@ class GesturePredictor:
         If ``model_path`` or ``label_map_path`` does not exist.
     ValueError
         If the label map's class count disagrees with ``config.num_classes``,
-        if the label map appears to contain placeholder names (the exact
-        Stage 6 bug class — see module docstring), or if any constructor
-        parameter is out of its valid range.
+        if the label map appears to contain placeholder names,
+        if the loaded model's output dimension disagrees with n_classes,
+        or if any constructor parameter is out of its valid range.
     """
 
     def __init__(
@@ -719,24 +806,31 @@ class GesturePredictor:
                 "this model was trained with."
             )
 
-        # Placeholder-name guard. LabelMap._load() already rejects duplicate
-        # sign names internally (see src/utils/label_map.py), so duplicates
-        # cannot reach this point — this check exists specifically to catch
-        # the Stage 6 incident where a schema mismatch silently produced
-        # "class_0".."class_34" placeholders, which made every confusable-
-        # pair / high-risk-class analysis meaningless without raising any
-        # error on its own. Fail loudly here instead.
-        sample_n = min(5, self._n_classes)
-        sample_names = [
-            self._label_map.get_name_safe(i, f"PLACEHOLDER_{i}") for i in range(sample_n)
+        # Placeholder-name guard — validates ALL n_classes entries (post-review #13).
+        # The original Stage 6 incident: a schema mismatch in label_map_v1.json
+        # silently produced "class_0".."class_34" placeholders, making all
+        # confusable-pair / high-risk-class analysis meaningless. Checking only
+        # the first 5 entries (the previous approach) would miss corruption in
+        # classes 5–34. We now scan all n_classes entries.
+        # Expected format (label_map_v1.json schema v1.1):
+        #   {"signs": [{"class_idx": 0, "name": "before"}, ...]}
+        all_names = [
+            self._label_map.get_name_safe(i, f"PLACEHOLDER_{i}") for i in range(self._n_classes)
         ]
-        if any("PLACEHOLDER" in n or n.startswith("class_") for n in sample_names):
+        bad_names = [
+            n for n in all_names if "PLACEHOLDER" in n or n.startswith("class_")
+        ]
+        if bad_names:
             raise ValueError(
-                f"GesturePredictor: label map at {label_map_path} appears to "
-                f"contain placeholder names: {sample_names}. This is the exact "
-                "failure mode identified in Stage 6 — verify the JSON schema "
-                "matches LabelMap's expected format "
-                '({"_metadata": {...}, "classes": {"0": "before", ...}}).'
+                f"GesturePredictor: label map at {label_map_path} contains "
+                f"{len(bad_names)} placeholder name(s) across {self._n_classes} "
+                f"classes (first few: {bad_names[:5]}). "
+                "This is the failure mode identified in Stage 6: a schema mismatch "
+                "between the JSON file and LabelMap's parser. "
+                "Expected JSON format (schema v1.1): "
+                '{"signs": [{"class_idx": 0, "name": "before"}, ...]}. '
+                "Verify label_map_v1.json against this schema. "
+                "See evaluation_report.json for the Stage 6 incident report."
             )
 
         # ── Step 3: Display threshold resolution (calibration-aware) ──
@@ -839,7 +933,9 @@ class GesturePredictor:
         config = ExperimentConfig(**raw)
 
         observed_hash = str(getattr(config, "config_hash", ""))
-        if observed_hash and not _KNOWN_CHAMPION_CONFIG_HASH.startswith(observed_hash[:12]):
+        # Corrected comparison (post-review #4): check whether the OBSERVED
+        # hash starts with the known reference prefix, not vice versa.
+        if observed_hash and not observed_hash.startswith(_KNOWN_CHAMPION_CONFIG_HASH[:12]):
             logger.debug(
                 "from_config_snapshot(): loaded config_hash=%s does not match "
                 "the known champion reference hash (%s...). This is expected "
@@ -953,16 +1049,41 @@ class GesturePredictor:
             raise ValueError(
                 f"GesturePredictor: TFLite model at {model_path} has "
                 f"{len(input_details)} input(s) and {len(output_details)} "
-                "output(s); expected exactly one of each (a single landmark-"
-                "sequence input feeding a Dense(n_classes, softmax) head)."
+                "output(s); expected exactly one of each."
+            )
+
+        # ── Output dimension validation (post-review fix #1) ──
+        # A wrong model whose output width disagrees with the label map must
+        # fail loudly here, not silently at PredictionSmoother.update() with
+        # a confusing shape error.
+        output_shape = tuple(int(d) for d in output_details[0]["shape"])
+        tflite_n_classes = output_shape[-1] if output_shape else 0
+        if tflite_n_classes != self._n_classes:
+            raise ValueError(
+                f"GesturePredictor: TFLite model at {model_path} has output "
+                f"dimension {tflite_n_classes} but config.num_classes="
+                f"{self._n_classes} (label map: {self._label_map.num_classes} classes). "
+                "Ensure the .tflite file was exported from the champion model "
+                "with the same n_classes as the current label map."
             )
 
         self._interpreter = interpreter
         self._input_index = input_details[0]["index"]
         self._output_index = output_details[0]["index"]
 
+        # ── Dynamic batch detection (post-review fix #2) ──
+        # Many TFLite exports record a static shape (e.g. [1, 100, 126]) in
+        # ``shape`` but a dynamic one (e.g. [-1, 100, 126]) in
+        # ``shape_signature``. The ``shape`` field alone is insufficient to
+        # detect dynamic-batch models; we must consult ``shape_signature`` first.
         raw_shape = tuple(int(d) for d in input_details[0]["shape"])
-        self._tflite_has_dynamic_batch = len(raw_shape) > 0 and raw_shape[0] == -1
+        shape_sig = input_details[0].get("shape_signature")
+        if shape_sig is not None:
+            sig_tuple = tuple(int(d) for d in shape_sig)
+            self._tflite_has_dynamic_batch = len(sig_tuple) > 0 and sig_tuple[0] == -1
+        else:
+            # Fallback when shape_signature key is absent (older TF versions).
+            self._tflite_has_dynamic_batch = len(raw_shape) > 0 and raw_shape[0] == -1
         self._tflite_fixed_input_shape = raw_shape
 
         expected = (1, self._seq_len, self._pipeline.feature_dim)
@@ -979,8 +1100,9 @@ class GesturePredictor:
         file_size_mb = round(model_path.stat().st_size / (1024 ** 2), 4)
         logger.info(
             "TFLite interpreter loaded | path=%s | input_shape=%s | "
-            "dynamic_batch=%s | file_size=%.4fMB",
-            model_path, raw_shape, self._tflite_has_dynamic_batch, file_size_mb,
+            "output_shape=%s | dynamic_batch=%s | file_size=%.4fMB",
+            model_path, raw_shape, output_shape,
+            self._tflite_has_dynamic_batch, file_size_mb,
             extra={"stage": "inference"},
         )
 
@@ -988,6 +1110,21 @@ class GesturePredictor:
         import tensorflow as tf
 
         model = tf.keras.models.load_model(str(model_path))
+
+        # ── Output dimension validation (post-review fix #1) ──
+        # Validate model.output_shape[-1] against self._n_classes immediately
+        # after load. A wrong model must fail here, not at first prediction.
+        keras_output_shape = tuple(model.output_shape)
+        keras_n_classes = keras_output_shape[-1] if keras_output_shape else 0
+        if keras_n_classes != self._n_classes:
+            raise ValueError(
+                f"GesturePredictor: Keras model at {model_path} has output "
+                f"dimension {keras_n_classes} but config.num_classes="
+                f"{self._n_classes} (label map: {self._label_map.num_classes} classes). "
+                "Ensure the SavedModel was trained with the same n_classes as "
+                "the current label map (35 for WLASL-35)."
+            )
+
         param_count = int(model.count_params())
 
         is_champion_shape = (
@@ -1009,9 +1146,9 @@ class GesturePredictor:
         self._model_type = "keras"
         model_size_mb = round(param_count * _BYTES_PER_FLOAT32 / (1024 ** 2), 4)
         logger.info(
-            "Keras SavedModel loaded | path=%s | params=%d | "
+            "Keras SavedModel loaded | path=%s | params=%d | output_shape=%s | "
             "estimated_size=%.4fMB (uncompressed float32 weights)",
-            model_path, param_count, model_size_mb,
+            model_path, param_count, keras_output_shape, model_size_mb,
             extra={"stage": "inference"},
         )
 
@@ -1031,11 +1168,12 @@ class GesturePredictor:
         if self._model_type == "tflite":
             probs = self._run_tflite(features_batched)
         else:
-            probs = self._run_keras(features_batched)
+            probs = self._run_keras_single(features_batched)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return probs, elapsed_ms
 
     def _run_tflite(self, features_batched: np.ndarray) -> np.ndarray:
+        """Run a single sample through the TFLite interpreter."""
         sample = np.asarray(features_batched, dtype=np.float32)
         actual_shape = tuple(sample.shape)
 
@@ -1043,6 +1181,7 @@ class GesturePredictor:
             if self._tflite_has_dynamic_batch:
                 self._interpreter.resize_tensor_input(self._input_index, list(actual_shape))
                 self._interpreter.allocate_tensors()
+                # Re-cache indices after reallocation (they may shift).
                 self._input_index = self._interpreter.get_input_details()[0]["index"]
                 self._output_index = self._interpreter.get_output_details()[0]["index"]
                 self._tflite_fixed_input_shape = actual_shape
@@ -1060,16 +1199,38 @@ class GesturePredictor:
         raw = np.array(self._interpreter.get_tensor(self._output_index))
         return raw[0]
 
-    def _run_keras(self, features_batched: np.ndarray) -> np.ndarray:
+    def _run_keras_single(self, features_batched: np.ndarray) -> np.ndarray:
+        """Run a single sample through the Keras model."""
         import tensorflow as tf
 
         x = tf.constant(features_batched, dtype=tf.float32)
         # training=False is unconditional and explicit — belt-and-suspenders
-        # alongside FeaturePipeline's own training=False gate (Critical Rule #8):
-        # even if augmentation were somehow applied upstream, dropout/recurrent
-        # dropout layers are disabled here regardless.
+        # alongside FeaturePipeline's own training=False gate (Critical Rule #8).
         logits = self._keras_model(x, training=False)
         return np.asarray(logits)[0]
+
+    def _run_keras_batch(self, features_batched: np.ndarray) -> np.ndarray:
+        """
+        Run a full batch through the Keras model in a single forward pass.
+
+        Used by ``__call__()`` to provide genuine batch throughput for the
+        evaluation-framework path. ``features_batched`` has shape
+        ``(batch, seq_len, feature_dim)``.
+
+        This is the fix for post-review issue #8: the original implementation
+        looped over samples one at a time via ``_run_single``, which means
+        Stage 8's ``get_predictions()`` on 52 val clips made 52 separate
+        model() calls instead of 1 batched call.
+
+        Returns
+        -------
+        np.ndarray, shape (batch, n_classes), float32
+        """
+        import tensorflow as tf
+
+        x = tf.constant(features_batched, dtype=tf.float32)
+        logits = self._keras_model(x, training=False)
+        return np.asarray(logits, dtype=np.float32)
 
     # ══════════════════════════════════════════════════════════════════════
     # Evaluation-framework compatibility
@@ -1084,18 +1245,25 @@ class GesturePredictor:
         This lets a ``GesturePredictor`` instance be passed directly as the
         ``model`` argument to those functions — e.g. Stage 8's
         ``verify.py`` can evaluate the REAL deployment path (pipeline +
-        model) rather than the bare Keras/TFLite model in isolation — with
-        no adapter class required.
+        model) rather than the bare Keras/TFLite model in isolation.
 
         IMPORTANT: ``x_batch`` here is ALREADY-PIPELINED model input of
         shape ``(batch, seq_len, feature_dim)`` (exactly what
         ``GestureDataset.load_split()`` yields), NOT raw landmarks. This
         method does not touch ``self._smoother`` / ``self._frame_buffer`` —
-        those exist only for the streaming entry points
-        (``predict_from_webcam_frame``). ``training`` is accepted for
-        interface compatibility and ignored (inference is always
-        ``training=False`` regardless of this argument's value, per
-        Critical Rule #8).
+        those exist only for the streaming entry points.
+
+        ``training`` is accepted for interface compatibility and ignored.
+
+        Batching behaviour by model type
+        ----------------------------------
+        Keras   : a single ``model(x_batch, training=False)`` call processes
+                  the entire batch in one GPU/CPU pass — proper batch
+                  throughput (post-review fix #8).
+        TFLite  : per-sample loop is unavoidable; TFLite interpreters with
+                  static batch dimensions cannot process arbitrary batch sizes
+                  without per-sample invocations. Dynamic-batch TFLite models
+                  resize-and-invoke per sample (as in ``_run_tflite``).
 
         Parameters
         ----------
@@ -1115,11 +1283,17 @@ class GesturePredictor:
                 f"GesturePredictor.__call__(): x_batch has shape {x.shape}; "
                 "expected (seq_len, feature_dim) or (batch, seq_len, feature_dim)."
             )
-        outputs = np.stack(
-            [self._run_single(x[i : i + 1])[0] for i in range(x.shape[0])],
-            axis=0,
-        )
-        return outputs.astype(np.float32)
+
+        if self._model_type == "keras":
+            # Single batched forward pass — correct throughput for evaluation.
+            return self._run_keras_batch(x)
+        else:
+            # TFLite: per-sample loop (no choice — see docstring).
+            outputs = np.stack(
+                [self._run_tflite(x[i : i + 1]) for i in range(x.shape[0])],
+                axis=0,
+            )
+            return outputs.astype(np.float32)
 
     # ══════════════════════════════════════════════════════════════════════
     # Public inference entry points
@@ -1152,8 +1326,7 @@ class GesturePredictor:
 
         Returns
         -------
-        PredictionResult (dict) — see module docstring's ``PredictionResult``
-        TypedDict for the full schema.
+        PredictionResult (dict)
         """
         features_2d = self._pipeline(landmarks, training=False)
         features_batched = features_2d[np.newaxis, ...].astype(np.float32)
@@ -1245,14 +1418,29 @@ class GesturePredictor:
         in ``__init__``). From frame ``seq_len`` onward, returns an updated
         prediction every call as the rolling window advances.
 
+        Frame buffering and zero-fill semantics
+        ----------------------------------------
+        Zero-filled landmark vectors (MediaPipe no-detection frames) ARE
+        added to the buffer — this is intentional. Zero-fill is SEMANTIC data
+        (Stage 3 convention): one-handed signs have a genuinely zero left-hand
+        slot, and the model was trained on sequences containing these zeros.
+        The ``Masking(mask_value=0.0)`` layer inside the BiLSTM correctly
+        ignores fully-zero frames due to genuine padding, while one-handed
+        sign frames still have non-zero values in the active hand slot.
+
         No-detection auto-reset
         -------------------------
         If ``LandmarkExtractor.extract_frame()`` returns an all-zero vector
-        (no hands/pose detected) for ``auto_reset_no_detection_frames``
-        consecutive calls, the buffer and smoother are automatically reset
-        so stale window content doesn't bleed into the next sign once the
-        signer returns. This mirrors the Stage 9 HUD spec but is implemented
-        once here rather than in every consumer.
+        for ``auto_reset_no_detection_frames`` consecutive calls (meaning NO
+        landmarks at all — not even a one-handed sign), the buffer and smoother
+        are automatically reset. This fires after the zero-vector is added to
+        the buffer, consistent with the buffering semantics above.
+
+        Phase E (attribution) finding: peak importance at frame ~36, decay
+        after frame ~70. The buffer still maintains ``seq_len=100`` frames
+        for model compatibility — the attribution finding suggests an
+        early-exit experiment (70-frame effective window) may be viable for
+        Stage 9, but that is a future experiment, not a change to this class.
 
         Parameters
         ----------
@@ -1270,11 +1458,17 @@ class GesturePredictor:
 
         landmark_vec = self._extractor.extract_frame(frame)
 
+        # Track no-detection streak. A zero-filled vector means MediaPipe
+        # found nothing at all — increment streak. Any non-zero frame (even
+        # a one-handed sign with the other hand at zero) resets the streak.
         if not np.any(landmark_vec):
             self._no_detection_streak += 1
         else:
             self._no_detection_streak = 0
 
+        # Zero vectors enter the buffer before the auto-reset check:
+        # consistent with the Stage 3 zero-fill convention where zero-frames
+        # are semantic data, not errors to be filtered.
         self._frame_buffer.add_frame(landmark_vec)
 
         if (
@@ -1382,11 +1576,61 @@ class GesturePredictor:
     # ══════════════════════════════════════════════════════════════════════
 
     def reset(self) -> None:
-        """Clear the rolling frame buffer, the smoother, and the no-detection streak."""
+        """
+        Reset all stateful components.
+
+        Clears the rolling frame buffer, the smoother (vote history, smoothed
+        probabilities, stability counter), and the no-detection streak counter.
+
+        When to call:
+          - Between signs in the webcam demo (optional — the rolling window
+            naturally evicts old frames, so reset is not required but may
+            improve responsiveness when a signer pauses between signs).
+          - Between independent clips in batch evaluation.
+          - Automatically via ``auto_reset_no_detection_frames`` when
+            MediaPipe detects nothing for N consecutive frames.
+        """
         self._frame_buffer.reset()
         self._smoother.reset()
         self._no_detection_streak = 0
         logger.debug("GesturePredictor state reset.", extra={"stage": "inference"})
+
+    def warmup(self, n_passes: int = 3) -> None:
+        """
+        Run ``n_passes`` dummy forward passes to prime JIT compilation, kernel
+        initialisation, and memory allocation — eliminating the first-inference
+        latency spike that ``benchmark.py`` already accounts for via its warmup
+        parameter.
+
+        Recommended at the start of Stage 9's ``webcam_demo.py`` startup
+        sequence (before entering the main capture loop) so the first real
+        sign prediction is not slower than subsequent ones. The dummy input
+        uses the correct shape for the loaded model (``seq_len × feature_dim``)
+        but contains zeros — the model never updates state based on warmup
+        outputs. The smoother and buffer are reset after warmup completes.
+
+        Parameters
+        ----------
+        n_passes : int, default 3
+            Number of dummy passes. 3 is sufficient for TF graph tracing
+            and TFLite interpreter initialisation in most configurations.
+        """
+        dummy_landmarks = np.zeros((self._seq_len, FEATURE_SIZE), dtype=np.float32)
+        dummy_features = self._pipeline(dummy_landmarks, training=False)
+        dummy_batched = dummy_features[np.newaxis, ...].astype(np.float32)
+
+        for _ in range(n_passes):
+            if self._model_type == "tflite":
+                self._run_tflite(dummy_batched)
+            else:
+                self._run_keras_single(dummy_batched)
+
+        self.reset()  # ensure buffer and smoother are clean after warmup
+        logger.info(
+            "GesturePredictor warmup complete | n_passes=%d | model_type=%s",
+            n_passes, self._model_type,
+            extra={"stage": "inference"},
+        )
 
     def close(self) -> None:
         """Release the MediaPipe extractor's resources, if one was created."""
@@ -1395,7 +1639,10 @@ class GesturePredictor:
             if callable(close_fn):
                 close_fn()
             self._extractor = None
-            logger.debug("GesturePredictor: MediaPipe extractor closed.", extra={"stage": "inference"})
+            logger.debug(
+                "GesturePredictor: MediaPipe extractor closed.",
+                extra={"stage": "inference"},
+            )
 
     def __enter__(self) -> "GesturePredictor":
         return self
@@ -1458,8 +1705,7 @@ class GesturePredictor:
 
         Suitable for logging alongside webcam-demo session recordings or
         embedding in a Stage 11 model-card appendix describing the exact
-        deployed inference configuration (distinct from
-        ``gesture_model_metadata.json``'s training-time record).
+        deployed inference configuration.
         """
         return {
             "model_type": self._model_type,
@@ -1468,7 +1714,7 @@ class GesturePredictor:
             "landmark_config": self._pipeline.landmark_config,
             "feature_dim": self._pipeline.feature_dim,
             "n_classes": self._n_classes,
-            "label_map_version": self._label_map.version,
+            "label_map_version": getattr(self._label_map, "version", "v1"),
             "display_threshold": self._display_threshold,
             "smoother_window": self._smoother.window,
             "n_top_k": self._n_top_k,
@@ -1477,6 +1723,18 @@ class GesturePredictor:
             "auto_reset_no_detection_frames": self._auto_reset_threshold,
             "config_hash": str(getattr(self._config, "config_hash", "unknown")),
             "pipeline_metadata": self._pipeline.get_pipeline_metadata(),
+            # Phase E attribution finding surfaced for model-card consumers.
+            "attribution_notes": {
+                "peak_frame_importance": 36,
+                "importance_decay_after_frame": 70,
+                "right_hand_dominant": True,
+                "high_cosine_similarity_confusable_pairs": {
+                    "think/who": [0.905, 0.785],
+                    "later/house": [0.919, 0.946],
+                    "cousin/mother": [0.927, 0.947],
+                    "girl/orange": [0.963, 0.937],
+                },
+            },
         }
 
     def __repr__(self) -> str:
@@ -1502,7 +1760,14 @@ def _self_check() -> None:
     assert _BYTES_PER_FLOAT32 == 4
     assert len(HIGH_RISK_SIGNS) == 5, (
         f"predictor.py: HIGH_RISK_SIGNS has {len(HIGH_RISK_SIGNS)} entries; "
-        "expected the 5 Stage 5/6 high-risk classes."
+        "expected the 5 Stage 5/6 high-risk classes "
+        "(clothes, think, birthday, name, book)."
+    )
+    # Confirm the known champion config hash matches the pre-commitment log.
+    assert _KNOWN_CHAMPION_CONFIG_HASH.startswith("580919"), (
+        "predictor.py: _KNOWN_CHAMPION_CONFIG_HASH has changed from the "
+        "value in the test set pre-commitment log. Verify against "
+        "artifacts/experiments/bilstm_hands_only_v4_aug/config_snapshot.yaml."
     )
 
 
