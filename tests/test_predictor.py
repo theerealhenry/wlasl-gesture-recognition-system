@@ -615,14 +615,21 @@ class TestPredictionSmoother:
             _, _, is_stable = smoother.update(probs_a)
         assert is_stable, "Should be stable after window frames."
 
-        # Feed enough class-B frames to flip the majority vote
-        # After 3 more B frames, history=[A,B,B,B] (with window=3, [B,B,B])
-        # which makes B the winner — stable counter resets to 1
-        for _ in range(3):
+        # Feed enough class-B frames to flip the majority vote AND THEN
+        # accumulate `window` consecutive B-wins. Majority voting lags one
+        # push behind a winner change, so starting from a stable [A,A,A]
+        # history with window=3:
+        #   push 1: history=[A,A,B] -> winner=A (2 vs 1) -- B does not win yet
+        #   push 2: history=[A,B,B] -> winner=B (2 vs 1) -- stable_count resets to 1
+        #   push 3: history=[B,B,B] -> winner=B           -- stable_count=2
+        #   push 4: history=[B,B,B] -> winner=B           -- stable_count=3 -> is_stable=True
+        # Reaching stability on B therefore requires 4 B-pushes, not 3.
+        for _ in range(4):
             _, _, is_stable = smoother.update(probs_b)
 
-        # Now class B has won 3 consecutive times → should be stable again
-        assert is_stable, "Should be stable on class B after 3 consecutive B frames."
+        # Now class B has been the consecutive majority winner for `window`
+        # calls → should be stable again.
+        assert is_stable, "Should be stable on class B after window consecutive B-win frames."
 
         # Verify that class A is no longer the winner
         winner, _, _ = smoother.update(probs_b)
@@ -641,14 +648,16 @@ class TestPredictionSmoother:
         # Single class-B frame shifts history to [A,A,B] (with window=3)
         # class A still wins (2 vs 1) — is_stable should be True (A won
         # again), but the point is the _stable_count hasn't reset fully yet.
-        # Feed 3 consecutive B frames to guarantee a transition.
-        for i in range(3):
+        # Feed 4 consecutive B frames to guarantee a transition AND a full
+        # window of B-wins (see the detailed trace in
+        # test_smoother_stability_becomes_false_on_winner_change — the first
+        # B push does not flip the majority vote, so window=3 requires 4
+        # B-pushes total to reach stable_count >= window).
+        for i in range(4):
             winner, _, is_stable = smoother.update(probs_b)
 
-        # After 3 B-only frames, winner is B and stable_count == 3 == window
-        # so is_stable=True. The key test: right after the switch on frame 1 of B
-        # when history was [A,A,B] (majority = A, winner unchanged, stable increments)
-        # This is complex to test precisely; we verify the final stable state on B.
+        # After 4 B-only pushes, winner is B and stable_count == 3 == window,
+        # so is_stable=True.
         assert winner == 1
         assert is_stable
 
@@ -1233,13 +1242,21 @@ class TestGesturePredictorWebcamFrame:
             pipeline_input_shapes.append(arr.shape)
             return np.zeros((SEQ_LEN, FEATURE_DIM), dtype=np.float32)
 
-        predictor = _make_predictor_base()
+        # auto_reset=None: this test verifies the buffer-fill -> pipeline-call
+        # path specifically. With the default auto_reset=3, an extractor that
+        # returns all-zero frames (correctly interpreted as "no detection")
+        # triggers an auto-reset every 3 frames, and the buffer never reaches
+        # seq_len — so self._pipeline(...) is never called and the assertion
+        # below fails for reasons unrelated to what this test is checking.
+        # Using non-zero frames AND disabling auto-reset removes that
+        # confound and isolates the shape-contract behaviour under test.
+        predictor = _make_predictor_base(auto_reset=None)
         predictor._pipeline = MagicMock(side_effect=_capturing_pipeline)
         predictor._pipeline.output_shape = (SEQ_LEN, FEATURE_DIM)
         predictor._pipeline.feature_dim = FEATURE_DIM
         predictor._extractor = MagicMock()
         predictor._extractor.extract_frame = MagicMock(
-            return_value=np.zeros(N_RAW_FEATURES, dtype=np.float32)
+            return_value=_random_landmark_frame(seed=0)
         )
 
         for i in range(SEQ_LEN + 1):
