@@ -1540,10 +1540,17 @@ class GesturePredictor:
             for e in top_k_raw
         ]
 
+        # is_confident MUST be derived from the same value reported as
+        # "confidence" (rounded), not the raw float. Float32 normalisation
+        # in upstream probability construction can leave a value like
+        # 0.349999994 that rounds to a displayed 0.35 but fails a raw `>=`
+        # comparison against a 0.35 threshold — producing a displayed
+        # confidence that contradicts its own is_confident flag.
+        rounded_confidence = round(display_confidence, 4)
         result: PredictionResult = {
             "sign": sign_name,
-            "confidence": round(display_confidence, 4),
-            "is_confident": display_confidence >= self._display_threshold,
+            "confidence": rounded_confidence,
+            "is_confident": rounded_confidence >= self._display_threshold,
             "class_idx": predicted_class,
             "top_k": top_k,
             "raw_confidence": round(raw_confidence, 4),
