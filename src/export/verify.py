@@ -154,6 +154,13 @@ import numpy as np
 
 from src.utils.logger import get_logger
 
+from src.evaluation.metrics import (
+    compute_macro_f1,
+    compute_accuracy,
+    compute_per_class_metrics,
+)
+from src.inference.predictor import GesturePredictor
+
 logger = get_logger(__name__)
 
 
@@ -943,10 +950,6 @@ def run_accuracy_verification(
                        y_pred_tflite} as numpy arrays — for downstream
                        per-class delta without re-running inference.
     """
-    from src.inference.predictor import GesturePredictor
-    from src.evaluation.metrics import (
-        compute_macro_f1, compute_accuracy, compute_per_class_metrics,
-    )
 
     keras_path = Path(keras_model_path)
     tflite_p   = Path(tflite_path)
@@ -1095,7 +1098,6 @@ def compute_per_class_tflite_delta(
             is_singleton, is_zero_support, is_high_risk, is_confusable_pair,
             confusable_with, meaningful_degradation
     """
-    from src.evaluation.metrics import compute_per_class_metrics
 
     per_class_keras  = compute_per_class_metrics(
         y_true, y_pred_keras,  sign_names, n_classes
@@ -2167,10 +2169,14 @@ def plot_tflite_per_class_delta(
     y_pos = np.arange(len(signs))
     bars  = ax.barh(
         y_pos, deltas,
-        color=colors, alpha=alphas,
+        color=colors,
         edgecolor="white", linewidth=0.5,
         height=0.72,
     )
+    # matplotlib's bar()/barh() only accept a scalar alpha (or None) — a
+    # per-bar alpha list must be applied to each Rectangle patch individually.
+    for bar, a in zip(bars, alphas):
+        bar.set_alpha(a)
 
     ax.axvline(
         _MEANINGFUL_DEGRADATION_DELTA, color="red", linestyle="--",
