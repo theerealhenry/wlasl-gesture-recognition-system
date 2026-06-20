@@ -2133,6 +2133,14 @@ class TestGesturePredictorIntegration:
 
             converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_path))
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
+            # TF 2.13's MLIR converter cannot always statically resolve the
+            # TensorListReserve op emitted by Bidirectional(LSTM(...)) unless
+            # SELECT_TF_OPS is enabled and tensor-list lowering is disabled.
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS,
+                tf.lite.OpsSet.SELECT_TF_OPS,
+            ]
+            converter._experimental_lower_tensor_list_ops = False
             tflite_bytes = converter.convert()
 
             tflite_path = Path(tmpdir) / "test_model.tflite"
