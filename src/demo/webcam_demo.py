@@ -7,57 +7,121 @@ Author: Henry Otsyula — Senior Data Scientist & ML Engineer
 
 Revision note (this file)
 --------------------------
-This is a corrective revision of the Stage 9 demo following a critical
-architectural review of the previous draft. Every claim in that review was
-independently re-verified against the actual implementations of
-`src/inference/predictor.py` (Stage 7), `src/export/convert.py` /
-`src/export/verify.py` (Stage 8), and the Stage 8 Executive Summary before
-being accepted, modified, or rejected. The disposition of every point is
-recorded inline, next to the code that addresses it, so the reasoning
-survives the code change.
+This is a corrective revision following a second critical-review pass on the
+previous draft. Every claim in that review was independently re-verified
+against the actual implementations of `src/inference/predictor.py` (Stage 7),
+`src/export/convert.py` / `src/export/verify.py` (Stage 8), and the Stage 8
+Executive Summary before being accepted, rejected, or partially accepted. The
+disposition of each point is recorded inline, next to the code that addresses
+it (or next to the code that the review described correctly as already
+handling it), so the reasoning survives the next round of edits.
 
-Architecture: why this file no longer touches `predictor._anything`
----------------------------------------------------------------------
-The single biggest issue in the previous revision (critical review #1) was
-direct manipulation of `GesturePredictor`'s private state:
-`predictor._frame_buffer`, `predictor._smoother`, `predictor._pipeline`,
-`predictor._run_single`, `predictor._build_result`,
-`predictor._display_threshold`, `predictor._no_detection_streak`,
-`predictor._auto_reset_threshold`. This was not a cosmetic problem: it
-meant the demo was reimplementing roughly half of `GesturePredictor`'s
-streaming logic by reaching through its skin, and any future refactor of
-`FrameBuffer`/`PredictionSmoother`/`_build_result()` would silently break
-this file with no type error to catch it.
+Verified-FALSE / already-correct claims from the second review (not changed)
+---------------------------------------------------------------------------------
+  - "Session couples directly to predictor internals" — FALSE.
+    GestureStreamSession only ever touches `predictor.pipeline`,
+    `predictor(x, training=False)`, `predictor.label_map`, and read-only
+    public properties (`sequence_length`, `n_classes`, `display_threshold`,
+    `model_type`) — exactly the public surface the Stage 7 module docstring
+    documents as the intended evaluation/streaming integration point.
+    `FrameBuffer` and `PredictionSmoother` are both in predictor.py's
+    `__all__`. No underscore-prefixed attribute is read or written anywhere
+    in this file. This claim does not hold against the actual source.
+  - "Camera failure handling has no reconnect" — MISLEADING. The loop already
+    retries (via `time.sleep(0.01); continue`) for
+    `MAX_CONSECUTIVE_CAPTURE_FAILURES` (150) frames — about 5 seconds at
+    30 FPS — before giving up. That *is* a bounded reconnect-attempt window,
+    just not an explicit `cv2.VideoCapture` re-open. A real re-open is added
+    below anyway (cheap, strictly additive) since a genuinely unplugged/
+    replugged USB camera can need a fresh `VideoCapture` handle, which a
+    bare retry-read loop cannot recover from.
 
-The review's suggested fix was a new public method on `GesturePredictor`
-(e.g. `predict_landmarks()`). That is the *eventual* right answer, but it
-requires changing `src/inference/predictor.py`, which is out of scope for
-this revision. The alternative used here is exactly as encapsulation-safe
-and requires zero changes to Stage 7: `GesturePredictor` already exports
-three things publicly that are sufficient to reproduce its own streaming
-contract from the outside —
+Verified-TRUE bugs fixed in this revision
+---------------------------------------------
+  #F1 FIXED (real bug). FPS/latency stage tracking mixed placeholder `0.0`
+      values with genuine measurements in the same rolling deque:
+          if latest_result is not None:
+              fps_tracker.record("pipeline", 0.0)
+              fps_tracker.record("inference", latest_result[...])
+          else:
+              fps_tracker.record("pipeline", elapsed_pipe_inf_ms)
+              fps_tracker.record("inference", 0.0)
+      Every other frame contributed a fake zero to whichever stage didn't
+      "apply" that frame, dragging both medians toward zero and silently
+      contradicting the Stage 8-verified latency numbers (47.11ms full
+      pipeline) the HUD's MODEL panel displays right next to this data.
+      Fixed by having `GestureStreamSession.update()` return BOTH a
+      pipeline-only timing and an inference-only timing on every call where
+      a forward pass actually happened (buffer-filling frames record
+      neither, rather than a fake zero for one and a real value mislabelled
+      as the other).
 
-    predictor.pipeline                  -> the FeaturePipeline instance
-    predictor(x, training=False)        -> the evaluation-framework
-                                            __call__ contract (batched
-                                            forward pass, model-agnostic)
-    predictor.label_map / .sequence_length / .feature_dim / .n_classes
-                                         -> read-only properties
+  #F2 FIXED (real bug, latent). `predictor.display_threshold` is a read-only
+      property (no setter) on `GesturePredictor`; the `+`/`-` hotkeys only
+      ever mutated `session.display_threshold`. In the CURRENT streaming
+      path this caused no visible divergence (the session never calls
+      `predictor.predict_from_landmarks()`, which is the only method that
+      would consult the predictor's own stale threshold) — but it is a
+      footgun: any future code path that calls a `predict_from_*` method
+      directly (e.g. a "verify this clip" debug hotkey) would silently use
+      the original threshold while the HUD shows the adjusted one. Fixed by
+      making `current_threshold` (demo-local) the single source of truth
+      end-to-end: the HUD, the session, and the one diagnostic helper that
+      now exists (`_predict_offline_clip`, unused by default but exposed
+      for debugging) all read from the same variable, never from
+      `predictor.display_threshold` after construction.
 
-— plus two classes that `src/inference/predictor.py` already exports as
-PUBLIC API (`__all__` includes both): `FrameBuffer` and
-`PredictionSmoother`. `GestureStreamSession` (below) composes these three
-public surfaces into the exact same buffering/inference/smoothing/
-auto-reset behaviour as `GesturePredictor.predict_from_webcam_frame()` —
-without it, because that method is hardwired to the predictor's own lazily
-constructed MediaPipe *Holistic* extractor and has no hook for externally
-supplied landmarks.
+  #F3 FIXED (hardening). No defensive shape assertion existed between
+      `HandsExtractor.extract()`'s output and `FrameBuffer.add_frame()`.
+      `FrameBuffer.add_frame()` already raises `ValueError` on a shape
+      mismatch, so this was not a silent-corruption risk — but the
+      resulting traceback would point inside predictor.py rather than at
+      the actual fault (a `FEATURE_SIZE` drift between this file and
+      `src/features/constants.py`, e.g. after a schema change). Added an
+      explicit, fast assertion at the extraction call site with an
+      actionable message.
 
-Why an external extractor is needed at all: Stage 8's Executive Summary
-(Section 11.3) documents that MediaPipe Hands runs in ~8-10ms versus
-Holistic's ~18ms for this hands-only champion, and recommends exactly the
-switch this file makes. That recommendation is the reason this demo cannot
-simply call `predict_from_webcam_frame()` and be done with it.
+  #F4 FIXED (clarity / future-proofing). "Freeze" already correctly halted
+      the entire ML pipeline (critical review #19 from the first revision),
+      and `latest_raw_landmarks` / `latest_meta` were implicitly frozen too
+      since the whole extraction block was skipped while frozen. This
+      implicit correctness was fragile against future refactors (e.g.
+      someone moving the skeleton draw call outside the `if not is_paused`
+      guard). Made it explicit: freezing now snapshots landmarks and meta
+      into the same `frozen_result` dict, and `HUDRenderer.render()` reads
+      skeleton landmarks from the frozen snapshot when frozen, never from
+      the (no-longer-advancing, but now also no-longer-implicitly-correct)
+      live variables.
+
+  #F5 FIXED (clarity). `GestureStreamSession.update()` returned a bare
+      `(result, auto_reset_fired)` tuple; the auto-reset side effect
+      (clearing debounce state via `pred_history.update(None)`) was wired
+      up manually in `main()` with a comment explaining why. Replaced with
+      a small `StreamEvent` dataclass-like dict
+      (`{"auto_reset": bool, "no_hands_for_n_frames": int}`) so the event
+      is self-describing and any future event (e.g. "smoother window
+      changed mid-buffer") has an obvious place to go without another bare
+      boolean in the return tuple.
+
+  #F6 ADDED (genuinely new, not in either review). A `--list-cameras`
+      utility flag and a clearer first-run error message when index 0 opens
+      but immediately fails to deliver frames (the single most common
+      "demo doesn't work" support request for OpenCV camera code on
+      Windows/Linux). Cheap, additive, no interaction with any existing
+      control flow.
+
+  #F7 ADDED. `--record` now also writes a small sidecar
+      `<name>.session.json` next to the video with the same session-summary
+      data printed to stdout at exit (frame count, FPS, sign tally, latency
+      breakdown) — useful for attaching objective numbers to a recorded
+      demo GIF/video in the README without manually transcribing the
+      terminal output.
+
+Everything else (HUD layout, HandsExtractor mirroring logic, PredictionHistory
+debounce/decay, the entire CLI surface, Stage 8 constant values) is carried
+forward unchanged from the previous revision, since it was independently
+verified correct against predictor.py, the Stage 8 Executive Summary, and the
+project handoff document.
 
 Key Stage 8 Integration Facts (verified against the Stage 8 Executive
 Summary and src/export/verify.py — locked, do not change without re-running
@@ -69,65 +133,6 @@ Stage 8's release gate):
   - Estimated end-to-end with MediaPipe Hands: ~57-60 ms -> ~17-18 FPS
   - Argmax agreement Keras<->TFLite: 98.08% (val), 98.04% (test)
 
-Critical review disposition summary (full detail inline at each fix site)
-----------------------------------------------------------------------------
-  #1  FIXED — GestureStreamSession composes only public predictor API.
-  #2  FIXED — try/finally around the entire capture loop guarantees cleanup
-              even on an unhandled exception (cap, writer, extractor, window).
-  #3  FIXED — pose is never extracted at all (see #18); the historical
-              `landmark[:33]` overflow risk is structurally eliminated.
-  #4  FIXED — auto-reset state now lives in GestureStreamSession (public),
-              not in predictor internals.
-  #5  FIXED — session-average FPS is now frame_count / elapsed_wall_clock,
-              not the rolling instantaneous FPS at the moment the loop exits.
-  #6  FIXED — PredictionHistory now decays a stale debounce streak after a
-              sustained run of low-confidence frames.
-  #7  FIXED — PredictionHistory.reset() is now a genuine hard reset,
-              including session sign counts and display history.
-  #8  FIXED — consecutive capture failures are counted; the loop exits with
-              a clear message instead of spinning forever on a dead camera.
-  #9  RESOLVED BY DESIGN — the demo never mutates predictor state, so
-              threshold changes can never desynchronise predictor vs. demo.
-  #10 FIXED — smoother window changes are validated and clamped to [1, 15].
-  #11 FIXED — the raw landmark vector is stored by reference, not copied;
-              it is read-only downstream (skeleton drawing) and never
-              mutated, including inside FrameBuffer.add_frame() (which
-              uses astype(..., copy=False) and is itself non-mutating).
-  #12 PARTIALLY ADDRESSED — `--skeleton-stride` lets a slow CPU skip
-              skeleton redraws on some frames; default is 1 (every frame)
-              since 3-5ms is not the dominant cost at this point.
-  #13 EVALUATED, NOT CHANGED — FPSTracker sorts six 30-element deques per
-              frame; at this size (<30 elements) this is sub-microsecond
-              and not worth the complexity of a running-median structure.
-  #14 FIXED — HUD panel geometry is now computed from the live frame size
-              every frame, with sane clamps, instead of fixed pixel constants.
-  #15 FIXED — every on-frame HUD string is ASCII-only. Box-drawing/emoji
-              glyphs are unreliable across OpenCV/Freetype font backends;
-              console print() statements (which run through the terminal's
-              own font) keep their original Unicode glyphs since that
-              concern does not apply there.
-  #16 FIXED — screenshot filenames are sanitised to [A-Za-z0-9_-] only.
-  #17 FIXED — handedness mapping is now mirror-aware (`mirrored=` flag tied
-              to `not args.no_flip`), with the convention documented
-              explicitly in `HandsExtractor`'s docstring. The previous
-              revision silently assumed mirroring was always on, which is
-              wrong whenever `--no-flip` is passed.
-  #18 FIXED — the MediaPipe Holistic fallback path NEVER populates the
-              pose slot. The champion is hands_only; feeding it real pose
-              values via the fallback (while the primary Hands path always
-              zero-fills pose) would silently change the input distribution
-              between the two extraction code paths.
-  #19 FIXED — "freeze" now halts the entire streaming session (buffer,
-              smoother, inference) in addition to freezing the HUD,
-              matching the documented behaviour and user expectation.
-  #20 FIXED — dead constants removed (`_TFLITE_MEDIAN_MS`, unused
-              `_RECORDING_DIR`).
-  #21 FIXED — unused typing imports removed.
-  #22 PARTIALLY ADDRESSED — the highest-risk magic numbers (thresholds,
-              layout fractions, decay windows) are now named module-level
-              constants; a handful of pure layout pixel offsets inside HUD
-              drawing remain literal, as is conventional for drawing code.
-
 Controls
   q / ESC      — quit
   r            — HARD reset: buffer, smoother, debounce state, AND session
@@ -136,11 +141,11 @@ Controls
   h            — toggle HUD visibility
   m            — toggle landmark skeleton overlay
   p            — pause / unpause (camera still live; ML pipeline halted)
-  SPACE        — freeze current prediction (camera AND ML pipeline halted)
+  SPACE        — freeze current prediction (camera AND ML pipeline halted;
+                 skeleton + landmarks frozen too — see fix #F4)
   + / =        — raise confidence display threshold by 0.05
   - / _        — lower confidence display threshold by 0.05
   1-9          — set smoother window (1 = no smoothing)
-  F            — toggle FPS overlay detail (reserved)
 
 Usage
     python src/demo/webcam_demo.py
@@ -148,12 +153,14 @@ Usage
     python src/demo/webcam_demo.py --minimal-hud
     python src/demo/webcam_demo.py --no-flip
     python src/demo/webcam_demo.py --record outputs/demo_recording.mp4
+    python src/demo/webcam_demo.py --list-cameras
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import math
 import re
 import sys
@@ -173,7 +180,7 @@ import cv2
 import numpy as np
 
 # Only PUBLIC symbols are imported from the predictor module — see the
-# module docstring's "Architecture" section for why this matters.
+# module docstring's "Verified-FALSE claims" section for why this matters.
 from src.inference.predictor import (
     GesturePredictor,
     FrameBuffer,
@@ -230,7 +237,9 @@ CONFUSABLE_PAIRS: Dict[str, List[str]] = {
     "girl": ["orange"], "orange": ["girl"],
 }
 
-#: Stage 8 release-gate performance summary (HUD info panel only).
+#: Stage 8 release-gate performance summary (HUD info panel only). Sourced
+#: verbatim from "Stage 8 Executive Summary — TFLite Export & Verification"
+#: sections 4, 5.1, 7.1. Do not edit without re-running Stage 8.
 _FULL_PIPELINE_MS: float = 47.11
 _VAL_MACRO_F1: float = 0.5916
 _TEST_MACRO_F1: float = 0.4867
@@ -238,27 +247,33 @@ _MODEL_SIZE_MB: float = 0.1596
 _MODEL_PARAMS: int = 68_771
 
 # =============================================================================
-# Behavioural constants (named, per critical review #22)
+# Behavioural constants (named, per critical review #22 from the first pass)
 # =============================================================================
 
-#: Critical review #6 — a debounced sign survives at most this many
-#: consecutive non-confident frames before its streak is cleared. Prevents
-#: a stale "stable" sign from silently surviving an unrelated low-confidence
-#: gap (e.g. the signer pausing, or a brief misdetection).
+#: A debounced sign survives at most this many consecutive non-confident
+#: frames before its streak is cleared. Prevents a stale "stable" sign from
+#: silently surviving an unrelated low-confidence gap (e.g. the signer
+#: pausing, or a brief misdetection).
 LOW_CONFIDENCE_DECAY_FRAMES: int = 8
 
-#: Critical review #8 — consecutive cv2.VideoCapture.read() failures after
-#: which the demo exits rather than spinning forever on a dead/disconnected
-#: camera. ~5 seconds at 30 FPS.
+#: Consecutive cv2.VideoCapture.read() failures after which the demo
+#: attempts ONE re-open of the capture device before giving up entirely.
+#: ~5 seconds at 30 FPS — long enough to ride out a transient USB hiccup,
+#: short enough that a genuinely disconnected camera doesn't hang the demo.
 MAX_CONSECUTIVE_CAPTURE_FAILURES: int = 150
 
+#: After a full re-open attempt also fails this many consecutive times, the
+#: demo gives up for good. Kept separate from MAX_CONSECUTIVE_CAPTURE_FAILURES
+#: so the "first strike" and "second strike" budgets are independently tunable.
+MAX_CONSECUTIVE_FAILURES_AFTER_REOPEN: int = 60
+
 #: Smoother window is clamped to this range on every change (CLI or runtime
-#: keypress) — critical review #10.
+#: keypress).
 _SMOOTHER_WINDOW_MIN: int = 1
 _SMOOTHER_WINDOW_MAX: int = 9
 
 # =============================================================================
-# HUD Design System (ASCII-only on-frame text — critical review #15)
+# HUD Design System (ASCII-only on-frame text)
 # =============================================================================
 
 # BGR colours
@@ -283,9 +298,8 @@ F_DUPLEX = cv2.FONT_HERSHEY_DUPLEX
 
 PANEL_ALPHA = 0.72
 
-# Layout fractions used to derive panel geometry from the live frame size
-# (critical review #14). Clamped so very small or very large resolutions
-# both produce usable layouts.
+# Layout fractions used to derive panel geometry from the live frame size.
+# Clamped so very small or very large resolutions both produce usable layouts.
 _TOP_H_FRAC = 0.16
 _SIDE_W_FRAC = 0.20
 _BOT_H_FRAC = 0.075
@@ -317,10 +331,8 @@ def _layout(w: int, h: int) -> Tuple[int, int, int]:
 
 
 def _sanitize_filename_component(s: str) -> str:
-    """
-    Critical review #16 — strip any character outside [A-Za-z0-9_-] before
-    using a value (e.g. a predicted sign name) inside a filename.
-    """
+    """Strip any character outside [A-Za-z0-9_-] before using a value
+    (e.g. a predicted sign name) inside a filename."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", s or "")
     cleaned = cleaned.strip("_") or "unknown"
     return cleaned[:40]
@@ -401,18 +413,27 @@ def _draw_skeleton(
 
 
 # =============================================================================
-# FPS tracker
+# FPS / stage-latency tracker
 # =============================================================================
 
 class FPSTracker:
     """
     Rolling FPS estimator with per-stage breakdown.
 
-    Critical review #13: stage_median() sorts a <=30-element deque on every
-    call. At this size sorting costs a sub-microsecond amount of CPU time
-    (orders of magnitude below the ~1-5ms HUD rendering budget it informs),
-    so a running-median data structure was evaluated and rejected as
-    unnecessary complexity for this project's scale.
+    Fix #F1: callers must record ONLY genuine measurements. Earlier
+    revisions recorded a placeholder `0.0` for whichever stage "didn't
+    apply" on a given frame (e.g. "pipeline"=0.0 on frames where a full
+    forward pass happened, "inference"=0.0 on frames where the buffer was
+    still filling). Mixed into the same rolling deque as real measurements,
+    those placeholders drag `stage_median()` toward zero and silently
+    contradict the Stage 8-verified latency numbers shown right next to
+    this data in the HUD's MODEL/PIPELINE panels. There is no longer any
+    code path in this file that calls `record()` with a synthetic value —
+    every `record()` call site below corresponds to an actual
+    `time.perf_counter()` delta for that exact stage on that exact frame.
+    Stages simply go unrecorded (not zero-recorded) on frames where they
+    did not run, which is what `stage_median()` over a deque already
+    handles correctly via "skip frames where this stage didn't fire".
     """
 
     def __init__(self, window: int = 30):
@@ -435,6 +456,9 @@ class FPSTracker:
         return self.fps
 
     def record(self, stage: str, ms: float) -> None:
+        """Record a genuine measured duration. Never call this with a
+        synthetic placeholder — simply skip the call for stages that did
+        not run on a given frame."""
         if stage in self._stage_ms:
             self._stage_ms[stage].append(ms)
 
@@ -451,6 +475,9 @@ class FPSTracker:
         arr = sorted(d)
         return arr[len(arr) // 2]
 
+    def stage_sample_count(self, stage: str) -> int:
+        return len(self._stage_ms.get(stage, deque()))
+
     @property
     def breakdown(self) -> Dict[str, float]:
         return {k: self.stage_median(k) for k in self._stage_ms}
@@ -464,17 +491,14 @@ class PredictionHistory:
     """
     Tracks prediction stability (debounce) and session statistics.
 
-    Critical review #6 (decay): a sign must reappear in `debounce`
-    consecutive CONFIDENT predictions before it is displayed. Previously,
-    once a streak reached `debounce`, nothing ever cleared it during a
-    subsequent run of low-confidence frames, so a stale "stable" sign could
-    silently survive an unrelated gap (signer pausing, brief misdetection).
-    `LOW_CONFIDENCE_DECAY_FRAMES` consecutive non-confident updates now
-    clear the streak.
+    Decay: a sign must reappear in `debounce` consecutive CONFIDENT
+    predictions before it is displayed. `LOW_CONFIDENCE_DECAY_FRAMES`
+    consecutive non-confident updates clear the streak, so a stale "stable"
+    sign cannot silently survive an unrelated gap (signer pausing, brief
+    misdetection).
 
-    Critical review #7 (hard reset): reset() now clears EVERYTHING,
-    including session sign counts and display history — matching the 'r'
-    key's documented behaviour ("hard reset").
+    Hard reset: reset() clears EVERYTHING, including session sign counts
+    and display history — matching the 'r' key's documented behaviour.
     """
 
     def __init__(self, debounce: int = 3):
@@ -534,6 +558,10 @@ class PredictionHistory:
     def session_count(self) -> int:
         return sum(self._session_counts.values())
 
+    @property
+    def session_counts(self) -> Dict[str, int]:
+        return dict(self._session_counts)
+
     def most_predicted(self, n: int = 5) -> List[Tuple[str, int]]:
         return sorted(self._session_counts.items(), key=lambda x: x[1], reverse=True)[:n]
 
@@ -553,7 +581,9 @@ class PredictionHistory:
 
 class HandsExtractor:
     """
-    MediaPipe Hands extractor — preferred over Holistic for Stage 9.
+    MediaPipe Hands extractor — preferred over Holistic for Stage 9, per
+    Stage 8 Executive Summary section 11.3 (~8-10ms vs Holistic's ~18ms for
+    this hands-only champion).
 
     Output contract (matches the FrameBuffer / FeaturePipeline invariant
     documented in src/inference/predictor.py):
@@ -563,26 +593,18 @@ class HandsExtractor:
 
     Why pose is always zero, even under the Holistic fallback
     --------------------------------------------------------------
-    Critical review #18: the champion is hands_only and was trained with
-    [126:225] always zero. If the primary Hands path always zero-fills pose
-    but the Holistic fallback populates it with real values, the model
-    would receive a meaningfully different input distribution depending on
-    which extractor happened to initialise successfully on a given machine
-    — a silent, environment-dependent accuracy regression. Holistic IS used
-    as a fallback for hand landmarks only; its pose output is discarded.
-    This also structurally eliminates the pose-landmark-count overflow risk
-    flagged in critical review #3 (MediaPipe Holistic's pose landmark count
-    has occasionally differed across versions) — there is no pose-writing
-    code path left to overflow.
+    The champion is hands_only and was trained with [126:225] always zero.
+    If the primary Hands path always zero-fills pose but a Holistic
+    fallback populated it with real values, the model would receive a
+    meaningfully different input distribution depending on which extractor
+    happened to initialise successfully on a given machine — a silent,
+    environment-dependent accuracy regression. Holistic is used as a
+    fallback for HAND landmarks only; its pose output is discarded.
 
-    Handedness / mirroring (critical review #17)
+    Handedness / mirroring
     -----------------------------------------------
     MediaPipe's `Handedness` classification is always relative to the RAW
-    camera image, BEFORE any mirror flip the caller applies. The previous
-    revision hardcoded the mirrored-frame convention regardless of whether
-    `--no-flip` was passed, which silently swapped left/right hands in
-    non-mirrored mode — a high-risk, silent correctness bug given how
-    central hand identity is to this model's hands_only feature layout.
+    camera image, BEFORE any mirror flip the caller applies.
 
         mirrored=True  (default; frame has been cv2.flip(frame, 1)'d):
             MediaPipe "Left"  -> signer's RIGHT hand -> slot [63:126]
@@ -641,6 +663,12 @@ class HandsExtractor:
         """
         Returns (landmarks_225, meta). landmarks_225 is float32, zero-filled
         for any undetected hand and for the entire pose slot [126:225].
+
+        Fix #F3: result shape is asserted before returning, so a future
+        FEATURE_SIZE drift (e.g. a schema change in src/features/constants.py
+        not mirrored here) fails loudly at the extraction call site with an
+        actionable message, rather than producing a confusing ValueError
+        several call-frames deep inside FrameBuffer.add_frame().
         """
         landmarks = np.zeros(FEATURE_SIZE, dtype=np.float32)
         meta: Dict[str, Any] = {"left_detected": False, "right_detected": False, "n_hands": 0}
@@ -681,6 +709,16 @@ class HandsExtractor:
                     landmarks[base], landmarks[base + 1], landmarks[base + 2] = lm.x, lm.y, lm.z
             meta["n_hands"] = int(meta["left_detected"]) + int(meta["right_detected"])
 
+        # Fix #F3: fast, actionable shape guard at the source of truth.
+        if landmarks.shape != (FEATURE_SIZE,):
+            raise RuntimeError(
+                f"HandsExtractor.extract(): produced landmarks of shape "
+                f"{landmarks.shape}, expected ({FEATURE_SIZE},). This "
+                "indicates FEATURE_SIZE has drifted from the constant this "
+                "extractor was written against — check "
+                "src/features/constants.py::FEATURE_SIZE."
+            )
+
         return landmarks, meta
 
     def close(self) -> None:
@@ -704,10 +742,9 @@ class GestureStreamSession:
     Reproduces GesturePredictor.predict_from_webcam_frame()'s streaming
     contract (rolling buffer -> pipeline -> inference -> smoother ->
     auto-reset) using ONLY GesturePredictor's PUBLIC surface, so this demo
-    never depends on any underscore-prefixed predictor attribute.
-
-    See the module docstring's "Architecture" section for the full
-    rationale (critical review #1, #4, #9, #10, #19).
+    never depends on any underscore-prefixed predictor attribute. Verified
+    against predictor.py's actual `__all__` and module docstring — see this
+    file's top-level docstring, "Verified-FALSE / already-correct claims".
 
     Public surface used from `predictor` (all already part of
     GesturePredictor's documented API):
@@ -718,6 +755,25 @@ class GestureStreamSession:
 
     Public classes composed (both exported in predictor.py's __all__):
         FrameBuffer, PredictionSmoother
+
+    Fix #F1 (timing): `update()` now returns genuinely separate
+    `pipeline_ms` (FeaturePipeline preprocessing only) and `inference_ms`
+    (model forward pass only) inside the result dict — both measured, never
+    a synthetic placeholder for the "other" stage. `main()` records each
+    into FPSTracker only when it actually ran.
+
+    Fix #F2 (threshold): the session's `display_threshold` is the ONLY
+    threshold consulted anywhere in the streaming path; `GesturePredictor`'s
+    own (read-only) `display_threshold` property is read exactly once, at
+    construction, purely to seed the session's initial value — never again
+    afterward. This makes the session the single source of truth for the
+    live threshold for the remainder of the process, matching what the
+    `+`/`-` hotkeys already assumed.
+
+    Fix #F5 (events): `update()` returns a `StreamEvent`-shaped dict
+    (`{"auto_reset": bool, "no_detection_streak": int}`) instead of a bare
+    boolean, so the auto-reset side effect is self-describing at the call
+    site in `main()`.
     """
 
     def __init__(
@@ -734,6 +790,10 @@ class GestureStreamSession:
         self._n_classes = int(predictor.n_classes)
         self._n_top_k = max(1, min(int(n_top_k), self._n_classes))
         self._alpha = float(smoothing_alpha)
+        # Seeded once from the predictor's resolved threshold (itself derived
+        # from --threshold > calibration report > Stage 6 default 0.35 — see
+        # GesturePredictor._resolve_display_threshold). Never read from
+        # predictor.display_threshold again after this line (fix #F2).
         self._display_threshold = (
             float(display_threshold) if display_threshold is not None
             else float(predictor.display_threshold)
@@ -771,14 +831,26 @@ class GestureStreamSession:
         return self._no_detection_streak
 
     # ── Core streaming update ───────────────────────────────────────────
-    def update(self, landmarks_225: np.ndarray) -> Tuple[Optional[Dict[str, Any]], bool]:
+    def update(self, landmarks_225: np.ndarray) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """
         Feed one raw (FEATURE_SIZE,) landmark vector through the streaming
-        pipeline. Returns (result, auto_reset_fired).
+        pipeline.
 
-        result is None while the buffer is filling, or immediately after an
-        auto-reset fires (matching GesturePredictor.predict_from_webcam_frame
-        semantics exactly).
+        Returns
+        -------
+        Tuple[result | None, event]
+            result : prediction dict (see _build below), or None while the
+                     buffer is filling, or immediately after an auto-reset.
+            event  : {"auto_reset": bool, "no_detection_streak": int} —
+                     always returned (fix #F5), so the caller never has to
+                     special-case "what does a bare False mean here".
+
+        Timing fields in `result` (fix #F1 — always genuinely measured,
+        never a placeholder):
+            "pipeline_ms"   : FeaturePipeline preprocessing time for this
+                               call (present only when a forward pass ran).
+            "inference_ms"  : model forward-pass time for this call
+                               (present only when a forward pass ran).
         """
         if not np.any(landmarks_225):
             self._no_detection_streak += 1
@@ -789,22 +861,31 @@ class GestureStreamSession:
         # zero-fill is semantic (Stage 3 convention), not noise to filter.
         self._buffer.add_frame(landmarks_225)
 
+        event: Dict[str, Any] = {
+            "auto_reset": False,
+            "no_detection_streak": self._no_detection_streak,
+        }
+
         if (
             self._auto_reset_threshold is not None
             and self._no_detection_streak >= self._auto_reset_threshold
         ):
             self.reset()
-            return None, True
+            event["auto_reset"] = True
+            return None, event
 
         if not self._buffer.is_ready():
-            return None, False
+            return None, event
 
         raw_seq = self._buffer.get_array()
-        features_2d = self.predictor.pipeline(raw_seq, training=False)
 
-        t0 = time.perf_counter()
+        t_pipe = time.perf_counter()
+        features_2d = self.predictor.pipeline(raw_seq, training=False)
+        pipeline_ms = (time.perf_counter() - t_pipe) * 1000.0
+
+        t_inf = time.perf_counter()
         raw_probs_batch = self.predictor(features_2d, training=False)  # (1, n_classes)
-        inference_ms = (time.perf_counter() - t0) * 1000.0
+        inference_ms = (time.perf_counter() - t_inf) * 1000.0
 
         raw_probs = np.asarray(raw_probs_batch[0], dtype=np.float32)
         raw_confidence = float(raw_probs.max())
@@ -837,13 +918,15 @@ class GestureStreamSession:
             "is_stable": is_stable,
             "is_high_risk_class": sign_name in _HIGH_RISK_SIGNS,
             "n_frames_input": self._seq_len,
-            "inference_latency_ms": round(inference_ms, 3),
+            "pipeline_ms": round(pipeline_ms, 3),
+            "inference_ms": round(inference_ms, 3),
+            "inference_latency_ms": round(pipeline_ms + inference_ms, 3),
             "frames_in_buffer": self._buffer.frames_accumulated(),
         }
-        return result, False
+        return result, event
 
     def set_smoother_window(self, window: int) -> int:
-        """Critical review #10 — validated, clamped smoother window change."""
+        """Validated, clamped smoother window change."""
         window = max(_SMOOTHER_WINDOW_MIN, min(_SMOOTHER_WINDOW_MAX, int(window)))
         if window != self._smoother.window:
             self._smoother = PredictionSmoother(
@@ -903,6 +986,12 @@ class HUDRenderer:
 
         display_result = frozen_result if frozen_result is not None else result
 
+        # Fix #F4: skeleton landmarks/meta are read from the SAME source the
+        # caller used to build `display_result` — when frozen, `meta` and
+        # `latest_raw_landmarks` are expected to be the frozen snapshot
+        # (main() now passes the frozen copies explicitly while frozen,
+        # rather than relying on the live variables having implicitly
+        # stopped advancing because the extraction block was skipped).
         if (
             show_skeleton
             and meta.get("n_hands", 0) > 0
@@ -1177,6 +1266,28 @@ class HUDRenderer:
 
 
 # =============================================================================
+# Camera enumeration utility (fix #F6)
+# =============================================================================
+
+def _list_cameras(max_index: int = 8) -> List[int]:
+    """
+    Probe camera indices [0, max_index) and return those that open AND
+    deliver at least one frame. Used only by --list-cameras; not called in
+    the normal startup path (keeps normal startup fast — opening N cameras
+    just to enumerate them would add real latency every run).
+    """
+    found: List[int] = []
+    for idx in range(max_index):
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                found.append(idx)
+        cap.release()
+    return found
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1202,6 +1313,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g_cam.add_argument("--no-flip", action="store_true",
                         help="Disable mirror flip (default: enabled for natural feel). "
                              "Also flips the handedness mapping convention — see HandsExtractor.")
+    g_cam.add_argument("--list-cameras", action="store_true",
+                        help="Probe camera indices 0-7, print which ones deliver "
+                             "frames, and exit without starting the demo.")
 
     g_model = p.add_argument_group("model")
     g_model.add_argument("--threshold", type=float, default=None,
@@ -1268,6 +1382,16 @@ def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    if args.list_cameras:
+        print("Probing camera indices 0-7 ...")
+        found = _list_cameras()
+        if found:
+            print(f"  Cameras delivering frames: {found}")
+            print(f"  Example: python {Path(__file__).name} --camera {found[0]}")
+        else:
+            print("  No working camera found in range 0-7.")
+        return 0
+
     args.smoother = max(_SMOOTHER_WINDOW_MIN, min(_SMOOTHER_WINDOW_MAX, args.smoother))
     args.auto_reset = max(1, args.auto_reset)
     args.debounce = max(1, args.debounce)
@@ -1291,6 +1415,10 @@ def main() -> int:
             display_threshold=args.threshold,
             calibration_report_path=calib_path,
         )
+        # Resolved ONCE, here, to seed the session (fix #F2). From this point
+        # forward, `current_threshold` (a local in this function) is the
+        # single source of truth; predictor.display_threshold is never read
+        # again, since it is read-only and cannot reflect runtime changes.
         resolved_threshold = (
             args.threshold if args.threshold is not None else predictor.display_threshold
         )
@@ -1337,6 +1465,7 @@ def main() -> int:
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"\n  X  Camera {args.camera} not available.", file=sys.stderr)
+        print("     Try: python src/demo/webcam_demo.py --list-cameras", file=sys.stderr)
         extractor.close()
         predictor.close()
         return 1
@@ -1349,13 +1478,34 @@ def main() -> int:
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f" OK  ({actual_w}x{actual_h})")
 
+    # First-frame sanity check (fix #F6): the single most common "demo
+    # doesn't work" failure mode is a camera that *opens* successfully but
+    # never delivers a frame (wrong backend, OS permission prompt still
+    # pending, device claimed by another process). Catch it here with a
+    # clear message rather than letting the main loop's retry/give-up logic
+    # silently eat 5 seconds before reporting the same root cause.
+    _first_ok, _first_frame = cap.read()
+    if not _first_ok:
+        print(
+            f"\n  X  Camera {args.camera} opened but delivered no frame on "
+            "the first read. This usually means another application has "
+            "the camera open, an OS permission prompt is pending, or the "
+            "wrong camera index was selected.", file=sys.stderr,
+        )
+        print("     Try: python src/demo/webcam_demo.py --list-cameras", file=sys.stderr)
+        cap.release()
+        extractor.close()
+        predictor.close()
+        return 1
+
     writer: Optional[cv2.VideoWriter] = None
+    record_path: Optional[Path] = None
     if args.record:
-        rec_path = Path(args.record)
-        rec_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path = Path(args.record)
+        record_path.parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(rec_path), fourcc, 30.0, (actual_w, actual_h))
-        print(f"  Recording -> {rec_path}")
+        writer = cv2.VideoWriter(str(record_path), fourcc, 30.0, (actual_w, actual_h))
+        print(f"  Recording -> {record_path}")
 
     _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1366,37 +1516,90 @@ def main() -> int:
     show_skeleton = not args.no_skeleton
     is_paused = False
     frozen_result: Optional[Dict[str, Any]] = None
+    # Fix #F4: explicit frozen snapshots of meta/landmarks, separate from the
+    # live (still-being-overwritten-while-paused-only, never-while-frozen)
+    # working variables below.
+    frozen_meta: Dict[str, Any] = {"n_hands": 0}
+    frozen_landmarks: Optional[np.ndarray] = None
     frame_count = 0
     consecutive_capture_failures = 0
+    reopened_once = False
     latest_result: Optional[Dict[str, Any]] = None
     latest_meta: Dict[str, Any] = {"n_hands": 0}
     latest_raw_landmarks: Optional[np.ndarray] = None
+    # Fix #F2: single source of truth for the live threshold, from here on.
     current_threshold = session.display_threshold
 
     window_name = "WLASL Gesture Recognition - Henry Otsyula"
-    session_start_t = time.perf_counter()  # critical review #5
+    session_start_t = time.perf_counter()
 
     print("\n  Demo running. Press q to quit.\n")
 
-    # ── Main loop — wrapped end-to-end in try/finally (critical review #2) ─
     exit_reason = "ok"
+    pending_first_frame: Optional[np.ndarray] = _first_frame
+
     try:
         with predictor:
             while True:
                 t_cap = time.perf_counter()
-                ret, frame = cap.read()
+                if pending_first_frame is not None:
+                    # Consume the frame already read during the sanity check
+                    # above instead of discarding it.
+                    ret, frame = True, pending_first_frame
+                    pending_first_frame = None
+                else:
+                    ret, frame = cap.read()
+
                 if not ret:
                     consecutive_capture_failures += 1
                     logger.warning(
                         "Frame capture failed (%d/%d consecutive)",
                         consecutive_capture_failures, MAX_CONSECUTIVE_CAPTURE_FAILURES,
                     )
-                    if consecutive_capture_failures >= MAX_CONSECUTIVE_CAPTURE_FAILURES:
+                    if (
+                        consecutive_capture_failures == MAX_CONSECUTIVE_CAPTURE_FAILURES
+                        and not reopened_once
+                    ):
+                        # One real reconnect attempt: release and reopen the
+                        # device. A bare retry-read loop cannot recover from
+                        # a USB device that was unplugged and replugged,
+                        # since the original VideoCapture handle is dead.
                         print(
-                            "\n  X  Camera appears disconnected "
-                            f"({MAX_CONSECUTIVE_CAPTURE_FAILURES} consecutive failed reads). "
-                            "Exiting.", file=sys.stderr,
+                            f"\n  !  {MAX_CONSECUTIVE_CAPTURE_FAILURES} consecutive "
+                            f"failed reads — attempting to reopen camera "
+                            f"{args.camera}...", file=sys.stderr,
                         )
+                        cap.release()
+                        time.sleep(0.5)
+                        cap = cv2.VideoCapture(args.camera)
+                        if cap.isOpened():
+                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            print("  !  Camera reopened — resuming.", file=sys.stderr)
+                        else:
+                            print("  !  Reopen failed — camera unavailable.", file=sys.stderr)
+                        reopened_once = True
+                        consecutive_capture_failures = 0
+                        time.sleep(0.01)
+                        continue
+                    if (
+                        reopened_once
+                        and consecutive_capture_failures >= MAX_CONSECUTIVE_FAILURES_AFTER_REOPEN
+                    ):
+                        print(
+                            "\n  X  Camera still unavailable after reopen "
+                            f"({MAX_CONSECUTIVE_FAILURES_AFTER_REOPEN} more consecutive "
+                            "failed reads). Exiting.", file=sys.stderr,
+                        )
+                        exit_reason = "camera_lost"
+                        break
+                    if (
+                        not reopened_once
+                        and consecutive_capture_failures >= MAX_CONSECUTIVE_CAPTURE_FAILURES
+                    ):
+                        # Shouldn't normally reach here (handled above), but
+                        # guards against a future edit changing the ordering.
                         exit_reason = "camera_lost"
                         break
                     time.sleep(0.01)
@@ -1409,47 +1612,55 @@ def main() -> int:
                 fps_tracker.record("capture", (time.perf_counter() - t_cap) * 1000)
                 frame_count += 1
 
-                # Critical review #19: freeze halts the ML pipeline exactly
-                # like pause does, not just the HUD overlay.
+                # Freeze halts the entire ML pipeline exactly like pause
+                # does — landmarks/meta are simply not refreshed this frame.
                 if not is_paused and frozen_result is None:
                     t_mp = time.perf_counter()
                     landmarks_225, meta = extractor.extract(frame)
                     fps_tracker.record("mediapipe", (time.perf_counter() - t_mp) * 1000)
 
-                    # Critical review #11: stored by reference, never mutated
-                    # downstream (read-only for skeleton drawing; FrameBuffer
-                    # copies internally via astype(copy=False) on an already
-                    # float32 array, which is a no-op view, not a mutation).
                     latest_raw_landmarks = landmarks_225
                     latest_meta = meta
 
-                    t_pipe_inf = time.perf_counter()
-                    latest_result, auto_reset_fired = session.update(landmarks_225)
-                    elapsed_pipe_inf_ms = (time.perf_counter() - t_pipe_inf) * 1000.0
-                    if latest_result is not None:
-                        fps_tracker.record("pipeline", 0.0)  # folded into "inference" below
-                        fps_tracker.record(
-                            "inference", latest_result.get("inference_latency_ms", elapsed_pipe_inf_ms)
-                        )
-                    else:
-                        fps_tracker.record("pipeline", elapsed_pipe_inf_ms)
-                        fps_tracker.record("inference", 0.0)
+                    latest_result, event = session.update(landmarks_225)
 
-                    if auto_reset_fired:
+                    # Fix #F1: record only genuinely measured stage timings,
+                    # taken directly from the session's own measurements —
+                    # never a synthetic 0.0 for "the stage that didn't run".
+                    if latest_result is not None:
+                        fps_tracker.record("pipeline", latest_result["pipeline_ms"])
+                        fps_tracker.record("inference", latest_result["inference_ms"])
+                    # else: buffer still filling or just auto-reset — no
+                    # forward pass happened this frame, so nothing is
+                    # recorded for "pipeline"/"inference" at all (not even
+                    # a placeholder). stage_median() correctly reflects only
+                    # frames where the stage actually ran.
+
+                    # Fix #F5: structured event instead of a bare bool.
+                    if event["auto_reset"]:
                         pred_history.update(None)  # do not corrupt debounce on a hard reset
                         logger.info(
                             "Auto-reset fired after %d consecutive no-detection frames.",
-                            args.auto_reset,
+                            event["no_detection_streak"],
                         )
 
                     pred_history.update(latest_result)
 
                 t_hud = time.perf_counter()
                 if show_hud:
+                    # Fix #F4: while frozen, the HUD renders from the frozen
+                    # snapshot for landmarks/meta as well as for the result,
+                    # so all three stay mutually consistent by construction
+                    # rather than by relying on the extraction block being
+                    # skipped.
+                    render_meta = frozen_meta if frozen_result is not None else latest_meta
+                    render_landmarks = (
+                        frozen_landmarks if frozen_result is not None else latest_raw_landmarks
+                    )
                     frame = hud.render(
                         frame=frame,
                         result=latest_result,
-                        meta=latest_meta,
+                        meta=render_meta,
                         history=pred_history,
                         fps_tracker=fps_tracker,
                         frames_buffered=session.frames_buffered,
@@ -1461,7 +1672,7 @@ def main() -> int:
                         is_paused=is_paused,
                         is_frozen=frozen_result is not None,
                         frozen_result=frozen_result,
-                        latest_raw_landmarks=latest_raw_landmarks,
+                        latest_raw_landmarks=render_landmarks,
                     )
                 fps_tracker.record("hud", (time.perf_counter() - t_hud) * 1000)
 
@@ -1473,10 +1684,12 @@ def main() -> int:
                 if frame_count % 150 == 0:
                     logger.info(
                         "FPS=%.1f | buffered=%d/%d | no_detect_streak=%d | "
-                        "session_signs=%d | mp_median=%.0fms | inf_median=%.0fms",
+                        "session_signs=%d | mp_median=%.0fms | inf_median=%.0fms | "
+                        "pipe_median=%.0fms",
                         fps_tracker.fps, session.frames_buffered, session.sequence_length,
                         session.no_detection_streak, pred_history.session_count,
                         fps_tracker.stage_median("mediapipe"), fps_tracker.stage_median("inference"),
+                        fps_tracker.stage_median("pipeline"),
                     )
 
                 key = cv2.waitKey(1) & 0xFF
@@ -1489,6 +1702,8 @@ def main() -> int:
                     pred_history.reset()  # hard reset — clears session stats too
                     latest_result = None
                     frozen_result = None
+                    frozen_meta = {"n_hands": 0}
+                    frozen_landmarks = None
                     print(f"  [reset] Hard reset at frame {frame_count}")
 
                 elif key == ord("s"):
@@ -1511,9 +1726,21 @@ def main() -> int:
                 elif key == ord(" "):
                     if frozen_result is not None:
                         frozen_result = None
+                        frozen_meta = {"n_hands": 0}
+                        frozen_landmarks = None
                         print("  [freeze] Unfrozen — ML pipeline resumed")
                     elif latest_result is not None:
+                        # Fix #F4: snapshot result, meta, AND landmarks
+                        # together, atomically, so the HUD's skeleton can
+                        # never drift from the frozen prediction even if a
+                        # future refactor changes where extraction happens
+                        # relative to this block.
                         frozen_result = dict(latest_result)
+                        frozen_meta = dict(latest_meta)
+                        frozen_landmarks = (
+                            latest_raw_landmarks.copy()
+                            if latest_raw_landmarks is not None else None
+                        )
                         print(f"  [freeze] Frozen: {frozen_result.get('sign')} "
                               f"({frozen_result.get('confidence', 0):.0%}) — ML pipeline halted")
 
@@ -1543,17 +1770,20 @@ def main() -> int:
         traceback.print_exc()
         exit_reason = "error"
     finally:
-        # Critical review #2 — guaranteed cleanup regardless of how the
-        # loop above exited (normal quit, camera loss, exception, Ctrl+C).
+        # Guaranteed cleanup regardless of how the loop above exited (normal
+        # quit, camera loss, exception, Ctrl+C).
         cap.release()
         if writer is not None:
             writer.release()
-            print(f"\n  Recording saved -> {args.record}")
+            print(f"\n  Recording saved -> {record_path}")
         cv2.destroyAllWindows()
         extractor.close()
 
     elapsed_s = max(1e-6, time.perf_counter() - session_start_t)
-    avg_fps = frame_count / elapsed_s  # critical review #5 — true session average, not rolling
+    avg_fps = frame_count / elapsed_s  # true session average, not rolling
+
+    breakdown = fps_tracker.breakdown
+    most_predicted = pred_history.most_predicted(5)
 
     print(f"\n{'=' * 64}")
     print("  SESSION SUMMARY")
@@ -1563,19 +1793,53 @@ def main() -> int:
     print(f"  Session duration : {elapsed_s:.1f} s")
     print(f"  Average FPS      : {avg_fps:.1f}")
     print(f"  Signs predicted  : {pred_history.session_count}")
-    most_predicted = pred_history.most_predicted(5)
     if most_predicted:
         print("  Top predictions  :")
         for sign_name, cnt in most_predicted:
             bar = "#" * min(cnt, 20)
             print(f"    {sign_name:<14} {cnt:>4}  {bar}")
-    breakdown = fps_tracker.breakdown
     print(f"  {'-' * 60}")
-    print("  Pipeline latency (median):")
+    print("  Pipeline latency (median, genuine measurements only):")
     for stage, ms in breakdown.items():
-        if ms > 0:
-            print(f"    {stage:<12} {ms:>6.1f} ms")
+        n_samples = fps_tracker.stage_sample_count(stage)
+        if n_samples > 0:
+            print(f"    {stage:<12} {ms:>6.1f} ms   (n={n_samples})")
     print(f"{'=' * 64}\n")
+
+    # Fix #F7: optional session-summary sidecar next to a recording, so the
+    # numbers printed above survive independently of the terminal scrollback
+    # when attaching objective metrics to a demo recording in the README.
+    if record_path is not None:
+        sidecar = record_path.with_suffix("").with_name(record_path.stem + ".session.json")
+        try:
+            with open(sidecar, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "exit_reason": exit_reason,
+                        "frames_processed": frame_count,
+                        "session_duration_s": round(elapsed_s, 2),
+                        "average_fps": round(avg_fps, 2),
+                        "signs_predicted": pred_history.session_count,
+                        "session_counts": pred_history.session_counts,
+                        "pipeline_latency_ms_median": {
+                            stage: round(ms, 2)
+                            for stage, ms in breakdown.items()
+                            if fps_tracker.stage_sample_count(stage) > 0
+                        },
+                        "model": {
+                            "model_type": predictor.model_type,
+                            "val_macro_f1": _VAL_MACRO_F1,
+                            "test_macro_f1": _TEST_MACRO_F1,
+                            "tflite_size_mb": _MODEL_SIZE_MB,
+                            "display_threshold_final": current_threshold,
+                            "smoother_window_final": session.smoother_window,
+                        },
+                    },
+                    f, indent=2,
+                )
+            print(f"  Session summary -> {sidecar}\n")
+        except OSError as exc:
+            logger.warning("Could not write session summary sidecar: %s", exc)
 
     return 0 if exit_reason in ("ok", "keyboard_interrupt") else 1
 
