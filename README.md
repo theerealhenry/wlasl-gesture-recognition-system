@@ -4,7 +4,9 @@
 <p align="center">
   <img src="reports/figures/demo_placeholder.png" alt="Real-time gesture recognition demo" width="720"/>
   <br/>
-  <em>Real-time BiLSTM inference on MediaPipe Holistic landmarks — 68K parameters, CPU-only, &lt;50ms latency</em>
+  <em>Real-time BiLSTM inference on MediaPipe Hands landmarks — 68,771 parameters, 0.16 MB
+  TFLite, CPU-only, ~47ms model+pipeline latency, live webcam HUD with calibrated confidence
+  display and confusable-pair warnings.</em>
 </p>
 
 <p align="center">
@@ -13,9 +15,19 @@
   <img src="https://img.shields.io/badge/MediaPipe-0.10.14-00897B?logo=google&logoColor=white" alt="MediaPipe"/>
   <img src="https://img.shields.io/badge/MLflow-2.14.3-0194E2?logo=mlflow&logoColor=white" alt="MLflow"/>
   <img src="https://img.shields.io/badge/OmegaConf-2.3.0-blueviolet" alt="OmegaConf"/>
-  <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker"/>
+  <img src="https://img.shields.io/badge/TFLite-0.1596_MB-success?logo=tensorflow&logoColor=white" alt="TFLite size"/>
+  <img src="https://img.shields.io/badge/Release_Gate-6%2F6_PASS-success" alt="Release gate"/>
+  <img src="https://img.shields.io/badge/Stages-1--9_complete-success" alt="Pipeline stages"/>
   <img src="https://github.com/HenryOtsyula/wlasl-gesture-recognition/actions/workflows/ci.yml/badge.svg" alt="CI"/>
   <img src="https://img.shields.io/badge/license-MIT-brightgreen" alt="MIT License"/>
+</p>
+
+<p align="center">
+  <strong>Pipeline status: Stages 1–9 complete</strong> — data ingestion through a verified
+  TFLite export and a working real-time webcam demo. Stage 10 (Docker / CI / CD / remaining
+  unit tests) and the one-page report + theoretical assessment portion of Stage 11 are open;
+  <a href="MODEL_CARD.md">MODEL_CARD.md</a> and <a href="LIMITATIONS.md">LIMITATIONS.md</a> are
+  complete and authoritative as of this README.
 </p>
 
 ---
@@ -23,7 +35,7 @@
 ## Table of Contents
 
 1. [Project Story and Scientific Framing](#1-project-story-and-scientific-framing)
-2. [Problem Statement](#2-problem-statement)
+2. [Problem Statement and Objectives](#2-problem-statement-and-objectives)
 3. [Key Results](#3-key-results)
 4. [System Architecture](#4-system-architecture)
 5. [Project Structure](#5-project-structure)
@@ -31,167 +43,255 @@
 7. [Pipeline Stages](#7-pipeline-stages)
 8. [Models and Experiments](#8-models-and-experiments)
 9. [Findings and Ablation Studies](#9-findings-and-ablation-studies)
-10. [Quickstart — Reproduce Everything](#10-quickstart--reproduce-everything)
-11. [Docker](#11-docker)
-12. [Experiment Tracking with MLflow](#12-experiment-tracking-with-mlflow)
-13. [Real-Time Demo](#13-real-time-demo)
-14. [KSL Adaptation Roadmap](#14-ksl-adaptation-roadmap)
-15. [Limitations](#15-limitations)
-16. [Contributing](#16-contributing)
-17. [License](#17-license)
+10. [Stage 6 — Evaluation, Calibration, and Interpretability](#10-stage-6--evaluation-calibration-and-interpretability)
+11. [Stage 7 — Unified Inference Engine](#11-stage-7--unified-inference-engine)
+12. [Stage 8 — TFLite Export and Release Gate](#12-stage-8--tflite-export-and-release-gate)
+13. [Stage 9 — Real-Time Webcam Demo](#13-stage-9--real-time-webcam-demo)
+14. [Quickstart — Reproduce Everything](#14-quickstart--reproduce-everything)
+15. [Docker](#15-docker)
+16. [Experiment Tracking with MLflow](#16-experiment-tracking-with-mlflow)
+17. [KSL Adaptation Roadmap](#17-ksl-adaptation-roadmap)
+18. [Limitations](#18-limitations)
+19. [Project Status and Remaining Work](#19-project-status-and-remaining-work)
+20. [Contributing](#20-contributing)
+21. [License and Citation](#21-license-and-citation)
 
 ---
 
 ## 1. Project Story and Scientific Framing
 
-Most sign language recognition research defaults to raw video pipelines fed into large convolutional architectures — accurate in controlled lab conditions, but computationally prohibitive on the edge devices that real signers actually carry. A 200 MB vision model running at 4 FPS on a mid-range smartphone is not a communication tool. It is a proof of concept.
+Most sign language recognition research defaults to raw video pipelines fed into large
+convolutional architectures — accurate in controlled lab conditions, but computationally
+prohibitive on the edge devices that real signers actually carry. A 200 MB vision model
+running at 4 FPS on a mid-range smartphone is not a communication tool; it is a proof of
+concept.
 
-This project investigates a different hypothesis: **how far can a lightweight, landmark-based sequence model go?**
+This project investigates a different hypothesis: **how far can a lightweight, landmark-based
+sequence model go, end-to-end — from raw video, through training and rigorous evaluation, to
+a verified mobile-deployment artefact and a working real-time demo?**
 
-The core insight is that gesture recognition does not require pixels. A signer's intent is fully encoded in the *structure* of their hands and the *motion* of their body over time — both representable as compact sequences of skeletal coordinates. By replacing raw video frames with structured landmark representations from MediaPipe Holistic, and replacing heavy vision backbones with temporal sequence models (BiLSTM), this pipeline builds a gesture recognition system that:
+The core insight is that gesture recognition does not require pixels. A signer's intent is
+largely encoded in the *structure* of their hands and the *motion* of their hands over time —
+both representable as compact sequences of skeletal coordinates. By replacing raw video frames
+with structured landmark representations from MediaPipe, and replacing heavy vision backbones
+with a small temporal sequence model (a 2-layer BiLSTM), this pipeline builds a gesture
+recognition system that:
 
-- **runs in real time on a CPU** with no GPU requirement
-- **fits in under 1 MB** as a quantised TFLite file (pre-quantisation: 0.262 MB)
-- achieves **val macro-F1 of 0.60** on a signer-independent held-out set across 35 ASL signs
-- **generalises to entirely unseen signers** — evaluated under zero signer overlap between splits, the most conservative possible test
+- **runs in real time on a CPU**, no GPU required — the deployed TFLite artefact runs **82×
+  faster** than the equivalent Keras model on the same CPU;
+- **fits in 0.1596 MB** as a verified, quantised TFLite file — **1.6% of the project's 10 MB
+  budget**;
+- achieves **0.5916 val macro-F1 / 0.4867 test macro-F1** (TFLite, the deployed artefact) on a
+  signer-independent held-out set across 35 ASL signs;
+- **generalises to entirely unseen signers** — evaluated under zero signer overlap between
+  splits, the most conservative possible test, with the test set evaluated exactly once and
+  never used for any selection decision;
+- ships as a **working, instrumented, real-time webcam demo** with a calibration-aware
+  confidence display, top-3 confusable-pair warnings, and a session-summary report — not a
+  notebook artefact.
 
-The project is simultaneously a technical investigation, a production ML engineering demonstration, and a direct precursor to Kenyan Sign Language (KSL) recognition — a domain where landmark-based, low-data approaches are not just a design preference but a practical necessity.
+The project is simultaneously a technical investigation, a senior-level production ML
+engineering demonstration, and a direct precursor to Kenyan Sign Language (KSL) recognition —
+a domain where landmark-based, low-data approaches are not a design preference but a practical
+necessity. Every honest limitation of this WLASL-35 system — and there are several worth taking
+seriously — is documented in detail in **[`LIMITATIONS.md`](LIMITATIONS.md)**, which this
+README treats as the project's source of truth for any accuracy or readiness claim.
 
 ---
 
-## 2a. Problem Statement
+## 2. Problem Statement and Objectives
 
-Sign language is the primary mode of communication for tens of millions of deaf and hard-of-hearing people worldwide, yet the vast majority of digital systems cannot interpret it. Automated gesture recognition offers a path toward accessibility, but existing approaches either demand specialist hardware, rely on models too large for mobile deployment, or are trained under evaluation conditions (random splits, seen-signer testing) that inflate reported accuracy beyond what real-world deployment would achieve.
+### Problem Statement
 
-This project addresses the following core question:
+Sign language is the primary mode of communication for tens of millions of deaf and
+hard-of-hearing people worldwide, yet the vast majority of digital systems cannot interpret it.
+Automated gesture recognition offers a path toward accessibility, but existing approaches either
+demand specialist hardware, rely on models too large for mobile deployment, or are trained under
+evaluation conditions (random splits, seen-signer testing) that inflate reported accuracy beyond
+what real-world deployment would achieve.
 
-> **Can a lightweight, landmark-based temporal model trained on the publicly available WLASL dataset reliably classify 35 American Sign Language signs across unseen signers, at inference speeds and model sizes compatible with CPU-only mobile deployment?**
+> **Can a lightweight, landmark-based temporal model trained on the publicly available WLASL
+> dataset reliably classify 35 American Sign Language signs across unseen signers, at inference
+> speeds and model sizes compatible with CPU-only mobile deployment — and can the entire
+> pipeline, from raw video to a live deployed demo, be built to senior production-ML standards?**
 
-The project is further motivated by its direct relevance to Kenyan Sign Language (KSL) recognition — a domain with scarce labelled data, limited compute budgets, and a strong practical need for on-device, offline-capable inference across a 500-sign vocabulary.
+This is further motivated by direct relevance to Kenyan Sign Language (KSL) recognition — a
+domain with scarce labelled data, limited compute budgets, and a strong practical need for
+on-device, offline-capable inference across a 500-sign vocabulary (see
+[Section 17](#17-ksl-adaptation-roadmap)).
 
----
+### Objectives — status
 
-## 2b. Objectives
-
-### Primary Objectives
-- Build a complete, reproducible end-to-end ML pipeline from raw video to a deployed TFLite model
-- Extract MediaPipe Holistic landmarks (hands + pose, 225 values per frame) from WLASL video clips across **35 selected signs**
-- Train and rigorously compare multiple temporal architectures: Dense baseline, LSTM, GRU, BiLSTM
-- Achieve **≥ 70% signer-independent validation accuracy**
-- Export the best-performing model as a quantised TFLite file and verify accuracy retention post-quantisation
-- Deploy a real-time webcam inference demo with live prediction overlay, confidence HUD, and temporal smoothing
-
-### Secondary Objectives
-- Conduct formal ablation studies across augmentation strategies, sequence lengths, and landmark configurations
-- Perform SHAP-based interpretability analysis to identify which frames and landmarks drive model predictions
-- Benchmark end-to-end inference latency and model size across all model variants
-- Analyse signer-independent generalisation — the most honest evaluation of real-world deployability
-- Document dataset bias, failure modes, and confidence calibration behaviour
-- Provide a detailed KSL adaptation roadmap grounded in the differences between ASL and KSL as linguistic systems
-- Produce a portfolio-quality repository demonstrating senior-level ML engineering practices: Docker, CI/CD, MLflow, OmegaConf config management, structured logging, and a unified inference engine
+| Objective | Status |
+|---|---|
+| Build a complete, reproducible end-to-end ML pipeline from raw video to a deployed TFLite model and live demo | ✅ **Done** — Stages 1–9 |
+| Extract MediaPipe landmarks across 35 selected WLASL signs | ✅ **Done** — 339 clips, schema v1.2 |
+| Train and rigorously compare multiple temporal architectures (Dense, LSTM, GRU, BiLSTM) | ✅ **Done** — 23 MLflow-tracked runs |
+| Achieve ≥70% signer-independent validation macro-F1 | ✗ **Not met** — 0.6011 achieved (Keras); honest, data-constrained ceiling, see [L8](LIMITATIONS.md#l8) |
+| Export the champion as a quantised TFLite file and verify accuracy retention | ✅ **Done** — release gate 6/6 PASS, see [Section 12](#12-stage-8--tflite-export-and-release-gate) |
+| Deploy a real-time webcam inference demo with live overlay, calibrated confidence, and temporal smoothing | ✅ **Done** — see [Section 13](#13-stage-9--real-time-webcam-demo) |
+| Formal ablation studies (augmentation, sequence length, landmark configuration) | ✅ **Done** — 23-run registry, [Section 8](#8-models-and-experiments) |
+| SHAP / Gradient×Input interpretability analysis | ✅ **Done** — [Section 10](#10-stage-6--evaluation-calibration-and-interpretability) |
+| Benchmark latency and model size across all model variants | ✅ **Done** — Stage 6 + Stage 8 release-gate benchmarks |
+| Signer-independent generalisation analysis | ✅ **Done** — per-signer accuracy with Wilson-score CIs |
+| Document dataset bias, failure modes, and confidence calibration | ✅ **Done** — [`LIMITATIONS.md`](LIMITATIONS.md), 18 documented limitations |
+| KSL adaptation roadmap | ✅ **Done** — [Section 17](#17-ksl-adaptation-roadmap) |
+| Docker, CI/CD, full test suite, one-page report, theoretical assessment | 🔜 **Open** — Stage 10 / remainder of Stage 11, see [Section 19](#19-project-status-and-remaining-work) |
 
 ---
 
 ## 3. Key Results
 
-### Champion Model: `bilstm_hands_only_v4_aug`
+### Champion model: `bilstm_hands_only_v4_aug`
 
-> BiLSTM (2-layer) · seq\_len=100 · hands-only landmarks (126-dim) · spatial-temporal augmentation · signer-independent evaluation
+> BiLSTM (2-layer, 32 units/direction) · seq_len=100 · hands-only landmarks (126-dim) ·
+> spatial-temporal augmentation · signer-independent evaluation · exported and release-gated
+> to TFLite
 
-| Metric | Value |
-|--------|-------|
-| **val macro-F1** (sklearn, zero\_division=0) | **0.6011** |
-| val accuracy | 0.5769 |
-| Minimum viability threshold (≥ 0.60) | ✓ Met |
-| Target threshold (≥ 0.70) | ✗ Not met (data-constrained ceiling ~0.60–0.65) |
-| Architecture | BiLSTM, 2 layers, 32 units/direction |
+| Metric | Keras SavedModel | **TFLite (deployed artefact)** |
+|---|---|---|
+| **Val macro-F1** | 0.6011 (90% bootstrap CI [0.5534, 0.6410]) | **0.5916** |
+| Val accuracy | 0.5769 | 0.5769 |
+| **Test macro-F1** (evaluated exactly once) | 0.4581 (90% CI [0.3935, 0.5076]) | **0.4867** |
+| Test accuracy | 0.4902 | 0.5098 |
+| Val→Test gap | 14.30 pp | 10.49 pp |
+| Argmax agreement (Keras ↔ TFLite) | — | 98.08% (val) / 98.04% (test) |
+
+| Property | Value |
+|---|---|
+| Architecture | BiLSTM, 2 layers, 32 units/direction (concat width 64) |
 | Total parameters | 68,771 |
-| Estimated weight size (float32) | 0.262 MB |
-| Input feature config | hands-only — 126 dims (left hand 63 + right hand 63) |
+| Pre-quantisation weight size | 0.262 MB |
+| **Deployed TFLite size** | **0.1596 MB** (1.6% of the 10 MB project target) |
+| Quantisation | Dynamic-range (`tf.lite.Optimize.DEFAULT`), `SELECT_TF_OPS` flex delegate required for `Bidirectional(LSTM)` |
+| Input feature config | hands-only — 126 dims (left hand 63 + right hand 63), pose never used |
 | Sequence length | 100 frames |
 | Augmentation | spatial-temporal (5-transform chain) |
 | Best epoch | 171 of 221 trained |
-| Early stopping patience | 50 (monitor: val\_macro\_f1) |
 | Training clips | 236 · 31 signers · zero signer overlap |
-| Validation clips | 52 · 7 signers · all unseen |
+| **TFLite inference latency** | 46.86 ms median, 83.40 ms p95 (dev CPU) |
+| **Full pipeline latency** (pipeline + TFLite, excl. MediaPipe) | **47.11 ms** median — 53% headroom under the 100 ms target |
+| Keras CPU latency (reference only, not deployable) | 3,862 ms (0.26 FPS) |
+| **TFLite vs Keras speedup** | **82.4×** |
+| Calibration | **Underconfident**: mean confidence 0.5136 < mean accuracy 0.5769 (ECE = 0.2009) |
+| Calibrated display threshold | **0.35** (single source of truth: `DEFAULT_DISPLAY_THRESHOLD` in `predictor.py`) |
 
-### High-Risk Class Performance (Champion)
+### Release gate (Stage 8) — all 6 hard criteria PASSED
 
-| Class | Train clips | val F1 | Status |
-|-------|-------------|--------|--------|
-| `clothes` | 2 | 1.00 | Learned (augmentation decisive) |
-| `birthday` | 4 | 1.00 | Stable |
-| `book` | 4 | 1.00 | Learned |
-| `name` | 4 | 1.00 | Learned |
-| `think` | 3 | 0.00 | **Unlearnable at 3-clip scale** |
+| Criterion | Measured | Threshold | Result |
+|---|---|---|---|
+| Val Δ macro-F1 (Keras − TFLite) | +0.0095 | ≤ ±0.03 | ✅ PASS |
+| Test Δ macro-F1 (Keras − TFLite) | −0.0286 | ≤ ±0.03 | ✅ PASS |
+| Val argmax agreement | 98.08% | ≥ 95% | ✅ PASS |
+| TFLite file exists and is valid | True | — | ✅ PASS |
+| TFLite size | 0.1596 MB | ≤ 10 MB | ✅ PASS |
+| Full pipeline latency | 47.11 ms | ≤ 100 ms | ✅ PASS |
 
-### Total Improvement Through Ablation
+The test-split delta is *negative* — TFLite is marginally **more** accurate than Keras on test
+(only 1 of 51 clips disagrees, and TFLite gets that one right). This is attributed to
+quantisation's small weight perturbations acting as incidental regularisation on a low-margin
+decision boundary, not a genuine, reproducible quality improvement (see
+[`LIMITATIONS.md` L10](LIMITATIONS.md#l10)).
+
+### Total improvement through ablation
 
 | Checkpoint | Run | val macro-F1 | Cumulative gain |
-|------------|-----|-------------|----------------|
+|---|---|---|---|
 | Group 3 baseline | `lstm_seq60` | 0.1434 | — |
 | + seq100 | `lstm_seq100` | 0.2354 | +64% rel. |
 | + hands-only | `lstm_hands_only` | 0.4948 | +110% rel. |
 | + BiLSTM | `bilstm_hands_only` | 0.5419 | +10% rel. |
-| + augmentation (250ep) | **`bilstm_hands_only_v4_aug`** | **0.6011** | **+11% rel.** |
+| + augmentation (250 ep) | **`bilstm_hands_only_v4_aug`** | **0.6011** | **+11% rel.** |
 | **Total (baseline → champion)** | | | **+319% relative** |
+
+### Pre-committed test-set protocol
+
+The held-out test set (51 clips, 7 signers, zero overlap with train/val) was evaluated **exactly
+once**, after a formal, timestamped pre-commitment of methodology and an expected-range gate
+(see `reports/evaluation/test_precommitment_log.md`). The result, **test macro-F1 = 0.4581**
+(Keras), fell **inside** the pre-committed expected range of [0.45, 0.58], and no further tuning
+or champion re-selection was performed afterward — the methodological discipline this project
+treats as non-negotiable for any honest small-data evaluation claim.
 
 ---
 
 ## 4. System Architecture
 
 ```
-
-┌─────────────────────────────────────────────────────────────────┐
-│                         INPUT LAYER                             │
-│               Video File  ·  Webcam Stream                      │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    MEDIAPIPE HOLISTIC                           │
-│      Left Hand (21 kp) · Right Hand (21 kp) · Pose (33 kp)      │
-│                225 (x, y, z) values per frame                   │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│             FEATURE ENGINEERING PIPELINE                        │
-│    Wrist-relative normalisation  ·  Z-coord soft-clip (±0.10)   │
-│    Centre-crop / right-zero-pad to seq_len                      │
-│    Spatial + temporal augmentation  (training only)             │
-│    Landmark config selection  (hands-only · pose-only · full)   │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │  (seq_len, 126) float32
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│     TEMPORAL CLASSIFIER  —  Champion: BiLSTM                    │
-│   Masking(0.0) → BiLSTM(32/dir)×2 → Dense(32, relu) → Drop      │
-│              Softmax output  (35 classes)                       │
-│          68,771 params · 0.262 MB · ≤50ms CPU                   │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-|                                                                 |
-│                  PREDICTION SMOOTHER                            │
-|                                                                 |
-│        Majority voting (window=5) · Confidence threshold        │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        OUTPUT                                   │
-|                                                                 |
-│     Sign label · Confidence score · Top-3 predictions           │
-|                                                                 |
-│     TFLite file  ·  Real-time HUD overlay  ·  JSON metadata     │
-└─────────────────────────────────────────────────────────────────┘
-
-
+┌─────────────────────────────────────────────────────────────────────┐
+│                            INPUT LAYER                              │
+│         Video File (dataset construction)  ·  Live Webcam Stream    │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     LANDMARK EXTRACTION                             │
+│  Dataset construction (Stages 1–3): MediaPipe Holistic               │
+│  Live inference (Stage 9):          MediaPipe Hands (preferred,      │
+│                                      ~8–10ms) — Holistic fallback     │
+│                                      with pose ALWAYS zero-filled in  │
+│                                      both paths (matches training)    │
+│      Left Hand (21 kp) · Right Hand (21 kp) · [Pose discarded]       │
+│                  225 (x, y, z) raw values per frame                  │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                FEATURE ENGINEERING PIPELINE (FeaturePipeline)        │
+│   Wrist-relative normalisation  ·  Z-coord soft-clip (±0.10)         │
+│   Centre-crop / right-zero-pad to seq_len=100                        │
+│   Spatial + temporal augmentation  (training only, never inference) │
+│   Landmark config selection → hands_only (126 dims)                  │
+│   SAME pipeline instance used at training and inference — enforced  │
+│   architecturally inside GesturePredictor, not by caller convention  │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │  (100, 126) float32
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│            TEMPORAL CLASSIFIER  —  Champion: BiLSTM                  │
+│   Masking(0.0) → Bidirectional(LSTM, 32/dir) ×2 → Dense(35, softmax) │
+│           68,771 params · 0.262 MB float32 · ≤50ms CPU               │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   TFLITE EXPORT & VERIFICATION  (Stage 8)            │
+│   Dynamic-range quantisation + SELECT_TF_OPS flex delegate            │
+│   gesture_bilstm_v1.tflite — 0.1596 MB, 6/6 release-gate criteria PASS│
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│         UNIFIED INFERENCE ENGINE  —  GesturePredictor (Stage 7)      │
+│   FrameBuffer (rolling 100-frame window) → FeaturePipeline →         │
+│   model(x, training=False) → PredictionSmoother (5-frame majority    │
+│   vote + exponential confidence smoothing) → calibration-aware       │
+│   is_confident gate (threshold = 0.35)                                │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                 REAL-TIME WEBCAM DEMO  (Stage 9)                     │
+│   GestureStreamSession (composes GesturePredictor's PUBLIC API        │
+│   with its own FrameBuffer/PredictionSmoother for the MediaPipe       │
+│   Hands extractor) → ASCII HUD: sign + confidence bar, top-3 panel,  │
+│   stability dot, confusable-pair / high-risk badges, FPS, session     │
+│   summary on exit                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-> **Full system architecture diagram:** `reports/figures/system_architecture.png`
+> Full system architecture diagram (rendered): `reports/figures/system_architecture.png`
+
+### A note on the two extraction paths
+
+The dataset used to **train** the champion was built with **MediaPipe Holistic** (Stages 1–3).
+The **live webcam demo** prefers **MediaPipe Hands** instead, because it is ~2× faster
+(~8–10 ms vs. ~18 ms per frame) and the champion never uses pose landmarks regardless. Both
+paths are constructed so the **model receives an identical input distribution** either way —
+the pose slot `[126:225]` is computed but never reaches the model, and the Holistic fallback
+path used if MediaPipe Hands fails to initialise also zero-fills pose rather than passing real
+values through. See [`LIMITATIONS.md` L14](LIMITATIONS.md#l14) for the residual,
+lower-probability risk this leaves open.
 
 ---
 
@@ -199,281 +299,102 @@ The project is further motivated by its direct relevance to Kenyan Sign Language
 
 ```
 wlasl-gesture-recognition/
-
 │
-
 ├── data/
-|
-│   ├── raw/                              # Downloaded WLASL videos — gitignored
-|
-│   ├── landmarks/                        # Cached .npy landmark arrays — gitignored
-|
-│   │   ├── train/<sign>/<video_id>.npy   ✅ 236 clips extracted
-|
-│   │   ├── val/<sign>/<video_id>.npy     ✅ 52 clips
-|
-│   │   ├── test/<sign>/<video_id>.npy    ✅ 51 clips
-|
-│   │   └── landmark_inventory.csv        ✅ 339 rows, schema v1.2
-|
+│   ├── raw/                                    # Downloaded WLASL videos — gitignored
+│   ├── landmarks/                               # Cached .npy landmark arrays — gitignored
+│   │   ├── train/<sign>/<video_id>.npy          ✅ 236 clips
+│   │   ├── val/<sign>/<video_id>.npy            ✅ 52 clips
+│   │   ├── test/<sign>/<video_id>.npy           ✅ 51 clips
+│   │   └── landmark_inventory.csv               ✅ 339 rows, schema v1.2
 │   └── splits/
-|
-│       ├── train.csv                     ✅ 245 entries → 236 loaded
-|
-│       ├── val.csv                       ✅ 53 entries → 52 loaded
-|
-│       └── test.csv                      ✅ 52 entries → 51 loaded
-|
+│       ├── train.csv  val.csv  test.csv         ✅ signer-aware, zero overlap
+│       └── split_summary.json                   ✅
 │
-|
 ├── notebooks/
-|
-│   ├── 01_data_exploration.ipynb         ✅ COMPLETE — dataset EDA, bias documentation
-|
-│   ├── 02_landmark_inspection.ipynb      ✅ COMPLETE — extraction validation, schema v1.2
-|
-│   ├── 03_full_landmark_analysis.ipynb   ✅ COMPLETE — full-dataset landmark analysis
-
-│   ├── 04_feature_engineering.ipynb      ✅ COMPLETE — pipeline validation gate: PASS
-
-│   ├── 05_model_experiments.ipynb        ✅ COMPLETE — 23-run experiment analysis
-
-│   ├── 06_evaluation_error_analysis.ipynb  🔜 Stage 6
-
-│   ├── 07_tflite_verification.ipynb       🔜 Stage 8
-
-│   └── 08_interpretability_shap.ipynb     🔜 Stage 6
-
+│   ├── 01_data_exploration.ipynb                ✅
+│   ├── 02_landmark_inspection.ipynb              ✅
+│   ├── 03_full_landmark_analysis.ipynb           ✅
+│   ├── 04_feature_engineering.ipynb              ✅ gate: PASS
+│   ├── 05_model_experiments.ipynb                ✅ 23-run analysis
+│   ├── 06_evaluation_error_analysis.ipynb        ✅ confusion matrix, calibration, signer analysis
+│   ├── 07_tflite_verification.ipynb              ✅ release gate, size/accuracy/per-class figures
+│   └── 08_interpretability_shap.ipynb            ✅ frame/landmark/per-class SHAP, confusable pairs
 │
-
 ├── src/
-
 │   ├── data/
-
-│   │   ├── init.py                   ✅
-
-│   │   ├── downloader.py                 ✅ WLASL JSON manifest → video fetch
-
-│   │   ├── validator.py                  ✅ 8-point integrity validation suite
-
-│   │   └── splitter.py                   ✅ Greedy bin-packing signer-aware split
-
+│   │   ├── downloader.py  validator.py  splitter.py        ✅
 │   │
-
 │   ├── features/
-
-│   │   ├── init.py                   ✅
-
-│   │   ├── constants.py                  ✅ Schema v1.2, landmark slice constants
-
-│   │   ├── extractor.py                  ✅ MediaPipe Holistic · schema v1.2 dual-criterion
-
-│   │   ├── augmentation.py               ✅ 5-transform chain · zero-fill invariant
-
-│   │   ├── pipeline.py                   ✅ FeaturePipeline · pre_augmentation()
-
-│   │   └── dataset.py                    ✅ GestureDataset · two-phase preloading
-
+│   │   ├── constants.py  extractor.py  augmentation.py     ✅
+│   │   ├── pipeline.py  dataset.py                          ✅
 │   │
-
 │   ├── models/
-
-│   │   ├── init.py                   ✅
-
-│   │   ├── architectures.py              ✅ Dense · LSTM · GRU · BiLSTM
-
-│   │   ├── factory.py                    ✅ build_model(cfg) · pipeline shape validation
-
-│   │   └── train.py                      ✅ train_one_run() · MacroF1Evaluator · MLflow
-
+│   │   ├── architectures.py  factory.py  train.py           ✅
 │   │
-
-│   ├── evaluation/
-
-│   │   ├── init.py                   🔜 Stage 6
-
-│   │   ├── metrics.py                    🔜 confusion matrix · per-class F1
-
-│   │   ├── benchmark.py                  🔜 latency profiling · FPS · model size
-
-│   │   ├── calibration.py                🔜 reliability diagram · ECE
-
-│   │   └── signer_analysis.py            🔜 per-signer accuracy breakdown
-
+│   ├── evaluation/                                          ✅ Stage 6 — complete
+│   │   ├── metrics.py            # macro-F1, per-class metrics, bootstrap CI
+│   │   ├── benchmark.py          # latency harness, TFLiteCallable adapter
+│   │   ├── calibration.py        # reliability diagram, ECE/MCE, threshold curve
+│   │   └── signer_analysis.py    # per-signer accuracy, Wilson-score CIs
 │   │
-
-│   ├── export/
-
-│   │   ├── init.py                   🔜 Stage 8
-
-│   │   ├── convert.py                    🔜 SavedModel → TFLite + quantisation
-
-│   │   └── verify.py                     🔜 TFLite accuracy verification
-
+│   ├── export/                                              ✅ Stage 8 — complete
+│   │   ├── convert.py            # verified SavedModel → TFLite export
+│   │   └── verify.py             # accuracy verification, release gate, model metadata
 │   │
-
-│   ├── inference/
-
-│   │   ├── init.py                   🔜 Stage 7
-
-│   │   └── predictor.py                  🔜 GesturePredictor unified engine
-
+│   ├── inference/                                           ✅ Stage 7 — complete
+│   │   └── predictor.py          # GesturePredictor, FrameBuffer, PredictionSmoother
 │   │
-
-│   ├── demo/
-
-│   │   └── webcam_demo.py                🔜 Stage 9
-
+│   ├── demo/                                                ✅ Stage 9 — complete
+│   │   └── webcam_demo.py        # GestureStreamSession + live OpenCV HUD
 │   │
-
 │   └── utils/
-
-│       ├── init.py                   ✅
-
-│       ├── config.py                     ✅ OmegaConf + Pydantic v2 · config_hash
-
-│       ├── logger.py                     ✅ Structured logging · file + console
-
-│       ├── reproducibility.py            ✅ Seed management · environment metadata
-
-│       └── label_map.py                  ✅ Versioned label map · LabelMap class
-
+│       ├── config.py  logger.py  reproducibility.py  label_map.py   ✅
 │
-
 ├── pipelines/
-
-│   ├── run_preprocessing.py              ✅ Stage 1 CLI entry point
-
-│   ├── run_landmark_extraction.py        ✅ Stage 3 CLI · resumable · tqdm
-
-│   ├── run_training.py                   ✅ Stage 5 CLI · argparse · dot-notation overrides
-
-│   ├── run_all_experiments.py            ✅ Adaptive orchestrator · 23 runs
-
-│   └── run_evaluation.py                 🔜 Stage 6 CLI
-
+│   ├── run_preprocessing.py                      ✅ Stage 1
+│   ├── run_landmark_extraction.py                ✅ Stage 3
+│   ├── run_training.py  run_all_experiments.py   ✅ Stage 5
+│   ├── run_evaluation.py                         ✅ Stage 6
+│   └── run_export_verification.py               ✅ Stage 8 — CLI release-gate runner
 │
-
-├── configs/
-
-│   ├── base.yaml                         ✅ Global defaults
-
-│   ├── model/
-
-│   │   ├── dense.yaml                    ✅
-
-│   │   ├── lstm.yaml                     ✅
-
-│   │   ├── gru.yaml                      ✅
-
-│   │   └── bilstm.yaml                   ✅
-
-│   ├── data/
-
-│   │   ├── seq20.yaml  seq30.yaml        ✅
-
-│   │   ├── seq40.yaml  seq60.yaml        ✅
-
-│   │   ├── seq80.yaml  seq100.yaml       ✅
-
-│   ├── augmentation/
-
-│   │   ├── none.yaml                     ✅
-
-│   │   ├── temporal.yaml                 ✅
-
-│   │   └── spatial_temporal.yaml         ✅
-
-│   └── experiment/
-
-│       ├── baseline.yaml                 ✅
-
-│       ├── ablation_augmentation.yaml    ✅
-
-│       ├── ablation_sequence.yaml        ✅
-
-│       ├── ablation_landmarks.yaml       ✅
-
-│       └── best_model.yaml               ✅
-
+├── configs/                                       ✅ OmegaConf + Pydantic v2, complete
 │
-
 ├── tests/
-
-│   ├── test_augmentation.py              ✅ Full suite · all passing
-
-│   ├── test_pipeline.py                  ✅ All passing
-
-│   ├── test_downloader.py                🔜
-
-│   ├── test_validator.py                 🔜
-
-│   ├── test_extractor.py                 🔜
-
-│   ├── test_model_factory.py             🔜
-
-│   └── test_predictor.py                 🔜
-
+│   ├── test_augmentation.py  test_pipeline.py    ✅
+│   ├── test_predictor.py                          ✅ Stage 7 suite
+│   ├── test_tflite_export.py                      ✅ Stage 8 suite (14 tests)
+│   ├── test_downloader.py  test_validator.py
+│   ├── test_extractor.py  test_model_factory.py  🔜 Stage 10
 │
-
 ├── artifacts/
-
-│   ├── label_map_v1.json                 ✅ Schema v1.1 · 35 signs · locked
-
-│   └── experiments/                      ✅ Per-run manifests · metrics · confusion matrices
-
-│       └── bilstm_hands_only_v4_aug/     ✅ Champion run artefacts
-
+│   ├── label_map_v1.json                         ✅ 35 signs, schema v1.1, locked
+│   └── experiments/bilstm_hands_only_v4_aug/      ✅ config_snapshot.yaml, manifests, metrics
 │
-
 ├── models/
-
-│   ├── bilstm_hands_only_v4_aug_saved_model/  ✅ Champion SavedModel
-
-│   ├── bilstm_hands_only_v4_aug_best_weights/ ✅ Best-epoch weights checkpoint
-
-│   └── [22 additional SavedModel directories] ✅ All 23 ablation runs
-
+│   ├── bilstm_hands_only_v4_aug_saved_model/      ✅ Champion Keras SavedModel
+│   ├── gesture_bilstm_v1.tflite                   ✅ 0.1596 MB — deployed artefact
+│   ├── gesture_model_metadata.json                ✅ config-derived deployment metadata
+│   ├── export_manifest.json                       ✅ SHA-256 checksum, conversion provenance
+│   └── [22 additional ablation SavedModel dirs]   ✅
 │
-
 ├── reports/
-
-│   ├── figures/                          ✅ All Stage 1–5 figures (25+ PNGs)
-
-│   ├── experiment_summary.md             ✅ Full 23-run registry
-
-│   └── report.pdf                        🔜 One-page technical report (Stage 11)
-
+│   ├── figures/                                   ✅ 35+ figures across Stages 1–9
+│   ├── evaluation/
+│   │   ├── evaluation_report.json                 ✅ Stage 6 consolidated report
+│   │   ├── tflite_verification_report.json        ✅ Stage 8 verification report
+│   │   ├── release_gate.json                      ✅ Stage 8 gate verdict
+│   │   └── test_precommitment_log.md              ✅ timestamped, finalised
+│   ├── experiment_summary.md                      ✅ full 23-run registry
+│   └── report.pdf                                 🔜 Stage 11 (one-page report)
 │
-
-├── .github/
-
-│   └── workflows/
-
-│       └── ci.yml                        🔜 Lint · Test · Docker build
-
-│
-
-├── Dockerfile                            🔜 Training image
-
-├── Dockerfile.inference                  🔜 Lean inference image
-
-├── docker-compose.yml                    🔜
-
-├── Makefile                              🔜
-
-├── MODEL_CARD.md                         🔜 Stage 11
-
-├── LIMITATIONS.md                        ✅ Complete and updated post-Stage 5
-
-├── requirements.txt                      ✅ Pinned versions
-
-├── requirements-dev.txt                  ✅
-
-└── README.md
+├── LIMITATIONS.md                                 ✅ 18 documented limitations, complete
+├── MODEL_CARD.md                                  ✅ complete, cross-referenced with LIMITATIONS.md
+├── README.md                                       (this file)
+├── requirements.txt  requirements-dev.txt          ✅
+├── .github/workflows/ci.yml                        🔜 Stage 10
+└── Dockerfile  Dockerfile.inference  docker-compose.yml  Makefile   🔜 Stage 10
 ```
-
----
 
 ---
 
@@ -481,30 +402,33 @@ wlasl-gesture-recognition/
 
 ### WLASL — Word-Level American Sign Language
 
-The [WLASL dataset](https://dxli94.github.io/WLASL/) is the largest publicly available word-level ASL video dataset, comprising over 21,000 video clips spanning 2,000+ signs performed by 119 signers. For this project, **35 signs** are selected and locked in `artifacts/label_map_v1.json` (schema v1.1).
+The [WLASL dataset](https://dxli94.github.io/WLASL/) is the largest publicly available
+word-level ASL video dataset, comprising over 21,000 video clips spanning 2,000+ signs
+performed by 119 signers. This project selects and locks **35 signs** in
+`artifacts/label_map_v1.json` (schema v1.1).
 
-### Dataset Statistics
+### Dataset statistics
 
 | Metric | Value |
-|--------|-------|
+|---|---|
 | Signs | 35 (locked) |
 | Total inventory entries | 751 |
 | Clips found on disk | 350 |
-| **Dataset completeness** | **46.6%** (401 dead YouTube URLs) |
+| **Dataset completeness** | **46.6%** (401 dead YouTube URLs — permanent, unrecoverable; see [L1](LIMITATIONS.md#l1)) |
 | Clips after v1.2 extraction | 339 (96.9% of found) |
 | Training clips loaded | **236** · 31 signers |
 | Validation clips loaded | **52** · 7 signers |
 | Test clips loaded | **51** · 7 signers |
 | Signer overlap across splits | **0** (confirmed) |
-| Class weight ratio | 6.50× (min: 0.519, max: 3.371) |
+| Class weight ratio | 6.50× (min 0.519, max 3.371) |
 | Mean frames per clip | 67.6 · median 67 · std 23.6 |
 | Global hand detection rate | 64.72% |
-| Singleton val classes | 21 of 35 |
+| Singleton val classes | 21 of 35 (see [L3](LIMITATIONS.md#l3)) |
 
-### The 35 Selected Signs
+### The 35 selected signs
 
 | Idx | Sign | Idx | Sign | Idx | Sign | Idx | Sign | Idx | Sign |
-|-----|------|-----|------|-----|------|-----|------|-----|------|
+|---|---|---|---|---|---|---|---|---|---|
 | 0 | before | 7 | candy | 14 | drink | 21 | go | 28 | mother |
 | 1 | birthday | 8 | chair | 15 | eat | 22 | help | 29 | name |
 | 2 | black | 9 | change | 16 | family | 23 | house | 30 | now |
@@ -513,485 +437,554 @@ The [WLASL dataset](https://dxli94.github.io/WLASL/) is the largest publicly ava
 | 5 | boy | 12 | computer | 19 | girl | 26 | like | 33 | think |
 | 6 | can | 13 | cousin | 20 | give | 27 | many | 34 | who |
 
-### Split Strategy: Signer-Aware, Zero Overlap
+### Split strategy: signer-aware, zero overlap
 
-Splits are **signer-aware**: every clip from a given signer is assigned exclusively to one partition. A signer's style never appears in both training and evaluation. This is the methodologically correct evaluation — random clip shuffling inflates accuracy by leaking signer-specific motion patterns across splits.
+Splits are **signer-aware**: every clip from a given signer is assigned exclusively to one
+partition. A signer's style never appears in both training and evaluation — the
+methodologically correct, more conservative choice versus the random-clip shuffling common in
+published WLASL benchmarks, which is *not* directly comparable to the numbers in this project.
 
 | Split | Clips | Signers | Classes represented |
-|-------|-------|---------|---------------------|
+|---|---|---|---|
 | Train | 236 | 31 | 35 |
 | Val | 52 | 7 (all unseen) | 35 |
 | Test | 51 | 7 (all unseen) | 35 |
 
-All reported metrics are on signers the model has **never seen during training** — more conservative and more honest than any random-split baseline.
+### Feature representation
 
-### Feature Representation
-
-Each video is processed by MediaPipe Holistic to extract:
-
-| Landmark group | Keypoints | Values per frame |
-|----------------|-----------|-----------------|
+| Landmark group | Keypoints | Values/frame |
+|---|---|---|
 | Left hand | 21 | 63 (x, y, z) |
 | Right hand | 21 | 63 (x, y, z) |
 | Pose (body skeleton) | 33 | 99 (x, y, z) |
 | **Total (full config)** | **75** | **225** |
-| **Champion (hands-only)** | **42** | **126** |
+| **Champion (hands-only — deployed)** | **42** | **126** |
 
 ---
 
 ## 7. Pipeline Stages
 
-The project is structured as a sequence of nine pipeline stages. Each stage has a standalone CLI entry point under `pipelines/` and can be run independently or via `make`.
-
 | Stage | Description | Status |
-|-------|-------------|--------|
+|---|---|---|
 | **1 — Data Ingestion** | WLASL manifest resolution, 8-point integrity validation, signer-aware greedy bin-packing split | ✅ Complete |
-| **2 — EDA** | Dataset characterisation, class distribution, signer dominance, temporal analysis, bias documentation | ✅ Complete |
-| **3 — Landmark Extraction** | MediaPipe Holistic on all 350 clips · v1.2 dual-criterion skip policy · 339 clips retained | ✅ Complete |
-| **4 — Feature Engineering** | Wrist-relative normalisation, z-clip, centre-crop/pad, 5-transform augmentation chain, GestureDataset | ✅ Complete |
-| **5 — Multi-Model Training** | 23 MLflow-tracked runs across 4 experiment groups · champion BiLSTM identified | ✅ Complete |
-| **6 — Evaluation & Interpretability** | Test-set evaluation, latency benchmark, SHAP, confidence calibration, signer analysis | 🔜 Next |
-| **7 — Inference Engine** | GesturePredictor unified class · TFLite runtime · PredictionSmoother | 🔜 Stage 7 |
-| **8 — TFLite Export** | Dynamic-range quantisation · accuracy verification · model metadata JSON | 🔜 Stage 8 |
-| **9 — Webcam Demo** | Real-time OpenCV HUD · FPS counter · top-3 bar chart · stability indicator | 🔜 Stage 9 |
+| **2 — EDA** | Class distribution, signer dominance, temporal analysis, bias documentation | ✅ Complete |
+| **3 — Landmark Extraction** | MediaPipe Holistic, v1.2 dual-criterion skip policy, 339 clips retained | ✅ Complete |
+| **4 — Feature Engineering** | Wrist-relative normalisation, z-clip, centre-crop/pad, 5-transform augmentation, `GestureDataset` | ✅ Complete — gate: PASS |
+| **5 — Multi-Model Training** | 23 MLflow-tracked runs across 4 experiment groups, champion identified | ✅ Complete |
+| **6 — Evaluation & Interpretability** | Test-set evaluation, latency benchmark, reliability diagram, SHAP, signer analysis | ✅ Complete |
+| **7 — Unified Inference Engine** | `GesturePredictor`, `FrameBuffer`, `PredictionSmoother`, model-format auto-detection | ✅ Complete |
+| **8 — TFLite Export & Verification** | Dynamic-range quantisation, accuracy verification, automated release gate (6/6 PASS) | ✅ Complete |
+| **9 — Real-Time Webcam Demo** | `GestureStreamSession`, MediaPipe Hands, calibration-aware HUD, session summary | ✅ Complete |
+| **10 — Infrastructure** | Docker, CI/CD, Makefile, remaining unit tests | 🔜 Open |
+| **11 — Report & Theoretical Assessment** | One-page report, 5-question theoretical assessment (Model Card already shipped) | 🔜 Partially open |
 
-### Stage 4: Feature Engineering Pipeline
+### Stage 4: feature engineering pipeline
 
-The `FeaturePipeline` class applies the following transform chain **identically at training and inference** — the single most important correctness invariant in the system:
+`FeaturePipeline` applies the following transform chain **identically at training and
+inference** — enforced architecturally (one shared instance inside `GesturePredictor`), not by
+caller discipline:
 
 ```
 Input: (T_raw, 225) float32
-
-↓ 1. Shape + finite validation
-
-↓ 2. Copy + float32 cast
-
-↓ 3. Wrist-relative normalisation (per-slot detection mask)
-
-↓ 4. Z-coordinate soft-clip (±0.10)
-
-↓ 5. Centre-crop or right-zero-pad → (seq_len, 225)
-
-↓ 6. Augmentation [training only, on full 225-dim array]
-
-↓ 7. Landmark config selection (hands_only / pose_only / full)
-
-Output: (seq_len, feature_dim) float32
+  ↓ 1. Shape + finite validation
+  ↓ 2. Copy + float32 cast
+  ↓ 3. Wrist-relative normalisation (per-slot detection mask)
+  ↓ 4. Z-coordinate soft-clip (±0.10)
+  ↓ 5. Centre-crop or right-zero-pad → (100, 225)
+  ↓ 6. Augmentation [training only, never at inference]
+  ↓ 7. Landmark config selection → hands_only
+Output: (100, 126) float32
 ```
 
-**Ordering constraint (enforced):** Augmentation (step 6) must precede landmark config selection (step 7). `AugmentationPipeline` validates `arr.shape[1] == 225` — if selection ran first, all augmentation calls on non-full configs would raise `ValueError`.
-
-### Stage 5: Augmentation Chain
-
-Five transforms applied in this order, each with a production-grade zero-fill invariant:
+### Stage 5: augmentation chain
 
 | Transform | Effect | Key invariant |
-|-----------|--------|---------------|
-| `temporal_jitter` | Zero-fill randomly selected frames **in place** | Dropped frames zeroed at original temporal position, not compressed |
-| `speed_jitter` | Resample at rate ∈ [0.7, 1.3] with zero-aware interpolation | Output frames where both surrounding source frames are zero remain zero |
-| `gaussian_noise` | N(0, 0.01) on detected component slots only | Per-slot masking: LH, RH, pose independently masked |
-| `rotation_2d` | ±5° rotation of wrist-relative hand coords | Applied only to detected frames; zero-fill frames unchanged |
-| `spatial_flip` | Per-frame hybrid policy (both/LH-only/RH-only/neither) | Clip-level safety check: both-hands fraction > 0.30 |
+|---|---|---|
+| `temporal_jitter` | Zero-fill randomly selected frames in place | Dropped frames zeroed at original position, not compressed |
+| `speed_jitter` | Resample at rate ∈ [0.7, 1.3], zero-aware interpolation | Frames with both surrounding source frames zero remain zero |
+| `gaussian_noise` | N(0, 0.01) on detected slots only | LH / RH / pose masked independently |
+| `rotation_2d` | ±5° rotation of wrist-relative hand coords | Zero-fill frames unchanged |
+| `spatial_flip` | Per-frame hybrid policy | Clip-level safety check: both-hands fraction > 0.30 |
 
 ---
 
 ## 8. Models and Experiments
 
-### Experiment Matrix
+Four experiment groups, **23 MLflow-tracked runs**, all under experiment name
+`"WLASL-35-class"`, seed=42, class-weight balancing enforced, per-epoch `load_split()` training
+loop. Full registry: [`reports/experiment_summary.md`](reports/experiment_summary.md).
 
-Four experiment groups, 23 MLflow-tracked runs, all under experiment name `"WLASL-35-class"`. Every run uses the same seed (42), class-weight balancing, and per-epoch `load_split()` training loop.
+| Group | Fixed | Headline finding |
+|---|---|---|
+| **1 — Architecture** | seq60, no-aug, full 225-dim, lr=1e-3 | Dense (0.3276) > all recurrent models at 80 epochs — an overfitting artefact (train/val gap 0.48), not evidence against temporal modelling |
+| **2 — Augmentation** | LSTM, seq60, full, lr=5e-4 | Spatial-temporal aug appeared harmful (0.0108) — **overturned by the champion**: with 250 epochs + hands_only, aug delivers +28% relative improvement |
+| **3 — Sequence length** | LSTM, no-aug, full, lr=5e-4 | seq100 (0.2354) beats seq60 (0.1434) by **+64% relative**; 97% truncation at seq60 vs 7% at seq100 |
+| **4 — Landmark config** | LSTM, seq100, no-aug, lr=5e-4 | hands_only (0.4948) more than doubles full (0.2354) — **+110% relative**, the single highest-leverage decision in the project |
 
-#### Group 1 — Architecture Comparison
-**Fixed:** seq60 · no-aug · full 225-dim · lr=1e-3 · max_epochs=80
+### Champion candidates (9 runs) → `bilstm_hands_only_v4_aug` 🏆
 
-| Run | Model | val macro-F1 | val acc | Best epoch | Total epochs |
-|-----|-------|-------------|---------|-----------|--------------|
-| `dense_baseline` | Dense | 0.3276 | 0.3654 | 75 | 80 |
-| `lstm_baseline` | LSTM | 0.1948 | 0.2500 | 53 | 68 |
-| `gru_baseline` | GRU | 0.1905 | 0.2692 | 78 | 80 |
-| `bilstm_baseline` | BiLSTM | 0.1761 | 0.1923 | 49 | 64 |
+| Run | Arch | Aug | val macro-F1 |
+|---|---|---|---|
+| `bilstm_hands_only` | BiLSTM | none | 0.5419 |
+| `champion_bilstm_hands_only_v3` | BiLSTM | temporal | 0.5190 |
+| `bilstm_hands_only_v3` | BiLSTM | none | 0.4695 |
+| `champion_bilstm_hands_only_v2` | BiLSTM | spatial_temporal | 0.4610 |
+| `champion_hands_only_v1` | LSTM | none | 0.4286 |
+| **`bilstm_hands_only_v4_aug`** 🏆 | **BiLSTM** | **spatial_temporal** | **0.6011** |
 
-> **Interpretation:** Dense's 0.3276 is an overfitting artefact — train macro-F1 reached 0.81 (gap: 0.48), confirming it memorised the 31 training signers' spatial positions rather than learning sign geometry. All Group 1 results were measured on full 225-dim landmarks; Group 4 showed hands-only produces +110% relative improvement, meaning these values are floor estimates.
-
-#### Group 2 — Augmentation Ablation
-**Fixed:** LSTM · seq60 · full · lr=5e-4 · max_epochs=80
-
-| Run | Augmentation | val macro-F1 | Best epoch | Stopped |
-|-----|-------------|-------------|-----------|---------|
-| `lstm_no_aug` | None | 0.1706 | 72 | Full (80) |
-| `lstm_temporal_aug` | Temporal only | 0.1200 | 80 | Full (80) |
-| `lstm_spatial_temporal_aug` | Spatial + temporal | 0.0108 | 17 | Early (32) |
-| `bilstm_spatial_temporal_aug` | Spatial + temporal | 0.0041 | 4 | Early (19) |
-
-> ⚠ **Critical finding:** The Group 2 conclusion (spatial-temporal augmentation harmful) was an 80-epoch artefact. Under 250 epochs with patience=50 and hands-only features, spatial-temporal augmentation achieves **0.6011 vs 0.4695** (no-aug, 300ep) — a 28% relative improvement and 50% reduction in overfitting gap. The augmentation result is **epoch-budget-conditional**.
-
-#### Group 3 — Sequence Length Ablation
-**Fixed:** LSTM · no-aug · full · lr=5e-4 · max_epochs=120
-
-| Run | seq_len | val macro-F1 | Mean content | Truncation rate |
-|-----|---------|-------------|-------------|----------------|
-| `lstm_seq60` | 60 | 0.1434 | 85.0% | 97.0% |
-| `lstm_seq80` | 80 | 0.0328 | 95.8% | 29.8% |
-| `lstm_seq80_v2` | 80 | 0.0297 | 95.8% | 29.8% |
-| `lstm_seq100` | **100** | **0.2354** | **99.2%** | **7.1%** |
-
-> `lstm_seq100` delivers **+64% relative improvement** over `lstm_seq60`. The seq80 result (0.033) is a deterministic local minimum under seed=42 — confirmed by v2 reproduction. Under different seeds or hands-only features, seq80 would likely perform comparably to seq100.
-
-#### Group 4 — Landmark Configuration Ablation
-**Fixed:** LSTM · seq100 · no-aug · lr=5e-4 · max_epochs=120
-
-| Run | Landmark config | Feature dim | val macro-F1 | Fisher ratio | Params |
-|-----|----------------|-------------|-------------|-------------|--------|
-| `lstm_seq100` (full) | Full | 225 | 0.2354 | 0.5492 | 110,499 |
-| **`lstm_hands_only`** | **Hands only** | **126** | **0.4948** | **0.8097** | **85,155** |
-| `lstm_pose_only` | Pose only | 99 | 0.0314 | 0.2176 | 78,243 |
-
-> **Defining finding of Stage 5:** Hands-only more than doubles val macro-F1 vs full (+110% relative), using 23% fewer parameters and 44% fewer input dimensions per timestep. The Fisher ratio prediction held directionally; the 2× magnitude gap exceeds the ratio difference alone, indicating non-linear suppression that compounds across LSTM layers.
-
-#### Champion Candidates (9 runs)
-
-| Run | Architecture | Aug | Epochs | val macro-F1 | High-risk F1 (B/Bk/Cl/Na/Th) |
-|-----|-------------|-----|--------|-------------|------------------------------|
-| `bilstm_hands_only` | BiLSTM | none | 180/30 | 0.5419 | 1.0/0.0/1.0/1.0/0.0 |
-| `champion_bilstm_hands_only_v3` | BiLSTM | temporal | 250/50 | 0.5190 | 1.0/1.0/0.0/1.0/0.0 |
-| `bilstm_hands_only_v3` | BiLSTM | none | 300/50 | 0.4695 | 1.0/0.5/0.0/0.0/0.0 |
-| `champion_bilstm_hands_only_v2` | BiLSTM | spatial-temporal | 250/50 | 0.4610 | 1.0/0.0/0.0/1.0/0.0 |
-| `bilstm_hands_only_v3_aug` | BiLSTM | temporal | 250/50 | 0.4553 | 1.0/1.0/0.0/0.0/0.0 |
-| `champion_hands_only_v1` | LSTM | none | 180/30 | 0.4286 | 0.0/0.0/1.0/0.0/0.0 |
-| `champion_bilstm_hands_only` | BiLSTM | none | 180/25 | 0.4181 | 1.0/1.0/0.0/1.0/0.0 |
-| `bilstm_hands_only_v2` | BiLSTM | none | 250/50 | 0.4067 | 0.67/0.0/0.0/0.0/0.0 |
-| **`bilstm_hands_only_v4_aug`** 🏆 | **BiLSTM** | **spatial-temporal** | **250/50** | **0.6011** | **1.0/1.0/1.0/1.0/0.0** |
-
-> B=birthday · Bk=book · Cl=clothes · Na=name · Th=think
-
-### Architecture Summary
-
-| Model | Purpose | Params | Input dim |
-|-------|---------|--------|-----------|
-| Dense | Non-temporal baseline — proves LSTM necessity | ~7.7M | (60, 225) |
-| LSTM (2-layer) | Primary ablation workhorse (Groups 2, 3, 4) | ~85–110K | (seq, feature) |
-| GRU (2-layer) | Speed/accuracy trade-off candidate | ~65–85K | (seq, feature) |
-| **BiLSTM (2-layer)** 🏆 | **Champion — bidirectional temporal context** | **~69–94K** | **(seq, feature)** |
-
-All recurrent models include `Masking(mask_value=0.0)` as the first non-Input layer. At a global both-hands-absent rate of 35.28%, masking is not optional — it prevents the LSTM from updating its hidden state on semantically empty zero-fill frames.
+All recurrent models include `Masking(mask_value=0.0)` as the first non-`Input` layer — at a
+global both-hands-absent rate of 35.28%, this is load-bearing, not optional.
 
 ---
 
 ## 9. Findings and Ablation Studies
 
-### Finding 1 — Temporal modelling is necessary
-
-Dense baseline (7.7M params, train macro-F1: 0.81) achieves 0.3276 val macro-F1 against LSTM's 0.1948 at 80 epochs. The 0.48 train/val gap confirms Dense memorises signer-specific spatial position rather than sign geometry. The relative ranking is correct; the absolute advantage inverts under extended training.
-
-### Finding 2 — `hands_only` is the single highest-leverage decision
-
-**+110% relative improvement** over full-225-dim at equivalent config. Removing 99 pose dimensions eliminates features that vary systematically across signers (body size, arm length, filming distance) without carrying discriminative sign-identity signal. The suppression effect compounds across LSTM layers — the performance gap is larger than Fisher ratios alone predict.
-
-### Finding 3 — Sequence length matters more than previously estimated
-
-97% of clips are truncated at seq_len=60 (P75=84, P90=95 frames). Extending from seq60 to seq100 delivers **+64% relative improvement**. The dataset median of 67 frames is substantially longer than the original design assumed — every additional frame retained yields measurable accuracy gains.
-
-### Finding 4 — Augmentation is epoch-budget-conditional, not harmful
-
-At 80 epochs with full 225-dim features: spatial-temporal augmentation appears harmful (val loss diverges). At 250 epochs with hands-only features: spatial-temporal augmentation is **decisively better** — val macro-F1 0.6011 vs 0.4695 (no-aug, 300ep), and the train/val overfitting gap halves from ~0.48 to ~0.24. The mechanism: augmentation slows signer-identity memorisation, allowing the model to find inter-signer invariant representations given enough training time.
-
-### Finding 5 — Val metric variance requires careful interpretation
-
-With 52 validation clips in ~2 batches, a single misclassified clip shifts val accuracy by 1.9pp; a singleton class prediction error shifts val macro-F1 by up to 2.9pp. Epoch-to-epoch swings of 3–5pp are structural noise. The champion's 0.6011 is reliably better than the best no-aug result (0.5419, gap = 5.9pp > noise floor), but should be understood as approximately 0.58 ± 0.03 as an expected value.
-
-### Ablation Summary Figures
-
-| Figure | Location |
-|--------|----------|
-| Architecture comparison bar + overfitting gap | `reports/figures/architecture_comparison_bar.png` |
-| Group 1 training curves (all 4 models) | `reports/figures/training_curves_all_models.png` |
-| Augmentation ablation (val macro-F1 + correction) | `reports/figures/ablation_augmentation.png` |
-| Sequence length vs content coverage | `reports/figures/ablation_sequence_length.png` |
-| Landmark config vs Fisher ratio | `reports/figures/ablation_landmark_config.png` |
-| Overfitting gap: aug vs no-aug | `reports/figures/overfitting_gap_comparison.png` |
-| Champion training curves | `reports/figures/champion_training_curves.png` |
-| Champion per-class val macro-F1 | `reports/figures/champion_per_class_f1.png` |
+1. **Temporal modelling is necessary.** The Dense baseline's apparent Group-1 win is an
+   overfitting artefact (0.48 train/val gap) caused by signer-position memorisation, not
+   evidence against recurrence.
+2. **`hands_only` is the single highest-leverage decision** (+110% relative). Removing 99 pose
+   dimensions eliminates signer-correlated, sign-irrelevant variance (body size, arm length,
+   filming distance) and has the welcome side-effect of improving KSL transferability
+   (see [Section 17](#17-ksl-adaptation-roadmap)).
+3. **Sequence length matters more than initially assumed.** 97% of clips were truncated at
+   seq60; extending to seq100 delivers +64% relative improvement.
+4. **Augmentation is epoch-budget-conditional, not harmful.** The Group 2 finding was an
+   80-epoch artefact; at 250 epochs, spatial-temporal augmentation is decisively beneficial and
+   halves the overfitting gap.
+5. **Validation-set metric variance requires careful interpretation.** Two identically
+   configured runs differed by 13pp purely from initialisation trajectory and singleton-class
+   noise — see [L3](LIMITATIONS.md#l3)/[L7](LIMITATIONS.md#l7) for the full statistical
+   treatment, including the 90% bootstrap CIs reported for every headline number.
 
 ---
 
-## 10. Quickstart — Reproduce Everything
+## 10. Stage 6 — Evaluation, Calibration, and Interpretability
 
-### Prerequisites
+`src/evaluation/` (`metrics.py`, `benchmark.py`, `calibration.py`, `signer_analysis.py`) is the
+framework-agnostic evaluation foundation: every function accepts "a callable returning
+`(batch, n_classes)`," which is exactly the contract `GesturePredictor.__call__` satisfies —
+the same evaluation code runs unmodified against the Keras model, a `TFLiteCallable` adapter,
+or `GesturePredictor` itself.
 
-- [Miniconda](https://docs.conda.io/en/latest/miniconda.html) installed
-- Python 3.10.20 conda environment
+### Test-set result (evaluated exactly once, pre-committed methodology)
 
-### Environment Setup
+**Test macro-F1 = 0.4581** (Keras), within the pre-committed expected range of [0.45, 0.58].
+The 14.3pp val→test gap is attributed to indirect val-set overfitting (the champion's epoch
+budget and augmentation strategy were both selected by repeatedly consulting val macro-F1
+across 23 runs), small-sample amplification, and genuine signer-generalisation difficulty — see
+[L6](LIMITATIONS.md#l6) for the full discussion of why this gap is this project's single most
+important honesty check.
+
+### Calibration
+
+| Metric | Value |
+|---|---|
+| ECE | 0.2009 |
+| MCE | 0.3472 |
+| Mean confidence | 0.5136 |
+| Mean accuracy | 0.5769 |
+| Overconfidence gap | **−0.0633 (underconfident)** |
+| Calibrated display threshold | **0.35** |
+
+The model is **underconfident**, the less common failure direction for softmax classifiers —
+a naive 0.50 threshold would needlessly suppress a meaningful fraction of correct predictions.
+Temperature scaling (the standard post-hoc fix) is documented but not implemented: the
+deployment layer only has access to post-softmax probabilities, and the 52-clip calibration set
+is too small for a reliable temperature estimate (see [L11](LIMITATIONS.md#l11)).
+
+### Interpretability (Gradient × Input attribution)
+
+- Peak frame importance around **frame ~36** of the 100-frame window; importance decays
+  substantially after **frame ~70**.
+- **Right-hand-dominant attribution** — left-hand features carry near-zero importance,
+  possibly a signer-handedness artefact from the small WLASL signer pool (see
+  [L13](LIMITATIONS.md#l13), open and unconfirmed).
+- **Four confusable sign pairs** with activation cosine similarity 0.785–0.963:
+
+  | Pair | Cosine similarity |
+  |---|---|
+  | think ↔ who | 0.905, 0.785 |
+  | later ↔ house | 0.919, 0.946 |
+  | cousin ↔ mother | 0.927, 0.947 |
+  | girl ↔ orange | 0.963, 0.937 |
+
+  These are the direct cause of several confusion-matrix entries (`before↔chair`,
+  `cousin↔go/now`, `drink↔boy/orange/who`, `girl↔go/now`, `who↔candy`) and are surfaced as a
+  first-class UI element in the Stage 9 demo (top-3 panel + confusable-pair badge), not silently
+  absorbed — see [L12](LIMITATIONS.md#l12).
+
+### Signer-independent generalisation
+
+Per-signer val accuracy (7 signers, ~7–8 clips each) ranges widely; Stage 6 reports
+Wilson-score 90% confidence intervals per signer rather than point estimates, since the
+per-signer sample size is too small for reliable individual estimates.
+
+---
+
+## 11. Stage 7 — Unified Inference Engine
+
+`src/inference/predictor.py::GesturePredictor` is the **sole, unified inference entry point**
+for this model — every consumer (Stage 8 verification, the Stage 9 demo, any future Android
+wrapper) is required to go through it rather than calling the TFLite interpreter or Keras model
+directly. This guarantees training/inference preprocessing consistency **by construction**, not
+by caller discipline.
+
+```python
+from src.inference.predictor import GesturePredictor
+
+predictor = GesturePredictor.from_config_snapshot(
+    config_snapshot_path=(
+        "artifacts/experiments/bilstm_hands_only_v4_aug/config_snapshot.yaml"
+    ),
+    model_path="models/gesture_bilstm_v1.tflite",
+    smoother_window=5,           # 5-frame majority vote, ≈167ms at 30 FPS
+    display_threshold=0.35,      # calibrated to the model's documented underconfidence
+)
+predictor.warmup(n_passes=3)     # eliminates a first-inference latency spike (can exceed 700ms)
+
+with predictor:
+    result = predictor.predict_from_video("path/to/clip.mp4")
+    print(result["sign"], result["confidence"], result["top_k"])
+```
+
+Key design guarantees: model-format auto-detection (`.tflite` vs. Keras SavedModel), a
+calibration-aware `is_confident` gate, output-dimension validation at construction time (a
+wrong model fails loudly immediately, not at first prediction), and an evaluation-framework
+`__call__(x_batch, training=False)` contract that lets `GesturePredictor` itself be passed as
+the `model` argument to any `src/evaluation` function.
+
+---
+
+## 12. Stage 8 — TFLite Export and Release Gate
+
+`src/export/convert.py` produces the verified deployment artefact; `src/export/verify.py`
+runs the full accuracy/latency/size comparison and assembles the single authoritative
+`ReleaseGateResult`. `pipelines/run_export_verification.py` is the CLI entry point:
 
 ```bash
-# 1. Clone the repository
+python pipelines/run_export_verification.py \
+    --config-snapshot artifacts/experiments/bilstm_hands_only_v4_aug/config_snapshot.yaml \
+    --saved-model models/bilstm_hands_only_v4_aug_saved_model \
+    --output models/gesture_bilstm_v1.tflite \
+    --n-calls 200 --warmup 20
+```
+
+Exit code `0` = release-ready, `1` = a hard gate criterion failed, `2` = an infrastructure
+error. Every export is identity-verified before conversion (parameter count, I/O shape,
+config-hash, and — as a non-fatal-by-default cross-check — layer architecture signature) so a
+wrong SavedModel among the 23 ablation candidates can never silently become a deployment
+artefact. See [Section 3](#3-key-results) for the full release-gate result table and
+[`LIMITATIONS.md` L10](LIMITATIONS.md#l10) for the quantisation trade-offs (`SELECT_TF_OPS`
+required; full-integer quantisation infeasible for this architecture under TF 2.13).
+
+---
+
+## 13. Stage 9 — Real-Time Webcam Demo
+
+```bash
+python src/demo/webcam_demo.py
+python src/demo/webcam_demo.py --model models/gesture_bilstm_v1.tflite --camera 1
+python src/demo/webcam_demo.py --minimal-hud
+python src/demo/webcam_demo.py --no-flip
+python src/demo/webcam_demo.py --record outputs/demo_recording.mp4
+```
+
+### Architecture: encapsulation-respecting streaming composition
+
+`GesturePredictor.predict_from_webcam_frame()` is hardwired to the predictor's own MediaPipe
+Holistic extractor. Since Stage 8's benchmarking recommended switching live inference to the
+faster MediaPipe **Hands** extractor (~8–10 ms vs. ~18 ms), the demo needed a different
+streaming path — without reaching into `GesturePredictor`'s private state. `GestureStreamSession`
+solves this by composing only `GesturePredictor`'s **public** surface
+(`predictor.pipeline`, `predictor(x, training=False)`, `predictor.label_map`, and its
+documented read-only properties) with its own `FrameBuffer` / `PredictionSmoother` instances —
+both already part of `predictor.py`'s public `__all__`. This reproduces
+`predict_from_webcam_frame()`'s exact buffering/inference/smoothing/auto-reset contract with
+zero dependency on any underscore-prefixed attribute, so a future refactor of `FrameBuffer` or
+`PredictionSmoother` cannot silently break the demo.
+
+### HUD and controls
+
+| Key | Action |
+|---|---|
+| `q` / `ESC` | Quit |
+| `r` | **Hard reset** — buffer, smoother, debounce state, *and* session statistics |
+| `s` | Save annotated screenshot (sanitised filename) |
+| `h` | Toggle HUD |
+| `m` | Toggle landmark skeleton overlay |
+| `p` | Pause (camera stays live; ML pipeline halts) |
+| `SPACE` | Freeze (camera *and* ML pipeline halt) |
+| `+` / `-` | Adjust confidence display threshold |
+| `1`–`9` | Set smoother window (clamped to [1, 9]) |
+
+The HUD displays: large sign name with a calibration-aware confidence bar (threshold marker at
+0.35), a top-3 panel with confidence bars and high-risk badges, a stability dot, a
+confusable-pair badge when the top-1 prediction belongs to one of the four near-degenerate
+pairs, an FPS counter with per-stage latency breakdown, and a buffer-fill progress ring while
+the rolling 100-frame window is still warming up. Panel geometry scales with the live frame
+resolution rather than using fixed pixel constants, and every on-frame string is ASCII-only for
+cross-platform OpenCV font compatibility.
+
+### Verified, documented behaviour (not assumptions)
+
+- Zero-fill frames (no hand detected) **enter the rolling buffer** — this is semantic data
+  (Stage 3 convention: a genuinely one-handed sign has a real zero slot), not noise to filter.
+- The Holistic fallback path, used only if MediaPipe Hands fails to initialise, **never**
+  populates the pose slot — both extraction paths feed the model an identical input
+  distribution.
+- Handedness mapping is mirror-aware: MediaPipe's `Left`/`Right` classification is always
+  camera-relative, and the demo's mapping correctly inverts when `--no-flip` is passed.
+- A debounced "stable" sign decays after a sustained run of low-confidence frames, rather than
+  silently surviving an unrelated detection gap.
+- The session summary printed on exit reports a true elapsed-time average FPS, not an
+  instantaneous rolling value sampled at the moment the loop happened to exit.
+- The entire capture loop is wrapped in `try`/`finally`: camera, video writer, MediaPipe
+  resources, and the OpenCV window are released deterministically regardless of how the loop
+  exits (normal quit, camera disconnection, or an unhandled exception).
+
+See [`LIMITATIONS.md` Section 8](LIMITATIONS.md#8-real-time-system-limitations-stage-9) (L14–L16)
+for the documented, honest limitations of the live system: MediaPipe detection sensitivity to
+lighting/angle, the deliberate ~8-frame display lag from smoothing + debounce, no
+out-of-distribution rejection, and single-threaded/single-sign scope.
+
+---
+
+## 14. Quickstart — Reproduce Everything
+
+### Environment setup
+
+```bash
 git clone https://github.com/HenryOtsyula/wlasl-gesture-recognition.git
 cd wlasl-gesture-recognition
 
-# 2. Activate conda environment
 conda activate <your-env-name>
-
-# 3. Install dependencies
 pip install -r requirements.txt
-pip install -r requirements-dev.txt   # optional: for tests and linting
+pip install -r requirements-dev.txt   # optional: tests and linting
 
-# 4. Verify installation
 python -c "
-import tensorflow as tf
-import mediapipe
-import mlflow
-print(f'TF:        {tf.__version__}')
-print(f'MediaPipe: {mediapipe.__version__}')
-print(f'MLflow:    {mlflow.__version__}')
+import tensorflow as tf, mediapipe, mlflow
+print(f'TF: {tf.__version__}  MediaPipe: {mediapipe.__version__}  MLflow: {mlflow.__version__}')
 "
 ```
 
-### Run the Full Pipeline
+### Run the full pipeline
 
 ```bash
-make download      # Fetch WLASL videos via manifest
-make preprocess    # Extract MediaPipe landmarks → .npy cache (~30–90 min)
-make train         # Run full 23-run experiment matrix (MLflow tracked)
-make evaluate      # Stage 6: test-set evaluation + benchmarks (coming)
-make demo          # Real-time webcam demo (coming)
+make preprocess    # Extract MediaPipe landmarks → .npy cache
+make train         # Run the full 23-run experiment matrix (MLflow tracked)
+make evaluate       # Stage 6: test-set evaluation, calibration, SHAP
+make export        # Stage 8: TFLite export + release gate
+make demo           # Stage 9: real-time webcam demo
 ```
 
-### Run a Single Training Experiment
+> `Makefile` / `make` targets ship as part of Stage 10 — until then, invoke each pipeline
+> script directly (shown below).
+
+### Train the champion configuration
 
 ```bash
-# Champion configuration
 python pipelines/run_training.py \
-    model=bilstm \
-    data=seq100 \
-    augmentation=spatial_temporal \
+    model=bilstm data=seq100 augmentation=spatial_temporal \
+    training.learning_rate=0.0005 training.epochs=250 \
+    training.early_stopping_patience=50 \
     --landmark-config hands_only \
-    --run-name bilstm_hands_only_v4_aug \
-    --experiment-group champion
-
-# With dot-notation overrides
-python pipelines/run_training.py \
-    model=bilstm \
-    data=seq100 \
-    augmentation=spatial_temporal \
-    training.learning_rate=0.0005 \
-    training.epochs=250 \
-    training.early_stopping_patience=50
+    --run-name bilstm_hands_only_v4_aug --experiment-group champion
 ```
 
-### Verify Stage 4 Pipeline Integrity
+### Evaluate (Stage 6)
 
 ```bash
-python -c "
-from src.utils.config import load_config
-from src.features import FeaturePipeline, GestureDataset
-import numpy as np
-
-cfg = load_config(model='bilstm', data='seq100', augmentation='spatial_temporal')
-pipeline = FeaturePipeline(cfg)
-assert pipeline.output_shape == (100, 126)   # hands_only: 126 dims
-assert callable(pipeline.pre_augmentation)
-
-dataset = GestureDataset(cfg, pipeline,
-                         splits_dir='data/splits',
-                         landmarks_dir='data/landmarks')
-assert dataset.n_train == 236
-assert dataset.n_val   == 52
-assert dataset.n_test  == 51
-print('✓ Stage 4 pipeline verified — ready for Stage 5 or Stage 6')
-"
+python pipelines/run_evaluation.py \
+    --champion-run bilstm_hands_only_v4_aug \
+    --splits val test \
+    --output-dir reports/evaluation/
 ```
 
-### View Experiment Results
+### Export and verify TFLite (Stage 8)
 
 ```bash
-# Launch MLflow UI
-mlflow ui --host 0.0.0.0 --port 5000
-# Navigate to: http://localhost:5000
-# Experiment: "WLASL-35-class" → 23 tracked runs
-
-# Or run the analysis notebook
-jupyter notebook notebooks/05_model_experiments.ipynb
+python pipelines/run_export_verification.py \
+    --config-snapshot artifacts/experiments/bilstm_hands_only_v4_aug/config_snapshot.yaml \
+    --saved-model models/bilstm_hands_only_v4_aug_saved_model \
+    --output models/gesture_bilstm_v1.tflite
 ```
 
-### Run Tests
+### Run the live demo (Stage 9)
 
 ```bash
-make test
-# or
-pytest tests/ -v --cov=src --cov-report=term-missing
-
-# Run only augmentation suite (the most comprehensive)
-pytest tests/test_augmentation.py -v
-pytest tests/test_pipeline.py -v
-```
-
----
-
-## 11. Docker
-
-Full pipeline containerised for guaranteed reproducibility.
-
-```bash
-# Stage 3: extract landmarks
-docker-compose run preprocess
-
-# Stage 5: run all experiments
-docker-compose run train
-
-# Stage 6: generate evaluation artefacts
-docker-compose run evaluate
-```
-
-Two images:
-
-| Image | Purpose | Approximate size |
-|-------|---------|-----------------|
-| `Dockerfile` | Full training environment (TF + MediaPipe) | ~4 GB |
-| `Dockerfile.inference` | Lean inference + demo (TFLite runtime only) | ~800 MB |
-
----
-
-## 12. Experiment Tracking with MLflow
-
-All 23 Stage 5 experiments are logged to a local MLflow tracking server under experiment `"WLASL-35-class"`. Each run records:
-
-- All hyperparameters from the config YAML (model, data, augmentation, training)
-- Per-epoch metrics: `train_loss`, `val_loss`, `train_acc`, `val_acc`, `val_macro_f1`, `learning_rate`, `epoch_time_s`
-- Train macro-F1 on a 50% subset every 5 epochs (to track the overfitting gap)
-- Per-run artefacts: confusion matrix (raw + normalised), training curves, per-class metrics JSON, run manifest, config snapshot
-- The trained SavedModel as an MLflow model artefact
-- Summary metrics: `best_val_macro_f1`, `best_val_acc`, `best_epoch`, high-risk class F1 scores
-
-```bash
-mlflow ui --host 0.0.0.0 --port 5000
-```
-
-The champion model (`bilstm_hands_only_v4_aug`) is tracked under MLflow run ID `cb16f689d2294001a2ff2d3e02419d27`.
-
-> Screenshot of MLflow experiment dashboard: `reports/figures/mlflow_dashboard.png`
-
----
-
-## 13. Real-Time Demo
-
-*(Stage 9 — coming)*
-
-```bash
-make demo
-# or
 python src/demo/webcam_demo.py
 ```
 
-The webcam demo will open a video window with the following HUD overlay:
+### Verify pipeline integrity
 
-- **Predicted sign** — large text, top centre
-- **Confidence %** — below sign name
-- **Top-3 bar chart** — right panel, colour-coded by confidence tier
-- **FPS counter** — bottom left
-- **Prediction stability indicator** — green (stable ≥5 frames), yellow (fluctuating)
-- **"No hands detected" warning** — when MediaPipe returns empty landmarks for 3+ consecutive frames
+```python
+from src.utils.config import load_config
+from src.features import FeaturePipeline, GestureDataset
 
-Temporal smoothing uses majority voting over a 5-frame sliding window. The champion model processes `(1, 100, 126)` float32 tensors — its hands-only feature config means only LH and RH landmark extraction is required at inference, simplifying the MediaPipe preprocessing path relative to a full-225-dim model.
+cfg = load_config(model='bilstm', data='seq100', augmentation='spatial_temporal')
+pipeline = FeaturePipeline(cfg)
+assert pipeline.output_shape == (100, 126)
 
----
-
-## 14. KSL Adaptation Roadmap
-
-### Why this matters
-
-The project is directly motivated by Kenyan Sign Language (KSL) recognition — a domain with scarce labelled data, limited compute, and a strong need for on-device offline inference. The ASL→KSL transfer path is non-trivial: ASL and KSL are structurally distinct languages with different phonologies, spatial grammar conventions, and lexicons. Direct model deployment from ASL to KSL would actively bias toward ASL-specific patterns that have no KSL equivalent.
-
-### Strengthened transfer argument from Stage 5
-
-The hands-only finding directly strengthens the KSL transfer case. By removing pose landmarks — which encode signer body position, arm length, and filming geometry (all signer-specific and language-agnostic features) — the champion model is already forced to rely purely on hand geometry. Hand geometry encodes sign-specific meaning independent of signer body size or frame position. A hands-only ASL model is therefore a better KSL transfer starting point than a full-landmark model: it has already learned to ignore one major class of cross-linguistic domain shift.
-
-### Proposed validation strategy
-
-1. **KSL from scratch (baseline):** Train a BiLSTM on AI4KSL data with the same hands-only pipeline
-2. **ASL-pretrained → frozen LSTM → KSL classifier:** Fine-tune only the Dense head
-3. **ASL-pretrained → full fine-tune on KSL:** Update all layers
-
-Compare on a held-out KSL test set using per-class recall — not just overall accuracy, which can mask catastrophic failure on low-frequency signs with no ASL equivalent.
-
-### Data requirements
-
-At the required scale of 500 KSL signs at ≥85% accuracy, approximately 100–200 clips per sign are needed for the BiLSTM to generalise reliably. At the AI4KSL dataset's ~40 clips per sign, augmentation can close some of this gap, but collecting additional multi-signer, multi-region data is the most reliable path. Regional dialect variation within KSL — like signer-to-signer variation in ASL — is the primary generalisation challenge.
-
-### Planned extensions
-
-- [ ] Expand from 35 to 100+ ASL signs as more data becomes accessible
-- [ ] Attention mechanism over BiLSTM output for improved SHAP interpretability
-- [ ] Temperature scaling for confidence calibration before production deployment
-- [ ] Android TFLite inference wrapper
-- [ ] KSL data collection and transfer learning validation
-
----
-
-## 15. Limitations
-
-See [`LIMITATIONS.md`](LIMITATIONS.md) for the complete discussion. Key limitations:
-
-**Data:**
-- **46.6% completeness:** 401 of 751 inventory clips are permanently inaccessible (dead YouTube URLs). This is the hard ceiling on achievable accuracy regardless of architecture.
-- **6.7 clips/class mean:** All 35 signs fall below the 20-clip minimum threshold. `think` (3 clips), `clothes` (2 clips) are effectively unlearnable at current scale.
-- **21 singleton val classes:** Per-class val metrics for 60% of classes are unreliable (1 incorrect prediction = F1 of 0.0). Macro-F1 is the mandatory primary metric.
-
-**Model:**
-- **70% target not met:** The honest achievable ceiling under current data constraints is approximately 0.60–0.65. Reaching 70% would likely require ≥50 clips per class or pre-trained hand-shape features.
-- **Seed sensitivity:** Identical configurations can diverge by up to 13pp due to initialisation differences amplified by the 52-clip validation set's noise floor. The champion's 0.6011 is a single-seed measurement (expected range: 0.58 ± 0.03).
-- **`think` class unlearnable:** F1 = 0.0 in 8 of 9 champion runs. 3 training clips with zero signer overlap is insufficient for any temporal architecture.
-
-**Deployment:**
-- **Confidence overconfidence:** Softmax outputs are not well-calibrated probabilities. Temperature scaling is recommended before production deployment (Stage 6 calibration analysis pending).
-- **MediaPipe dependency at inference:** Hand detection adds ~18ms per frame to pipeline latency. At 35.28% both-hands-absent rate, real-time performance depends on MediaPipe's robustness.
-- **ASL ≠ KSL:** The champion model cannot be directly deployed for Kenyan Sign Language. See the KSL adaptation roadmap above.
-
-**Evaluation:**
-- **Augmentation finding is epoch-budget-conditional:** Group 2's conclusion (spatial-temporal harmful) was overturned by the champion run. Conclusions drawn from ablations with fixed epoch budgets must be treated as epoch-specific, not general.
-- **Val metric variance:** 3–5pp epoch-to-epoch swings are structural noise on 52 validation clips. Comparisons within 3pp are not statistically meaningful.
-
----
-
-## 16. Contributing
-
-This project is under active development. Contributions, issues, and suggestions are welcome.
-
-```bash
-# Development setup
-pip install -r requirements-dev.txt
-pre-commit install   # installs git hooks for black + flake8
-
-# Run tests
-make test
-
-# Lint
-make lint
-
-# Format
-black src/ pipelines/ tests/
+dataset = GestureDataset(cfg, pipeline, splits_dir='data/splits', landmarks_dir='data/landmarks')
+assert (dataset.n_train, dataset.n_val, dataset.n_test) == (236, 52, 51)
+print("Pipeline verified.")
 ```
 
-Please open an issue before submitting a pull request for significant changes. The experiment configuration system (OmegaConf + Pydantic v2) enforces strict field validation — any new config fields must be added to both the YAML defaults and the Pydantic schema in `src/utils/config.py`.
+### Run tests
+
+```bash
+pytest tests/ -v --cov=src --cov-report=term-missing
+pytest tests/test_predictor.py -v        # Stage 7 suite
+pytest tests/test_tflite_export.py -v    # Stage 8 suite
+```
 
 ---
 
-## 17. License
+## 15. Docker
 
-This project is licensed under the MIT License — see [`LICENSE`](LICENSE) for details.
+*(Stage 10 — open)*
 
-The WLASL dataset is subject to its own licence terms. See the [WLASL repository](https://github.com/dxli94/WLASL) for details. This project does not redistribute any WLASL video content.
+Two images are planned: a full training image (TensorFlow + MediaPipe, ~4 GB) and a lean
+inference image (`Dockerfile.inference`, TFLite runtime only, ~800 MB) that intentionally
+excludes `src/evaluation` and the full TensorFlow training stack, matching the project's
+documented `GesturePredictor`-only deployment contract.
+
+---
+
+## 16. Experiment Tracking with MLflow
+
+All 23 Stage 5 experiments are logged under experiment `"WLASL-35-class"`. Each run records
+every hyperparameter, per-epoch metrics (`train_loss`, `val_loss`, `train_acc`, `val_acc`,
+`val_macro_f1`, `learning_rate`, `epoch_time_s`), per-run artefacts (confusion matrices,
+training curves, per-class metrics, run manifest, config snapshot), and the trained SavedModel
+as an MLflow artefact.
+
+```bash
+mlflow ui --host 0.0.0.0 --port 5000
+```
+
+The champion is tracked under MLflow run ID `cb16f689d2294001a2ff2d3e02419d27`.
+
+---
+
+## 17. KSL Adaptation Roadmap
+
+The production target for this work is **Kenyan Sign Language**, not ASL — WLASL-35 is a
+technical-verification and engineering exercise. ASL and KSL are structurally distinct
+languages (different phonemic handshape inventories, movement patterns, signing-space
+conventions, non-manual grammatical markers, and almost entirely different lexicons); this
+model has **no knowledge of KSL** and is not deployable for it without adaptation
+(see [L18](LIMITATIONS.md#l18)).
+
+**What plausibly transfers:** the `hands_only` configuration — adopted purely for WLASL-35
+accuracy reasons (+110% relative improvement, [Section 9](#9-findings-and-ablation-studies)) —
+has the welcome side-effect of removing pose landmarks, which encode signer-specific body
+morphology rather than sign-specific geometry. This removes one entire axis of cross-linguistic
+domain shift before KSL transfer even begins.
+
+**Proposed validation protocol** (not yet executed):
+1. KSL-from-scratch baseline — establishes the achievable ceiling with the target architecture.
+2. Frozen ASL-pretrained BiLSTM + new KSL classifier head — tests motion-pattern transfer.
+3. Full fine-tune (ASL init → all layers trainable on KSL) — expected best performer once
+   sufficient KSL data exists.
+
+Evaluate all three with **per-class recall**, not aggregate accuracy — this project's own
+per-class data-scarcity failures ([L2](LIMITATIONS.md#l2)) are likely to recur, possibly worse,
+at 500-class KSL scale.
+
+**Data requirement:** ~100–200 clips/sign (current AI4KSL: ~40 clips/sign — below viability).
+**Architecture scaling:** `hidden_units ∈ {128, 256}` should be the first ablation point (current
+champion: 64). **Estimated timeline:** 3–6 months, dominated by data collection, not modelling —
+consistent with this project's own finding that architecture search converges quickly relative
+to the cost of data scarcity.
+
+---
+
+## 18. Limitations
+
+**[`LIMITATIONS.md`](LIMITATIONS.md) is the authoritative limitations register for this
+project** — 18 documented limitations (`L1`–`L18`), each with severity, evidence, and applied
+mitigation. Every accuracy or readiness claim anywhere in this README, the model card, or any
+future report should be read relative to that document. Headline points:
+
+| Theme | Headline limitation |
+|---|---|
+| Data | 46.6% dataset completeness is a **hard, unfixable ceiling** on achievable accuracy ([L1](LIMITATIONS.md#l1)) |
+| Data | `think` is effectively unlearnable at current scale (3 training clips, F1=0.0 in 8/9 runs) ([L2](LIMITATIONS.md#l2)) |
+| Evaluation | 21/35 val classes are singletons; champion's val macro-F1 should be read as **≈0.58 ± 0.03**, not a fixed point ([L3](LIMITATIONS.md#l3), [L7](LIMITATIONS.md#l7)) |
+| Evaluation | The 14.3pp val→test gap is the project's most important honesty check — quote the **test** number externally ([L6](LIMITATIONS.md#l6)) |
+| Model | 70% target not met (0.6011 Keras val achieved); evidence points to data, not architecture, as the binding constraint ([L8](LIMITATIONS.md#l8)) |
+| Calibration | Model is **underconfident** (ECE = 0.2009); mitigated with a 0.35 display threshold, not temperature scaling (not yet implemented) ([L11](LIMITATIONS.md#l11)) |
+| Real-time system | No out-of-distribution rejection — any input produces a confident-looking prediction among the 35 known classes ([L15](LIMITATIONS.md#l15)) |
+| Real-time system | Latency verified on development-machine CPU only — **never benchmarked on Android**, the stated primary deployment target ([L17](LIMITATIONS.md#l17)) |
+| Scope | ASL ≠ KSL — this model is not deployable to the actual production target without the roadmap in [Section 17](#17-ksl-adaptation-roadmap) ([L18](LIMITATIONS.md#l18)) |
+
+---
+
+## 19. Project Status and Remaining Work
+
+| Item | Status |
+|---|---|
+| Stages 1–9 (data → training → evaluation → TFLite export → live demo) | ✅ Complete |
+| `LIMITATIONS.md` | ✅ Complete, 18 limitations documented |
+| `MODEL_CARD.md` | ✅ Complete, cross-referenced with `LIMITATIONS.md` |
+| Test pre-commitment log (`reports/evaluation/test_precommitment_log.md`) | ✅ Complete, finalised, no further tuning performed |
+| Docker (`Dockerfile`, `Dockerfile.inference`, `docker-compose.yml`) | 🔜 Stage 10 |
+| CI/CD (`.github/workflows/ci.yml`), `Makefile` | 🔜 Stage 10 |
+| Remaining unit tests (`test_downloader.py`, `test_validator.py`, `test_extractor.py`, `test_model_factory.py`) | 🔜 Stage 10 |
+| One-page technical report (`reports/report.pdf`) | 🔜 Stage 11 |
+| Five-question theoretical assessment | 🔜 Stage 11 |
+
+Any claim about this system's accuracy or production readiness made before Stage 10/11 close
+should be sourced to `LIMITATIONS.md`, `MODEL_CARD.md`, and the Stage 6/8 evaluation/verification
+reports under `reports/evaluation/` directly — not to a not-yet-written report.
+
+---
+
+## 20. Contributing
+
+```bash
+pip install -r requirements-dev.txt
+pre-commit install   # black + flake8 git hooks
+
+pytest tests/ -v --cov=src --cov-report=term-missing   # test
+flake8 src/ pipelines/ tests/ --max-line-length 100      # lint
+black src/ pipelines/ tests/                              # format
+```
+
+Please open an issue before submitting a pull request for significant changes. The
+configuration system (OmegaConf + Pydantic v2) enforces strict field validation — any new
+config field must be added to both the YAML defaults and the Pydantic schema in
+`src/utils/config.py`.
+
+---
+
+## 21. License and Citation
+
+This project is licensed under the MIT License — see [`LICENSE`](LICENSE).
+
+The WLASL dataset is subject to its own licence terms; see the
+[WLASL repository](https://github.com/dxli94/WLASL). This project does not redistribute any
+WLASL video content.
+
+If you use this model or dataset in research, please cite:
+
+> Li, D., Rodriguez, C., Yu, X., & Li, H. (2020). Word-level deep sign language recognition
+> from video: A new large-scale dataset and methods comparison. *WACV 2020*.
 
 ---
 
 <p align="center">
   <strong>Henry Otsyula</strong><br/>
   Senior Data Scientist &amp; ML Engineer<br/>
-  Built as part of a sign language recognition research initiative.<br/>
-  For questions about KSL adaptation or the pipeline, open an issue.
+  Built as part of a sign language recognition research initiative, with Kenyan Sign Language
+  recognition as the long-term production target.
 </p>
 
 <p align="center">
   <sub>
-    Stage 5 complete · 23 MLflow runs · champion val macro-F1: 0.6011 · 68,771 parameters · 0.262 MB
+    Stages 1–9 complete · 23 MLflow runs · champion val macro-F1: 0.6011 (Keras) / 0.5916 (TFLite)
+    · test macro-F1: 0.4581 (Keras) / 0.4867 (TFLite) · 68,771 parameters · 0.1596 MB TFLite ·
+    release gate 6/6 PASS · 47.11 ms full-pipeline latency · live webcam demo verified
   </sub>
 </p>
