@@ -1900,6 +1900,171 @@ def write_export_manifest(
     )
     return manifest_path.resolve()
 
+# =============================================================================
+# Step 1.9 — Deployment pre-flight check (Stage 9 integration helper)
+# =============================================================================
+
+def verify_deployment_artifact(
+    tflite_path: Union[str, Path] = _DEFAULT_TFLITE_OUTPUT_PATH,
+    expected_sha256: Optional[str] = None,
+    expected_input_shape: Tuple[int, int, int] = _TFLITE_EXPECTED_INPUT_SHAPE,
+    expected_output_shape: Tuple[int, int] = _TFLITE_EXPECTED_OUTPUT_SHAPE,
+) -> Dict[str, Any]:
+    """
+    Cheap, read-only pre-flight check for Stage 9 (and any other downstream
+    consumer) to confirm a .tflite file at ``tflite_path`` is the verified
+    deployment artefact BEFORE sinking time into opening a camera / MediaPipe
+    session against it.
+
+    This is intentionally NOT a re-run of the full Stage 8 release gate
+    (that lives in src/export/verify.py and requires a GestureDataset +
+    val/test splits). It is a fast, dependency-light structural check meant
+    to catch the two most common "wrong file at this path" mistakes before
+    Stage 9's webcam_demo.py spends ~1-2s on MediaPipe + predictor init:
+
+      1. The file is missing entirely (most common: forgot to run Stage 8,
+         or ran it with a different --output path).
+      2. The file's SHA-256 doesn't match the one recorded in
+         models/export_manifest.json (most common: a stale/partial file
+         from an interrupted export, or a manual file swap).
+
+    It re-uses ``_sanity_check_tflite`` (already defined in this module) for
+    the shape + finite-output check, so the validation logic itself is never
+    duplicated.
+
+    Parameters
+    ----------
+    tflite_path : str | Path, default models/gesture_bilstm_v1.tflite
+    expected_sha256 : str, optional
+        If provided, compared against the file's actual SHA-256. If omitted,
+        this function attempts to read it from
+        ``models/export_manifest.json`` (written by ``write_export_manifest``)
+        sitting alongside ``tflite_path``; if that's also absent, the
+        checksum check is skipped (logged, not raised — Stage 9 should still
+        be able to run against a manually-placed file during development).
+    expected_input_shape, expected_output_shape : tuple
+        Static TFLite shapes. Defaults to the champion's (1, 100, 126) ->
+        (1, 35) contract.
+
+    Returns
+    -------
+    dict
+        {
+          exists: bool,
+          path: str,
+          size_mb: float | None,
+          sha256: str | None,
+          sha256_expected: str | None,
+          sha256_match: bool | None,   # None if no expected hash was available
+          sanity_check: dict | None,   # from _sanity_check_tflite, or None on failure
+          ok: bool,                    # overall verdict — False blocks Stage 9 from proceeding
+          issues: List[str],
+        }
+
+    This function never raises — it always returns a verdict dict so a
+    caller (e.g. webcam_demo.py's startup sequence) can print a clear,
+    actionable message and exit(1) rather than crashing with a traceback
+    deep inside MediaPipe or the TFLite interpreter.
+    """
+    issues: List[str] = []
+    path = Path(tflite_path)
+
+    if not path.exists():
+        return {
+            "exists": False,
+            "path": str(path),
+            "size_mb": None,
+            "sha256": None,
+            "sha256_expected": expected_sha256,
+            "sha256_match": None,
+            "sanity_check": None,
+            "ok": False,
+            "issues": [
+                f"TFLite file not found at {path}. Run Stage 8 "
+                "(src/export/convert.py::export_champion) first, or pass "
+                "--model with the correct path."
+            ],
+        }
+
+    size_mb = round(path.stat().st_size / (1024 ** 2), 4)
+    sha256 = _compute_file_sha256(path)
+
+    # Resolve expected hash from export_manifest.json if not supplied.
+    resolved_expected = expected_sha256
+    if resolved_expected is None:
+        manifest_path = path.parent / "export_manifest.json"
+        if manifest_path.exists():
+            try:
+                with open(manifest_path, encoding="utf-8") as f:
+                    manifest = json.load(f)
+                resolved_expected = manifest.get("sha256_checksum")
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "verify_deployment_artifact(): could not read %s (%s: %s) "
+                    "— skipping checksum verification.",
+                    manifest_path, type(exc).__name__, exc,
+                    extra={"stage": "export"},
+                )
+
+    sha256_match: Optional[bool] = None
+    if resolved_expected:
+        sha256_match = (sha256 == resolved_expected)
+        if not sha256_match:
+            issues.append(
+                f"SHA-256 mismatch: file={sha256[:16]}... vs "
+                f"manifest={resolved_expected[:16]}.... This file may be "
+                "stale, corrupted, or manually replaced since the last "
+                "verified Stage 8 export. Re-run Stage 8 to regenerate it."
+            )
+    else:
+        logger.info(
+            "verify_deployment_artifact(): no expected SHA-256 available "
+            "(no export_manifest.json found alongside %s) — skipping "
+            "checksum verification. This is expected in early development "
+            "before write_export_manifest() has been called.",
+            path,
+            extra={"stage": "export"},
+        )
+
+    sanity: Optional[Dict[str, Any]] = None
+    try:
+        sanity = _sanity_check_tflite(
+            path,
+            expected_input_shape=expected_input_shape,
+            expected_output_shape=expected_output_shape,
+        )
+    except Exception as exc:
+        issues.append(f"Sanity inference failed: {type(exc).__name__}: {exc}")
+
+    ok = path.exists() and (sha256_match is not False) and sanity is not None
+
+    result = {
+        "exists": True,
+        "path": str(path.resolve()),
+        "size_mb": size_mb,
+        "sha256": sha256,
+        "sha256_expected": resolved_expected,
+        "sha256_match": sha256_match,
+        "sanity_check": sanity,
+        "ok": ok,
+        "issues": issues,
+    }
+
+    if ok:
+        logger.info(
+            "verify_deployment_artifact(): OK | path=%s | size=%.4fMB | "
+            "sha256_match=%s",
+            path, size_mb, sha256_match,
+            extra={"stage": "export"},
+        )
+    else:
+        logger.error(
+            "verify_deployment_artifact(): FAILED | path=%s | issues=%s",
+            path, issues,
+            extra={"stage": "export"},
+        )
+
+    return result
 
 # =============================================================================
 # Import-time self-check
@@ -1984,6 +2149,7 @@ __all__ = [
     "export_champion_tflite",
     "export_champion",
     "write_export_manifest",
+    "verify_deployment_artifact",
     # Exposed for Stage 8 test suite (test_tflite_export.py)
     "_verify_champion_model",
     "_check_layer_architecture_signature",
