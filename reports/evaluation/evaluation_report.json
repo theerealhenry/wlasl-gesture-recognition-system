@@ -1,0 +1,60 @@
+{
+  "generated_at": "2026-06-19T17:57:52.457245Z",
+  "champion_run": "bilstm_hands_only_v4_aug",
+  "phase_d_notebook": "notebooks/06_evaluation_error_analysis.ipynb",
+  "config_discrepancy": "Champion config_snapshot.yaml confirms early_stopping_monitor=val_accuracy, NOT val_macro_f1 as narrated in the Stage 5 handoff. Champion selection used manual MacroF1Evaluator in train.py (best_val_macro_f1 tracked separately). The Keras early-stopping monitor (val_accuracy) does not affect which weights were checkpointed \u2014 the manual macro-F1 counter controlled that. Discrepancy is informational; it does not invalidate the reported val_macro_f1=0.6011.",
+  "val": {
+    "n_samples": 52,
+    "macro_f1": 0.601088,
+    "accuracy": 0.576923,
+    "macro_f1_ci": {
+      "ci_lower": 0.553438,
+      "ci_upper": 0.640966,
+      "ci_level": 0.9,
+      "ci_width": 0.087528,
+      "n_bootstrap": 1000,
+      "resampling_unit": "clip (class-stratified, NOT signer-aware)"
+    },
+    "calibration": {
+      "ece": 0.200857,
+      "ece_unweighted": 0.194152,
+      "mce": 0.347238,
+      "overconfidence_gap": -0.06333,
+      "mean_confidence": 0.513593,
+      "mean_accuracy": 0.576923,
+      "temperature_scaling_note": "Temperature scaling (dividing pre-softmax logits by scalar T) is the standard post-hoc calibration remedy. Not implemented in Stage 6 because this module receives post-softmax probabilities. See LIMITATIONS.md."
+    }
+  },
+  "test": {
+    "n_samples": 51,
+    "macro_f1": 0.458095,
+    "accuracy": 0.490196,
+    "macro_f1_ci": {
+      "ci_lower": 0.393466,
+      "ci_upper": 0.507626,
+      "ci_level": 0.9,
+      "ci_width": 0.11416,
+      "n_bootstrap": 1000,
+      "resampling_unit": "clip (class-stratified, NOT signer-aware)"
+    },
+    "test_pre_commitment_log": "reports/test_evaluation_log.md",
+    "first_and_final_evaluation": true
+  },
+  "val_test_gap": {
+    "macro_f1_gap": 0.142993,
+    "interpretation": "Indirect val-set overfitting: champion hyperparameters (epoch budget, augmentation strategy, landmark config) were selected based on val performance. Test provides the unbiased estimate. Gap is expected and not evidence of leakage (splits are signer-aware with zero overlap)."
+  },
+  "high_risk_class_f1_val": {},
+  "figures_produced": [
+    "confusion_matrix_best_model.png",
+    "confusion_matrix_normalised.png",
+    "confusion_matrix_test.png",
+    "per_class_metrics.png",
+    "per_class_metrics_test.png",
+    "confidence_calibration.png",
+    "confidence_threshold_curve.png",
+    "signer_generalisation.png",
+    "failure_mode_analysis.png"
+  ],
+  "phase_d_completion_status": "COMPLETE"
+}
