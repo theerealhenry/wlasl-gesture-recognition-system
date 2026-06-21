@@ -1,0 +1,209 @@
+{
+  "model_name": "gesture_bilstm_v1",
+  "version": "1.0.0",
+  "created_utc": "2026-06-20T17:53:11.492462+00:00",
+  "mlflow_run_id": "cb16f689d2294001a2ff2d3e02419d27",
+  "config_hash": "5809193d37e0d480e409b8e3112e70c8de9008497a29727b411a7128e73287a6",
+  "config_snapshot_path": "artifacts\\experiments\\bilstm_hands_only_v4_aug\\config_snapshot.yaml",
+  "architecture": {
+    "name": "bilstm",
+    "num_layers": 2,
+    "hidden_units": 64,
+    "units_per_direction": 32,
+    "dropout": 0.3,
+    "recurrent_dropout": 0.1,
+    "bidirectional": true,
+    "total_params": 68771,
+    "_note": "Architecture fields read from config_snapshot.yaml. total_params is hardcoded as cross-check against the _verify_champion_model() assertion in convert.py."
+  },
+  "input_shape_keras": [
+    null,
+    100,
+    126
+  ],
+  "input_shape_tflite": [
+    1,
+    100,
+    126
+  ],
+  "input_dtype": "float32",
+  "output_shape_keras": [
+    null,
+    35
+  ],
+  "output_shape_tflite": [
+    1,
+    35
+  ],
+  "output_dtype": "float32",
+  "preprocessing": {
+    "sequence_length": 100,
+    "landmark_config": "hands_only",
+    "feature_dim": 126,
+    "feature_layout": {
+      "left_hand": [
+        0,
+        63
+      ],
+      "right_hand": [
+        63,
+        126
+      ],
+      "pose": "not_used"
+    },
+    "normalisation": "wrist_relative",
+    "z_coord_clip": 0.1,
+    "normalise_pose": false,
+    "flip_min_hand_presence": 0.3,
+    "missing_frame_strategy": "zero_fill",
+    "padding_strategy": "right_zero",
+    "truncation_strategy": "centre",
+    "mediapipe_model_complexity": 1,
+    "min_detection_confidence": 0.5,
+    "min_tracking_confidence": 0.5
+  },
+  "label_map_version": "v1",
+  "label_map_path": "artifacts/label_map_v1.json",
+  "num_classes": 35,
+  "stage6_reference_metrics": {
+    "_note": "These values come from Stage 6 evaluation (Phase B1/C). They are the Keras model baselines against which TFLite deltas are computed in Stage 8. CIs are 90% bootstrap intervals from Stage 6 Phase B1 analysis.",
+    "keras_val_macro_f1": 0.6011,
+    "keras_val_accuracy": 0.5769,
+    "keras_val_macro_f1_ci": [
+      0.5534,
+      0.641
+    ],
+    "keras_test_macro_f1": 0.4581,
+    "keras_test_accuracy": 0.4902,
+    "keras_test_macro_f1_ci": [
+      0.3935,
+      0.5076
+    ],
+    "ci_level": 0.9,
+    "ci_source": "loaded from reports\\evaluation\\evaluation_report.json"
+  },
+  "tflite_performance": {
+    "_note": "Measured in Stage 8 by run_accuracy_verification().",
+    "val_macro_f1": 0.5916,
+    "val_accuracy": 0.5769,
+    "test_macro_f1": 0.4867,
+    "test_accuracy": 0.5098,
+    "val_delta_macro_f1": 0.0095,
+    "test_delta_macro_f1": -0.0286,
+    "val_argmax_agreement": 0.9808,
+    "test_argmax_agreement": 0.9804,
+    "val_n_samples": 52,
+    "test_n_samples": 51,
+    "val_n_disagreements": 1,
+    "test_n_disagreements": 1
+  },
+  "calibration": {
+    "stage6_keras_reference": {
+      "ece": 0.2009,
+      "mean_confidence": 0.5136,
+      "mean_accuracy": 0.5769,
+      "overconfidence_gap": -0.0633,
+      "_source": "loaded from reports\\evaluation\\evaluation_report.json"
+    },
+    "tflite_confidence_shift": -0.0013,
+    "keras_mean_confidence": 0.5136,
+    "tflite_mean_confidence": 0.5123,
+    "calibration_direction": "underconfident",
+    "recommended_display_threshold": 0.35,
+    "_note": "Stage 6 found the Keras model is underconfident (mean_confidence=0.5136 < mean_accuracy=0.5769). display_threshold=0.35 is calibrated to this underconfidence. Check tflite_confidence_shift \u2014 if >\u00b10.03, reconsider threshold for TFLite deployment model in Stage 9."
+  },
+  "file_sizes": {
+    "param_memory_mb": 0.2623,
+    "savedmodel_disk_mb": 3.87,
+    "tflite_disk_mb": 0.1596,
+    "size_reduction_vs_params_x": 1.64,
+    "size_reduction_vs_savedmodel_x": 24.26,
+    "_note": "param_memory_mb = params * 4 bytes (weight tensors only). savedmodel_disk_mb = actual SavedModel directory size on disk (includes graph, assets, metadata). tflite_disk_mb = actual .tflite file size on disk."
+  },
+  "latency_cpu": {
+    "tflite_median_ms": 46.8629,
+    "tflite_p95_ms": 83.3982,
+    "tflite_p99_ms": 111.3784,
+    "tflite_fps": 21.34,
+    "keras_median_ms": 3862.5135,
+    "pipeline_median_ms": 0.2467,
+    "full_pipeline_ms": 47.11,
+    "meets_100ms_target": true,
+    "speedup_vs_keras_x": 82.42,
+    "benchmark_n_calls": 200,
+    "benchmark_warmup": 20,
+    "_note": "full_pipeline_ms = pipeline_median_ms + tflite_median_ms. MediaPipe extraction (~18ms) is excluded \u2014 measured in Stage 9."
+  },
+  "quantisation": {
+    "mode": "dynamic_range",
+    "description": "tf.lite.Optimize.DEFAULT \u2014 int8 weights, float32 activations",
+    "requires_select_tf_ops": true,
+    "reason_for_select_tf_ops": "Bidirectional(LSTM) in TF 2.13 emits TensorListReserve ops not in the standard TFLite builtin op set. SELECT_TF_OPS (flex delegate) required at inference time. Adds ~800KB to the Android TFLite runtime binary.",
+    "sha256_checksum": "da6fc9dcb3b7f713ec681da993b1bf8abfa6be571f3695c5309732c3f785ee73"
+  },
+  "per_class_quantisation_impact": {
+    "n_meaningful_degradations": 0,
+    "n_confusable_pair_flips": 0,
+    "notable_classes": [],
+    "_note": "See tflite_verification_report.json for full 35-class delta table. meaningful_degradation = |delta| > 0.10 on non-singleton class. Confusable pairs from Stage 6 Phase E: think/who, later/house, cousin/mother, girl/orange."
+  },
+  "interpretability_notes": {
+    "peak_frame_importance": 36,
+    "importance_decay_after_frame": 70,
+    "dominant_hand": "right",
+    "left_hand_attribution": "near-zero (possible signer handedness artifact)",
+    "top_confusable_pairs": [
+      {
+        "signs": [
+          "think",
+          "who"
+        ],
+        "cosine_similarity": [
+          0.905,
+          0.785
+        ]
+      },
+      {
+        "signs": [
+          "later",
+          "house"
+        ],
+        "cosine_similarity": [
+          0.919,
+          0.946
+        ]
+      },
+      {
+        "signs": [
+          "cousin",
+          "mother"
+        ],
+        "cosine_similarity": [
+          0.927,
+          0.947
+        ]
+      },
+      {
+        "signs": [
+          "girl",
+          "orange"
+        ],
+        "cosine_similarity": [
+          0.963,
+          0.937
+        ]
+      }
+    ]
+  },
+  "deployment_notes": {
+    "thread_safety": "NOT thread-safe \u2014 one GesturePredictor per thread",
+    "mediapipe_version": "0.10.14 (pinned)",
+    "tensorflow_version": "2.13.1",
+    "android_runtime_note": "Requires TFLite flex delegate for SELECT_TF_OPS",
+    "recommended_entry_point": "GesturePredictor.from_config_snapshot()",
+    "config_snapshot_path": "artifacts\\experiments\\bilstm_hands_only_v4_aug\\config_snapshot.yaml",
+    "stage9_display_threshold": 0.35,
+    "smoother_window": 5,
+    "early_stopping_note": "The champion config shows early_stopping_monitor: val_accuracy. This controls only ReduceLROnPlateau; actual early stopping used a manual Python loop monitoring val_macro_f1 with patience=50. See config_snapshot.yaml for full training parameters."
+  }
+}

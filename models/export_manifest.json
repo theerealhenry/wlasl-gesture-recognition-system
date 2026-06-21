@@ -1,0 +1,69 @@
+{
+  "created_utc": "2026-06-20T17:37:28.791870+00:00",
+  "tensorflow_version": "2.13.1",
+  "output_path": "D:\\PROJECTS\\WLASL-Gesture-Recognition-System\\models\\gesture_bilstm_v1.tflite",
+  "tflite_disk_mb": 0.1596,
+  "savedmodel_disk_mb": 3.87,
+  "param_memory_mb": 0.2623,
+  "conversion_time_s": 22.2,
+  "quantised": true,
+  "quantisation_mode": "dynamic_range",
+  "used_select_tf_ops": true,
+  "keras_params": 68771,
+  "size_reduction_vs_params_x": 1.64,
+  "size_reduction_vs_savedmodel_x": 24.26,
+  "sha256_checksum": "da6fc9dcb3b7f713ec681da993b1bf8abfa6be571f3695c5309732c3f785ee73",
+  "model_diagnostics": {
+    "actual_params": 68771,
+    "actual_input_shape": [
+      null,
+      100,
+      126
+    ],
+    "actual_output_shape": [
+      null,
+      35
+    ],
+    "expected_input_shape": [
+      null,
+      100,
+      126
+    ],
+    "expected_output_shape": [
+      null,
+      35
+    ],
+    "params_match_champion": true,
+    "architecture_check": {
+      "matches": true,
+      "observed_layer_classes": [
+        "InputLayer",
+        "Masking",
+        "Bidirectional",
+        "Bidirectional",
+        "Dense",
+        "Dropout",
+        "Dense"
+      ],
+      "missing_or_insufficient": []
+    },
+    "config_hash": "5809193d37e0d480e409b8e3112e70c8de9008497a29727b411a7128e73287a6"
+  },
+  "sanity_check": {
+    "input_shape": [
+      1,
+      100,
+      126
+    ],
+    "output_shape": [
+      1,
+      35
+    ],
+    "output_finite": true,
+    "output_sum_row0": 1.0,
+    "n_input_tensors": 1,
+    "n_output_tensors": 1
+  },
+  "config_snapshot_path": "D:\\PROJECTS\\WLASL-Gesture-Recognition-System\\artifacts\\experiments\\bilstm_hands_only_v4_aug\\config_snapshot.yaml",
+  "config_hash": "5809193d37e0d480e409b8e3112e70c8de9008497a29727b411a7128e73287a6"
+}
