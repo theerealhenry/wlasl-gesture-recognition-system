@@ -1,0 +1,358 @@
+# =============================================================================
+# docker-compose.yml — WLASL Gesture Recognition Pipeline
+# =============================================================================
+#
+# Author  : Henry Otsyula — Senior Data Scientist & ML Engineer
+# Stage   : 10 (Infrastructure)
+# Version : 3.8
+#
+# OVERVIEW
+# ─────────
+# Defines one named service per pipeline stage. Each service:
+#   - Mounts only the volumes it actually writes to (principle of least access)
+#   - Runs as UID/GID 1000 to match the non-root user in the Dockerfiles
+#   - Inherits determinism env vars from the base config
+#   - Can be run independently:  docker-compose run --rm <service>
+#
+# DETERMINISM NOTES
+# ──────────────────
+# PYTHONHASHSEED=42 is set in the environment block (not just in the image
+# ENV layer). Docker Compose environment values are injected BEFORE Python
+# starts, which is the only correct ordering — hash randomisation must be
+# in place before any dict/set is created by the interpreter startup sequence.
+# TF_DETERMINISTIC_OPS and TF_CUDNN_DETERMINISTIC follow the same logic.
+#
+# VOLUME STRATEGY
+# ────────────────
+# Each service mounts exactly the volumes it needs. This prevents:
+#   - Accidental state sharing between independent pipeline stages
+#   - The test service accidentally overwriting production model checkpoints
+#   - The inference service accidentally reading a partially-written model
+# Read-only mounts (:ro) are used where a service only reads a directory,
+# making it immediately obvious in the compose file which services write where.
+#
+# QUICK REFERENCE
+# ────────────────
+#   Full pipeline (in order):
+#     docker-compose run --rm preprocess
+#     docker-compose run --rm extract
+#     docker-compose run --rm train
+#     docker-compose run --rm evaluate
+#     docker-compose run --rm export
+#     docker-compose run --rm register
+#
+#   Quality gates:
+#     docker-compose run --rm lint
+#     docker-compose run --rm test
+#
+#   Utilities:
+#     docker-compose run --rm mlflow          (MLflow UI at http://localhost:5000)
+#     docker-compose run --rm inference       (webcam demo, requires --device)
+#
+# =============================================================================
+
+version: "3.8"
+
+# ─── Shared base configuration ────────────────────────────────────────────────
+# x-training-base: YAML anchor reused by all training/evaluation services.
+# Avoids repeating build context, image tag, and env vars across 8+ services.
+# Override specific keys per service using the YAML merge key (<<: *base).
+x-training-base: &training-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      BUILD_DATE: "${BUILD_DATE:-}"
+      GIT_COMMIT: "${GIT_COMMIT:-unknown}"
+      VERSION: "${VERSION:-1.0.0}"
+  image: wlasl-train:latest
+  # Determinism environment — these must be set in the compose environment
+  # block (not just in the image ENV layer) to guarantee they are present
+  # before Python's interpreter initialises. See DETERMINISM NOTES above.
+  environment:
+    - PYTHONHASHSEED=42
+    - TF_DETERMINISTIC_OPS=1
+    - TF_CUDNN_DETERMINISTIC=1
+    - TF_CPP_MIN_LOG_LEVEL=2
+    # Pass through the host's MLFLOW_TRACKING_URI if set (for remote tracking).
+    # Defaults to the local mlruns/ directory otherwise.
+    - MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI:-mlruns}
+  # Run as the non-root mluser (UID/GID 1000) defined in the Dockerfile.
+  # This ensures files written inside containers have correct ownership when
+  # bind-mounted directories are inspected on the host.
+  user: "1000:1000"
+  # Sensible resource limits: TF training on a 236-clip dataset is CPU-bound.
+  # Adjust cpus/memory upward for larger datasets or GPU-equipped hosts.
+  # These defaults prevent runaway containers from starving other processes.
+  deploy:
+    resources:
+      limits:
+        cpus: "4.0"
+        memory: "8G"
+      reservations:
+        cpus: "1.0"
+        memory: "2G"
+  # Restart policy: do not restart automatically. Training pipelines are
+  # one-shot batch jobs; an automatic restart after OOM or exit-1 would
+  # waste compute and corrupt MLflow run state.
+  restart: "no"
+
+# ─── Services ─────────────────────────────────────────────────────────────────
+services:
+
+  # ── Stage 1: Data Preprocessing ─────────────────────────────────────────────
+  # Downloads WLASL videos from YouTube, validates the manifest, and creates
+  # signer-aware train/val/test splits (zero signer overlap guaranteed).
+  # Writes to: data/raw/, data/splits/, logs/
+  preprocess:
+    <<: *training-base
+    container_name: wlasl-preprocess
+    command: python pipelines/run_preprocessing.py
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    # Internet access required for YouTube downloads.
+    # If running in a restricted environment, mount a pre-downloaded dataset
+    # and skip this service.
+
+  # ── Stage 3: Landmark Extraction ────────────────────────────────────────────
+  # Runs MediaPipe Holistic over every downloaded video clip and saves
+  # (N, 225) float32 landmark arrays + schema-v1.2 sidecar .meta.json files.
+  # Reads:  data/raw/, data/splits/
+  # Writes: data/landmarks/, logs/
+  extract:
+    <<: *training-base
+    container_name: wlasl-extract
+    command: python pipelines/run_landmark_extraction.py --split all
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+  # ── Stage 5: Training ────────────────────────────────────────────────────────
+  # Runs the full 23-run ablation experiment matrix (Groups 1–4 + champion run).
+  # Each run logs parameters, metrics, and artifacts to MLflow.
+  # Reads:  data/landmarks/, data/splits/, artifacts/
+  # Writes: models/*_saved_model/, models/*_best_weights/, mlruns/, logs/,
+  #         artifacts/experiments/<run_name>/
+  train:
+    <<: *training-base
+    container_name: wlasl-train
+    command: python pipelines/run_all_experiments.py
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./mlruns:/app/mlruns
+      - ./artifacts:/app/artifacts
+      - ./logs:/app/logs
+    # Training is the most compute-intensive service. Allocate more CPU time
+    # than the base default. Raise memory limit if training on a larger dataset.
+    deploy:
+      resources:
+        limits:
+          cpus: "6.0"
+          memory: "12G"
+        reservations:
+          cpus: "2.0"
+          memory: "4G"
+
+  # ── Stage 5 (champion only): Train single run ─────────────────────────────
+  # Faster alternative: run ONLY the champion configuration without the full
+  # 23-run ablation matrix. Useful for reproducing the champion after a KSL
+  # fine-tuning experiment without re-running all baselines.
+  train-champion:
+    <<: *training-base
+    container_name: wlasl-train-champion
+    command: >
+      python pipelines/run_training.py
+        --model bilstm
+        --data seq100
+        --augmentation spatial_temporal
+        --run-name bilstm_hands_only_v4_aug
+        --overrides data.landmark_config=hands_only training.learning_rate=0.0005
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./mlruns:/app/mlruns
+      - ./artifacts:/app/artifacts
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: "8G"
+
+  # ── Stage 6: Evaluation ──────────────────────────────────────────────────────
+  # Runs the full evaluation suite: confusion matrices, SHAP attribution,
+  # per-class metrics, calibration analysis, benchmark latency.
+  # Reads:  data/landmarks/, data/splits/, models/, artifacts/
+  # Writes: reports/evaluation/, reports/figures/, logs/
+  evaluate:
+    <<: *training-base
+    container_name: wlasl-evaluate
+    command: >
+      python pipelines/run_evaluation.py
+        --champion-run bilstm_hands_only_v4_aug
+        --splits val test
+        --output-dir reports/evaluation/
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./artifacts:/app/artifacts:ro
+      - ./logs:/app/logs
+
+  # ── Stage 8: TFLite Export + Verification ──────────────────────────────────
+  # Runs the full Stage 8 pipeline:
+  #   Step 1: export_champion() → gesture_bilstm_v1.tflite (convert.py)
+  #   Step 2: run_full_verification() → release gate + metadata (verify.py)
+  # The 6/6 hard criteria must PASS before Stage 9 can proceed.
+  # Reads:  models/*_saved_model/, data/landmarks/, artifacts/
+  # Writes: models/gesture_bilstm_v1.tflite, models/export_manifest.json,
+  #         models/gesture_model_metadata.json, reports/evaluation/tflite_*,
+  #         reports/figures/tflite_*, logs/
+  export:
+    <<: *training-base
+    container_name: wlasl-export
+    command: python pipelines/run_export_verification.py
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./artifacts:/app/artifacts:ro
+      - ./logs:/app/logs
+
+  # ── Stage 10: MLflow Model Registry ─────────────────────────────────────────
+  # Registers the Stage 5 champion in the MLflow Model Registry as
+  # gesture-lstm-production at Production stage. Idempotent (safe to re-run).
+  # Reads:  mlruns/ (to find the champion run by run ID)
+  # Writes: mlruns/ (registry metadata)
+  register:
+    <<: *training-base
+    container_name: wlasl-register
+    command: python pipelines/run_model_registration.py
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./models:/app/models:ro
+      - ./logs:/app/logs
+
+  # ── Quality: Lint ─────────────────────────────────────────────────────────
+  # Runs flake8 over src/, pipelines/, and tests/.
+  # Exit code 0 = no violations; exit code 1 = violations found.
+  # Used as CI job 1 (lint must pass before test and docker-build run).
+  lint:
+    <<: *training-base
+    container_name: wlasl-lint
+    command: >
+      flake8 src/ pipelines/ tests/
+        --max-line-length 100
+        --extend-ignore E203,W503
+        --exclude src/__pycache__,__pycache__,.git,.venv
+    volumes:
+      - ./src:/app/src:ro
+      - ./pipelines:/app/pipelines:ro
+      - ./tests:/app/tests:ro
+
+  # ── Quality: Test ──────────────────────────────────────────────────────────
+  # Runs the full pytest suite with coverage.
+  # --cov-fail-under=60: realistic threshold given Stage 10 test files are
+  # unit tests with mocks. Target ≥70% after all Stage 10 test files land.
+  # Reads:  data/ (fixtures), artifacts/ (label map, config snapshots)
+  # Writes: coverage.xml (for Codecov upload in CI)
+  test:
+    <<: *training-base
+    container_name: wlasl-test
+    command: >
+      pytest tests/ -v
+        --tb=short
+        --cov=src
+        --cov-report=term-missing
+        --cov-report=xml:coverage.xml
+        --cov-fail-under=60
+    volumes:
+      - ./data:/app/data:ro
+      - ./artifacts:/app/artifacts:ro
+      - ./tests:/app/tests:ro
+      - ./src:/app/src:ro
+      # coverage.xml is written to the working directory — mount a
+      # writable output location so CI can collect it.
+      - ./reports:/app/reports
+
+  # ── Utility: MLflow UI ──────────────────────────────────────────────────────
+  # Launches the MLflow experiment tracking UI.
+  # Access at http://localhost:5000 after running:
+  #   docker-compose up mlflow
+  mlflow:
+    <<: *training-base
+    container_name: wlasl-mlflow
+    command: mlflow ui --host 0.0.0.0 --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/app/mlruns:ro
+    restart: unless-stopped
+    # Override resource limits: the MLflow UI is a lightweight Flask app.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  # ── Production Inference (webcam demo) ─────────────────────────────────────
+  # Runs the Stage 9 real-time webcam demo using the lean inference image.
+  # The TFLite model is mounted read-only — not baked into the image.
+  #
+  # LINUX webcam passthrough:
+  #   /dev/video0 is the default camera. Adjust to /dev/video1 etc. as needed.
+  #   Run `ls /dev/video*` to discover available camera devices.
+  #
+  # macOS: OpenCV VideoCapture cannot access cameras inside Docker containers
+  #   on macOS without a third-party USB/IP bridge. Run the demo natively
+  #   on macOS: python src/demo/webcam_demo.py
+  #
+  # DISPLAY forwarding (Linux):
+  #   The DISPLAY env var and X11 socket are forwarded so cv2.imshow() works.
+  #   If running headlessly (CI, cloud), add --no-hud or use VNC.
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile.inference
+      args:
+        BUILD_DATE: "${BUILD_DATE:-}"
+        GIT_COMMIT: "${GIT_COMMIT:-unknown}"
+        VERSION: "${VERSION:-1.0.0}"
+    image: wlasl-inference:latest
+    container_name: wlasl-inference
+    command: >
+      python src/demo/webcam_demo.py
+        --model models/gesture_bilstm_v1.tflite
+        --config artifacts/experiments/bilstm_hands_only_v4_aug/config_snapshot.yaml
+    volumes:
+      # Model: mounted read-only — never baked into the image
+      - ./models:/app/models:ro
+      # Artifacts: label map and config snapshots (also baked in, but mount
+      # for override flexibility during KSL adaptation experiments)
+      - ./artifacts:/app/artifacts:ro
+    # Camera device passthrough (Linux only).
+    # Comment out or remove the `devices:` block on macOS/Windows.
+    devices:
+      - /dev/video0:/dev/video0
+    environment:
+      # X11 display forwarding for cv2.imshow()
+      - DISPLAY=${DISPLAY:-:0}
+      - PYTHONHASHSEED=42
+      - TF_CPP_MIN_LOG_LEVEL=2
+    # Host networking: required for X11 socket forwarding and for accessing
+    # /dev/video0 on some Linux configurations. Alternatively, mount the
+    # X11 socket explicitly: volumes: [/tmp/.X11-unix:/tmp/.X11-unix].
+    network_mode: host
+    # Override resource limits: inference is much lighter than training.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2G"
+        reservations:
+          cpus: "0.5"
+          memory: "512M"
+    user: "1000:1000"
+    restart: "no"
