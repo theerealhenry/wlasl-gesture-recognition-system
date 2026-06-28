@@ -1,0 +1,98 @@
+# =============================================================================
+# requirements-inference.txt — WLASL Gesture Recognition: Inference Only
+# =============================================================================
+# Author  : Henry Otsyula — Senior Data Scientist & ML Engineer
+# Stage   : 10 (Infrastructure)
+# Used by : Dockerfile.inference (lean ~300 MB production image)
+#
+# PURPOSE
+# ────────
+# Minimal dependency set for GesturePredictor inference. Every package here
+# has a documented reason. Packages not listed are explicitly excluded.
+#
+# ABI COMPATIBILITY CONTRACT
+# ───────────────────────────
+# tflite-runtime 2.13.0 MUST match TF 2.13.1's ABI. The SELECT_TF_OPS flex
+# delegate (required for the champion BiLSTM's TensorList ops) is linked
+# against TF 2.13.1 C++ symbols. A version mismatch causes either:
+#   (a) a load-time symbol error            (immediately visible), or
+#   (b) silent numerical drift in dequant   (catastrophic, invisible)
+# Do NOT upgrade tflite-runtime independently of tensorflow in requirements.txt.
+#
+# PROTOBUF CONSTRAINT
+# ────────────────────
+# protobuf==3.20.3 is installed BEFORE this file in Dockerfile.inference
+# (via a separate pip install protobuf==3.20.3 step).
+# MediaPipe 0.10.14 requires protobuf>=3.20; protobuf 4.x breaks the
+# MediaPipe C++/Python bridge API. This constraint is fragile if pip
+# attempts to upgrade it as a dependency of another package — pinning here
+# enforces the ceiling.
+# =============================================================================
+
+
+# ─── TFLite Runtime ──────────────────────────────────────────────────────────
+# Lightweight alternative to full tensorflow (~10 MB vs ~500 MB).
+# Provides tf.lite.Interpreter with SELECT_TF_OPS flex delegate support.
+# The flex delegate is required for the champion BiLSTM's TensorListReserve /
+# TensorListStack ops (confirmed in Stage 8 convert.py; cannot use builtin-ops
+# only for this architecture under TF 2.13).
+# Version MUST match TF 2.13.1 ABI — see contract note above.
+tflite-runtime==2.13.0
+
+# ─── MediaPipe ───────────────────────────────────────────────────────────────
+# Landmark extraction: HandsExtractor (Stage 9) uses mp.solutions.hands.
+# Pinned to 0.10.14 to guarantee:
+#   - N_HAND=21 landmarks per hand (63 values)
+#   - N_POSE=33 landmarks (not used at inference but constants pinned to this)
+#   - Handedness classification API stability
+# Stage 8 Executive Summary confirms 0.10.14 is the required version for
+# the verified pipeline (~8–10ms per frame with Hands model, vs ~18ms Holistic).
+mediapipe==0.10.14
+
+# ─── OpenCV (headless) ───────────────────────────────────────────────────────
+# Headless variant: excludes Qt, GTK, and X11 GUI backends.
+# Required for:
+#   - cv2.VideoCapture  : webcam frame reading in webcam_demo.py
+#   - cv2.cvtColor      : BGR→RGB conversion before MediaPipe processing
+#   - cv2.imencode      : screenshot encoding
+#   - cv2.VideoWriter   : recording output in --record mode
+#   - cv2.putText et al : HUD rendering (all OpenCV drawing ops in webcam_demo.py)
+# 4.8.1.78 is the last stable release before ABI changes that break MediaPipe
+# (confirmed in requirements.txt compatibility note).
+opencv-python-headless==4.8.1.78
+
+# ─── NumPy ───────────────────────────────────────────────────────────────────
+# Core array operations throughout the inference path:
+#   - FeaturePipeline: wrist-normalisation, z-clipping, pad/crop
+#   - FrameBuffer: rolling landmark accumulator
+#   - PredictionSmoother: exponential smoothing, majority voting
+#   - GesturePredictor: raw_probs, smoothed_probs, argmax
+# Pinned to 1.24.3: TF 2.13.x requires numpy < 2.0; 1.24.3 is the
+# highest patch release in the 1.24 series compatible with all dependencies.
+numpy==1.24.3
+
+# ─── OmegaConf ───────────────────────────────────────────────────────────────
+# Required by GesturePredictor.from_config_snapshot() and
+# src/utils/config.py::load_config_from_manifest():
+#   OmegaConf.load(snapshot_path)          → DictConfig
+#   OmegaConf.to_container(raw, resolve=True) → plain dict for Pydantic
+# Without OmegaConf, the predictor cannot reconstruct ExperimentConfig from
+# the config_snapshot.yaml file — inference cannot start.
+omegaconf==2.3.0
+
+# ─── Pydantic ────────────────────────────────────────────────────────────────
+# ExperimentConfig schema validation (frozen, typed config object).
+# Used by GesturePredictor.__init__() to access:
+#   config.data.sequence_length, config.data.landmark_config,
+#   config.data.z_coord_clip, config.num_classes, etc.
+# Pydantic v2.8.2 matches requirements.txt to ensure identical validation
+# behaviour between training and inference environments.
+pydantic==2.8.2
+
+# ─── Protobuf ────────────────────────────────────────────────────────────────
+# Re-declared here as a ceiling constraint (Dockerfile.inference installs it
+# before this file, but pip may attempt to upgrade it as a transitive dep).
+# protobuf==3.20.3 is the MediaPipe 0.10.14 compatibility ceiling.
+# Note: protobuf is installed BEFORE this file in the Dockerfile so that
+# the version is already pinned when mediapipe is resolved.
+protobuf==3.20.3
