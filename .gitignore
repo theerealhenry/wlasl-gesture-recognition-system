@@ -29,6 +29,7 @@ models/*.ckpt
 models/*.ckpt.*
 models/*.index
 models/*.data-*
+models/
 
 # TFLite export — commit only the final champion model if < 10 MB
 # Uncomment the line below to also exclude .tflite files:
@@ -296,3 +297,6 @@ docs/site/
 
 # project outline doc
 *docx
+
+outputs/
+

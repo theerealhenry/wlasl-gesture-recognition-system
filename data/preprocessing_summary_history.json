@@ -542,5 +542,628 @@
         "missing_rate": 0.0
       }
     }
+  },
+  {
+    "_run_metadata": {
+      "run_id": "20260603T063222Z",
+      "status": "completed",
+      "started_utc": "2026-06-03T06:32:22.220557+00:00",
+      "completed_utc": "2026-06-03T06:54:38.762912+00:00",
+      "extractor_schema": "1.1",
+      "max_missing_frame_pct": 0.3
+    },
+    "aggregate": {
+      "n_queued": 208,
+      "n_extracted": 1,
+      "n_cached": 50,
+      "n_skipped_policy": 157,
+      "n_skipped_error": 0,
+      "n_usable": 51,
+      "policy_skip_rate": 0.7548,
+      "error_rate": 0.0,
+      "total_frames": 25,
+      "total_decode_failures": 2,
+      "total_missing_both": 6,
+      "global_missing_rate": 0.2609,
+      "total_proc_sec": 1277.7,
+      "mean_proc_sec_per_clip": 1277.659
+    },
+    "per_sign": {
+      "before": {
+        "usable": 2,
+        "skipped": 4,
+        "total_frames": 87,
+        "missing_frames": 19,
+        "missing_rate": 0.2184
+      },
+      "birthday": {
+        "usable": 3,
+        "skipped": 2,
+        "total_frames": 144,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "black": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 34,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "blue": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 51,
+        "missing_frames": 10,
+        "missing_rate": 0.1961
+      },
+      "book": {
+        "usable": 2,
+        "skipped": 3,
+        "total_frames": 72,
+        "missing_frames": 8,
+        "missing_rate": 0.1111
+      },
+      "boy": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 31,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "can": {
+        "usable": 2,
+        "skipped": 4,
+        "total_frames": 42,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "candy": {
+        "usable": 1,
+        "skipped": 6,
+        "total_frames": 32,
+        "missing_frames": 7,
+        "missing_rate": 0.2188
+      },
+      "chair": {
+        "usable": 0,
+        "skipped": 5,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "change": {
+        "usable": 2,
+        "skipped": 3,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "clothes": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 37,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "color": {
+        "usable": 2,
+        "skipped": 4,
+        "total_frames": 142,
+        "missing_frames": 18,
+        "missing_rate": 0.1268
+      },
+      "computer": {
+        "usable": 3,
+        "skipped": 4,
+        "total_frames": 104,
+        "missing_frames": 14,
+        "missing_rate": 0.1346
+      },
+      "cousin": {
+        "usable": 1,
+        "skipped": 8,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "drink": {
+        "usable": 1,
+        "skipped": 7,
+        "total_frames": 79,
+        "missing_frames": 22,
+        "missing_rate": 0.2785
+      },
+      "eat": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 52,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "family": {
+        "usable": 0,
+        "skipped": 5,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "finish": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 33,
+        "missing_frames": 6,
+        "missing_rate": 0.1818
+      },
+      "friend": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 60,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "girl": {
+        "usable": 2,
+        "skipped": 5,
+        "total_frames": 60,
+        "missing_frames": 17,
+        "missing_rate": 0.2833
+      },
+      "give": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 25,
+        "missing_frames": 6,
+        "missing_rate": 0.24
+      },
+      "go": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 35,
+        "missing_frames": 8,
+        "missing_rate": 0.2286
+      },
+      "help": {
+        "usable": 4,
+        "skipped": 3,
+        "total_frames": 128,
+        "missing_frames": 17,
+        "missing_rate": 0.1328
+      },
+      "house": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 46,
+        "missing_frames": 8,
+        "missing_rate": 0.1739
+      },
+      "know": {
+        "usable": 2,
+        "skipped": 4,
+        "total_frames": 69,
+        "missing_frames": 19,
+        "missing_rate": 0.2754
+      },
+      "later": {
+        "usable": 2,
+        "skipped": 5,
+        "total_frames": 37,
+        "missing_frames": 10,
+        "missing_rate": 0.2703
+      },
+      "like": {
+        "usable": 0,
+        "skipped": 6,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "many": {
+        "usable": 1,
+        "skipped": 4,
+        "total_frames": 44,
+        "missing_frames": 9,
+        "missing_rate": 0.2045
+      },
+      "mother": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 76,
+        "missing_frames": 21,
+        "missing_rate": 0.2763
+      },
+      "name": {
+        "usable": 2,
+        "skipped": 3,
+        "total_frames": 55,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "now": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 43,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "orange": {
+        "usable": 0,
+        "skipped": 6,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      },
+      "thanksgiving": {
+        "usable": 4,
+        "skipped": 2,
+        "total_frames": 92,
+        "missing_frames": 22,
+        "missing_rate": 0.2391
+      },
+      "think": {
+        "usable": 2,
+        "skipped": 5,
+        "total_frames": 114,
+        "missing_frames": 18,
+        "missing_rate": 0.1579
+      },
+      "who": {
+        "usable": 1,
+        "skipped": 5,
+        "total_frames": 0,
+        "missing_frames": 0,
+        "missing_rate": 0.0
+      }
+    }
+  },
+  {
+    "_run_metadata": {
+      "run_id": "20260603T092821Z",
+      "status": "completed",
+      "started_utc": "2026-06-03T09:28:21.553849+00:00",
+      "completed_utc": "2026-06-03T10:18:39.858439+00:00",
+      "extractor_schema": "1.2",
+      "skip_policy": "dual_criterion_v1.2",
+      "min_detected_frames": 15,
+      "max_missing_pct": 0.95
+    },
+    "aggregate": {
+      "n_queued": 350,
+      "n_extracted": 339,
+      "n_cached": 0,
+      "n_skipped_policy": 11,
+      "n_skipped_error": 0,
+      "n_usable": 339,
+      "policy_skip_rate": 0.0314,
+      "error_rate": 0.0,
+      "total_frames": 22928,
+      "total_detected": 13341,
+      "total_decode_failures": 678,
+      "total_missing_left": 15974,
+      "total_missing_right": 9413,
+      "total_missing_pose": 85,
+      "total_missing_both": 8909,
+      "global_missing_rate": 0.4004,
+      "global_detection_rate": 0.5996,
+      "total_proc_sec": 3001.6,
+      "mean_proc_sec_per_clip": 8.854
+    },
+    "per_sign": {
+      "before": {
+        "usable": 16,
+        "skipped": 0,
+        "total_frames": 1001,
+        "detected_frames": 649,
+        "missing_frames": 320,
+        "detection_rate": 0.6484,
+        "missing_rate": 0.3197
+      },
+      "birthday": {
+        "usable": 6,
+        "skipped": 0,
+        "total_frames": 438,
+        "detected_frames": 290,
+        "missing_frames": 136,
+        "detection_rate": 0.6621,
+        "missing_rate": 0.3105
+      },
+      "black": {
+        "usable": 9,
+        "skipped": 1,
+        "total_frames": 562,
+        "detected_frames": 270,
+        "missing_frames": 274,
+        "detection_rate": 0.4804,
+        "missing_rate": 0.4875
+      },
+      "blue": {
+        "usable": 8,
+        "skipped": 0,
+        "total_frames": 518,
+        "detected_frames": 247,
+        "missing_frames": 255,
+        "detection_rate": 0.4768,
+        "missing_rate": 0.4923
+      },
+      "book": {
+        "usable": 6,
+        "skipped": 0,
+        "total_frames": 396,
+        "detected_frames": 229,
+        "missing_frames": 155,
+        "detection_rate": 0.5783,
+        "missing_rate": 0.3914
+      },
+      "boy": {
+        "usable": 8,
+        "skipped": 0,
+        "total_frames": 572,
+        "detected_frames": 279,
+        "missing_frames": 277,
+        "detection_rate": 0.4878,
+        "missing_rate": 0.4843
+      },
+      "can": {
+        "usable": 9,
+        "skipped": 0,
+        "total_frames": 549,
+        "detected_frames": 306,
+        "missing_frames": 225,
+        "detection_rate": 0.5574,
+        "missing_rate": 0.4098
+      },
+      "candy": {
+        "usable": 13,
+        "skipped": 0,
+        "total_frames": 825,
+        "detected_frames": 381,
+        "missing_frames": 418,
+        "detection_rate": 0.4618,
+        "missing_rate": 0.5067
+      },
+      "chair": {
+        "usable": 7,
+        "skipped": 0,
+        "total_frames": 496,
+        "detected_frames": 271,
+        "missing_frames": 211,
+        "detection_rate": 0.5464,
+        "missing_rate": 0.4254
+      },
+      "change": {
+        "usable": 12,
+        "skipped": 0,
+        "total_frames": 841,
+        "detected_frames": 587,
+        "missing_frames": 230,
+        "detection_rate": 0.698,
+        "missing_rate": 0.2735
+      },
+      "clothes": {
+        "usable": 5,
+        "skipped": 0,
+        "total_frames": 377,
+        "detected_frames": 193,
+        "missing_frames": 174,
+        "detection_rate": 0.5119,
+        "missing_rate": 0.4615
+      },
+      "color": {
+        "usable": 8,
+        "skipped": 0,
+        "total_frames": 615,
+        "detected_frames": 356,
+        "missing_frames": 243,
+        "detection_rate": 0.5789,
+        "missing_rate": 0.3951
+      },
+      "computer": {
+        "usable": 14,
+        "skipped": 0,
+        "total_frames": 979,
+        "detected_frames": 703,
+        "missing_frames": 248,
+        "detection_rate": 0.7181,
+        "missing_rate": 0.2533
+      },
+      "cousin": {
+        "usable": 13,
+        "skipped": 1,
+        "total_frames": 1027,
+        "detected_frames": 564,
+        "missing_frames": 437,
+        "detection_rate": 0.5492,
+        "missing_rate": 0.4255
+      },
+      "drink": {
+        "usable": 15,
+        "skipped": 0,
+        "total_frames": 993,
+        "detected_frames": 571,
+        "missing_frames": 392,
+        "detection_rate": 0.575,
+        "missing_rate": 0.3948
+      },
+      "eat": {
+        "usable": 6,
+        "skipped": 1,
+        "total_frames": 422,
+        "detected_frames": 220,
+        "missing_frames": 190,
+        "detection_rate": 0.5213,
+        "missing_rate": 0.4502
+      },
+      "family": {
+        "usable": 11,
+        "skipped": 0,
+        "total_frames": 826,
+        "detected_frames": 509,
+        "missing_frames": 295,
+        "detection_rate": 0.6162,
+        "missing_rate": 0.3571
+      },
+      "finish": {
+        "usable": 8,
+        "skipped": 1,
+        "total_frames": 385,
+        "detected_frames": 260,
+        "missing_frames": 109,
+        "detection_rate": 0.6753,
+        "missing_rate": 0.2831
+      },
+      "friend": {
+        "usable": 7,
+        "skipped": 0,
+        "total_frames": 599,
+        "detected_frames": 316,
+        "missing_frames": 269,
+        "detection_rate": 0.5275,
+        "missing_rate": 0.4491
+      },
+      "girl": {
+        "usable": 9,
+        "skipped": 0,
+        "total_frames": 546,
+        "detected_frames": 283,
+        "missing_frames": 245,
+        "detection_rate": 0.5183,
+        "missing_rate": 0.4487
+      },
+      "give": {
+        "usable": 10,
+        "skipped": 0,
+        "total_frames": 552,
+        "detected_frames": 342,
+        "missing_frames": 190,
+        "detection_rate": 0.6196,
+        "missing_rate": 0.3442
+      },
+      "go": {
+        "usable": 15,
+        "skipped": 0,
+        "total_frames": 887,
+        "detected_frames": 602,
+        "missing_frames": 255,
+        "detection_rate": 0.6787,
+        "missing_rate": 0.2875
+      },
+      "help": {
+        "usable": 14,
+        "skipped": 0,
+        "total_frames": 864,
+        "detected_frames": 617,
+        "missing_frames": 219,
+        "detection_rate": 0.7141,
+        "missing_rate": 0.2535
+      },
+      "house": {
+        "usable": 7,
+        "skipped": 0,
+        "total_frames": 489,
+        "detected_frames": 275,
+        "missing_frames": 200,
+        "detection_rate": 0.5624,
+        "missing_rate": 0.409
+      },
+      "know": {
+        "usable": 7,
+        "skipped": 1,
+        "total_frames": 451,
+        "detected_frames": 252,
+        "missing_frames": 185,
+        "detection_rate": 0.5588,
+        "missing_rate": 0.4102
+      },
+      "later": {
+        "usable": 12,
+        "skipped": 0,
+        "total_frames": 822,
+        "detected_frames": 433,
+        "missing_frames": 365,
+        "detection_rate": 0.5268,
+        "missing_rate": 0.444
+      },
+      "like": {
+        "usable": 10,
+        "skipped": 0,
+        "total_frames": 688,
+        "detected_frames": 404,
+        "missing_frames": 264,
+        "detection_rate": 0.5872,
+        "missing_rate": 0.3837
+      },
+      "many": {
+        "usable": 10,
+        "skipped": 0,
+        "total_frames": 607,
+        "detected_frames": 402,
+        "missing_frames": 185,
+        "detection_rate": 0.6623,
+        "missing_rate": 0.3048
+      },
+      "mother": {
+        "usable": 10,
+        "skipped": 1,
+        "total_frames": 705,
+        "detected_frames": 362,
+        "missing_frames": 323,
+        "detection_rate": 0.5135,
+        "missing_rate": 0.4582
+      },
+      "name": {
+        "usable": 6,
+        "skipped": 0,
+        "total_frames": 424,
+        "detected_frames": 254,
+        "missing_frames": 158,
+        "detection_rate": 0.5991,
+        "missing_rate": 0.3726
+      },
+      "now": {
+        "usable": 9,
+        "skipped": 0,
+        "total_frames": 580,
+        "detected_frames": 317,
+        "missing_frames": 245,
+        "detection_rate": 0.5466,
+        "missing_rate": 0.4224
+      },
+      "orange": {
+        "usable": 9,
+        "skipped": 1,
+        "total_frames": 700,
+        "detected_frames": 313,
+        "missing_frames": 369,
+        "detection_rate": 0.4471,
+        "missing_rate": 0.5271
+      },
+      "thanksgiving": {
+        "usable": 12,
+        "skipped": 1,
+        "total_frames": 933,
+        "detected_frames": 642,
+        "missing_frames": 267,
+        "detection_rate": 0.6881,
+        "missing_rate": 0.2862
+      },
+      "think": {
+        "usable": 7,
+        "skipped": 0,
+        "total_frames": 452,
+        "detected_frames": 242,
+        "missing_frames": 196,
+        "detection_rate": 0.5354,
+        "missing_rate": 0.4336
+      },
+      "who": {
+        "usable": 11,
+        "skipped": 3,
+        "total_frames": 807,
+        "detected_frames": 400,
+        "missing_frames": 385,
+        "detection_rate": 0.4957,
+        "missing_rate": 0.4771
+      }
+    }
   }
 ]

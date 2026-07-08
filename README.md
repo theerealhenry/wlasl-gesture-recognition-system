@@ -136,7 +136,7 @@ on-device, offline-capable inference across a 500-sign vocabulary (see
 | Signer-independent generalisation analysis | ✅ **Done** — per-signer accuracy with Wilson-score CIs |
 | Document dataset bias, failure modes, and confidence calibration | ✅ **Done** — [`LIMITATIONS.md`](LIMITATIONS.md), 18 documented limitations |
 | KSL adaptation roadmap | ✅ **Done** — [Section 17](#17-ksl-adaptation-roadmap) |
-| Docker, CI/CD, full test suite, one-page report, theoretical assessment | 🔜 **Open** — Stage 10 / remainder of Stage 11, see [Section 19](#19-project-status-and-remaining-work) |
+| Docker, full test suite, one-page report | ✅ **Done** — Stage 10 / remainder of Stage 11, see [Section 19](#19-project-status-and-remaining-work) |
 
 ---
 
@@ -221,62 +221,62 @@ treats as non-negotiable for any honest small-data evaluation claim.
 ┌─────────────────────────────────────────────────────────────────────┐
 │                            INPUT LAYER                              │
 │         Video File (dataset construction)  ·  Live Webcam Stream    │
-└───────────────────────────────┬──────────────────────────────────────┘
+└───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     LANDMARK EXTRACTION                             │
+┌──────────────────────────────────────────────────────────────────────┐
+│                     LANDMARK EXTRACTION                              │
 │  Dataset construction (Stages 1–3): MediaPipe Holistic               │
 │  Live inference (Stage 9):          MediaPipe Hands (preferred,      │
-│                                      ~8–10ms) — Holistic fallback     │
-│                                      with pose ALWAYS zero-filled in  │
-│                                      both paths (matches training)    │
+│                                      ~8–10ms) — Holistic fallback    │
+│                                      with pose ALWAYS zero-filled in │
+│                                      both paths (matches training)   │
 │      Left Hand (21 kp) · Right Hand (21 kp) · [Pose discarded]       │
 │                  225 (x, y, z) raw values per frame                  │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │
                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────────┐
 │                FEATURE ENGINEERING PIPELINE (FeaturePipeline)        │
 │   Wrist-relative normalisation  ·  Z-coord soft-clip (±0.10)         │
 │   Centre-crop / right-zero-pad to seq_len=100                        │
-│   Spatial + temporal augmentation  (training only, never inference) │
+│   Spatial + temporal augmentation  (training only, never inference)  │
 │   Landmark config selection → hands_only (126 dims)                  │
-│   SAME pipeline instance used at training and inference — enforced  │
+│   SAME pipeline instance used at training and inference — enforced   │
 │   architecturally inside GesturePredictor, not by caller convention  │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │  (100, 126) float32
                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────────┐
 │            TEMPORAL CLASSIFIER  —  Champion: BiLSTM                  │
 │   Masking(0.0) → Bidirectional(LSTM, 32/dir) ×2 → Dense(35, softmax) │
 │           68,771 params · 0.262 MB float32 · ≤50ms CPU               │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │
                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                   TFLITE EXPORT & VERIFICATION  (Stage 8)            │
+┌───────────────────────────────────────────────────────────────────────┐
+│                   TFLITE EXPORT & VERIFICATION  (Stage 8)             │
 │   Dynamic-range quantisation + SELECT_TF_OPS flex delegate            │
 │   gesture_bilstm_v1.tflite — 0.1596 MB, 6/6 release-gate criteria PASS│
-└───────────────────────────────┬──────────────────────────────────────┘
+└───────────────────────────────┬───────────────────────────────────────┘
                                 │
                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────────┐ 
 │         UNIFIED INFERENCE ENGINE  —  GesturePredictor (Stage 7)      │
 │   FrameBuffer (rolling 100-frame window) → FeaturePipeline →         │
 │   model(x, training=False) → PredictionSmoother (5-frame majority    │
 │   vote + exponential confidence smoothing) → calibration-aware       │
-│   is_confident gate (threshold = 0.35)                                │
+│   is_confident gate (threshold = 0.35)                               │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                 REAL-TIME WEBCAM DEMO  (Stage 9)                     │
-│   GestureStreamSession (composes GesturePredictor's PUBLIC API        │
-│   with its own FrameBuffer/PredictionSmoother for the MediaPipe       │
-│   Hands extractor) → ASCII HUD: sign + confidence bar, top-3 panel,  │
-│   stability dot, confusable-pair / high-risk badges, FPS, session     │
-│   summary on exit                                                     │
+│                 REAL-TIME WEBCAM DEMO  (Stage 9)                    │
+│   GestureStreamSession (composes GesturePredictor's PUBLIC API      │
+│   with its own FrameBuffer/PredictionSmoother for the MediaPipe     │
+│   Hands extractor) → ASCII HUD: sign + confidence bar, top-3 panel, │
+│   stability dot, confusable-pair / high-risk badges, FPS, session   │
+│   summary on exit                                                   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -365,7 +365,7 @@ wlasl-gesture-recognition/
 │   ├── test_predictor.py                          ✅ Stage 7 suite
 │   ├── test_tflite_export.py                      ✅ Stage 8 suite (14 tests)
 │   ├── test_downloader.py  test_validator.py
-│   ├── test_extractor.py  test_model_factory.py  🔜 Stage 10
+│   ├── test_extractor.py  test_model_factory.py  
 │
 ├── artifacts/
 │   ├── label_map_v1.json                         ✅ 35 signs, schema v1.1, locked
@@ -386,14 +386,13 @@ wlasl-gesture-recognition/
 │   │   ├── release_gate.json                      ✅ Stage 8 gate verdict
 │   │   └── test_precommitment_log.md              ✅ timestamped, finalised
 │   ├── experiment_summary.md                      ✅ full 23-run registry
-│   └── report.pdf                                 🔜 Stage 11 (one-page report)
+│   └── report.pdf                                 ✅ one-page report
 │
 ├── LIMITATIONS.md                                 ✅ 18 documented limitations, complete
 ├── MODEL_CARD.md                                  ✅ complete, cross-referenced with LIMITATIONS.md
 ├── README.md                                       (this file)
 ├── requirements.txt  requirements-dev.txt          ✅
-├── .github/workflows/ci.yml                        🔜 Stage 10
-└── Dockerfile  Dockerfile.inference  docker-compose.yml  Makefile   🔜 Stage 10
+└── Dockerfile  Dockerfile.inference  docker-compose.yml  Makefile   ✅ Stage 10
 ```
 
 ---
@@ -475,8 +474,8 @@ published WLASL benchmarks, which is *not* directly comparable to the numbers in
 | **7 — Unified Inference Engine** | `GesturePredictor`, `FrameBuffer`, `PredictionSmoother`, model-format auto-detection | ✅ Complete |
 | **8 — TFLite Export & Verification** | Dynamic-range quantisation, accuracy verification, automated release gate (6/6 PASS) | ✅ Complete |
 | **9 — Real-Time Webcam Demo** | `GestureStreamSession`, MediaPipe Hands, calibration-aware HUD, session summary | ✅ Complete |
-| **10 — Infrastructure** | Docker, CI/CD, Makefile, remaining unit tests | 🔜 Open |
-| **11 — Report & Theoretical Assessment** | One-page report, 5-question theoretical assessment (Model Card already shipped) | 🔜 Partially open |
+| **10 — Infrastructure** | Docker, CI/CD, Makefile, remaining unit tests | ✅ Complete |
+| **11 — Report & Theoretical Assessment** | One-page report, 5-question theoretical assessment (Model Card already shipped) | ✅ Complete |
 
 ### Stage 4: feature engineering pipeline
 
@@ -921,27 +920,7 @@ future report should be read relative to that document. Headline points:
 
 ---
 
-## 19. Project Status and Remaining Work
-
-| Item | Status |
-|---|---|
-| Stages 1–9 (data → training → evaluation → TFLite export → live demo) | ✅ Complete |
-| `LIMITATIONS.md` | ✅ Complete, 18 limitations documented |
-| `MODEL_CARD.md` | ✅ Complete, cross-referenced with `LIMITATIONS.md` |
-| Test pre-commitment log (`reports/evaluation/test_precommitment_log.md`) | ✅ Complete, finalised, no further tuning performed |
-| Docker (`Dockerfile`, `Dockerfile.inference`, `docker-compose.yml`) | 🔜 Stage 10 |
-| CI/CD (`.github/workflows/ci.yml`), `Makefile` | 🔜 Stage 10 |
-| Remaining unit tests (`test_downloader.py`, `test_validator.py`, `test_extractor.py`, `test_model_factory.py`) | 🔜 Stage 10 |
-| One-page technical report (`reports/report.pdf`) | 🔜 Stage 11 |
-| Five-question theoretical assessment | 🔜 Stage 11 |
-
-Any claim about this system's accuracy or production readiness made before Stage 10/11 close
-should be sourced to `LIMITATIONS.md`, `MODEL_CARD.md`, and the Stage 6/8 evaluation/verification
-reports under `reports/evaluation/` directly — not to a not-yet-written report.
-
----
-
-## 20. Contributing
+## 19. Contributing
 
 ```bash
 pip install -r requirements-dev.txt
@@ -959,7 +938,7 @@ config field must be added to both the YAML defaults and the Pydantic schema in
 
 ---
 
-## 21. License and Citation
+## 20. License and Citation
 
 This project is licensed under the MIT License — see [`LICENSE`](LICENSE).
 
