@@ -2,12 +2,18 @@
 ### A Production-Grade, End-to-End Landmark-Based Sign Language Recognition Pipeline
 
 <p align="center">
-  <img src="reports/figures/demo_placeholder.png" alt="Real-time gesture recognition demo" width="720"/>
-  <br/>
+
+https://github.com/user-attachments/assets/demo.mp4
+
+</p>
+<p align="center">
   <em>Real-time BiLSTM inference on MediaPipe Hands landmarks — 68,771 parameters, 0.16 MB
-  TFLite, CPU-only, ~47ms model+pipeline latency, live webcam HUD with calibrated confidence
+  TFLite, CPU-only, ~47 ms model+pipeline latency, live webcam HUD with calibrated confidence
   display and confusable-pair warnings.</em>
 </p>
+
+> **Can't see the video?** Download [`assets/demo.mp4`](assets/demo.mp4) or watch it directly
+> in the [`assets/`](assets/) folder.
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10.20-blue?logo=python&logoColor=white" alt="Python 3.10"/>
@@ -17,17 +23,17 @@
   <img src="https://img.shields.io/badge/OmegaConf-2.3.0-blueviolet" alt="OmegaConf"/>
   <img src="https://img.shields.io/badge/TFLite-0.1596_MB-success?logo=tensorflow&logoColor=white" alt="TFLite size"/>
   <img src="https://img.shields.io/badge/Release_Gate-6%2F6_PASS-success" alt="Release gate"/>
-  <img src="https://img.shields.io/badge/Stages-1--9_complete-success" alt="Pipeline stages"/>
+  <img src="https://img.shields.io/badge/Stages-1--11_complete-success" alt="Pipeline stages"/>
   <img src="https://github.com/HenryOtsyula/wlasl-gesture-recognition/actions/workflows/ci.yml/badge.svg" alt="CI"/>
   <img src="https://img.shields.io/badge/license-MIT-brightgreen" alt="MIT License"/>
 </p>
 
 <p align="center">
-  <strong>Pipeline status: Stages 1–9 complete</strong> — data ingestion through a verified
-  TFLite export and a working real-time webcam demo. Stage 10 (Docker / CI / CD / remaining
-  unit tests) and the one-page report + theoretical assessment portion of Stage 11 are open;
-  <a href="MODEL_CARD.md">MODEL_CARD.md</a> and <a href="LIMITATIONS.md">LIMITATIONS.md</a> are
-  complete and authoritative as of this README.
+  <strong>Pipeline status: Stages 1–11 complete</strong> — data ingestion through a verified
+  TFLite export, a working real-time webcam demo, full Docker infrastructure, CI/CD, and the
+  one-page technical report.
+  <a href="MODEL_CARD.md">MODEL_CARD.md</a> and <a href="LIMITATIONS.md">LIMITATIONS.md</a>
+  are complete and authoritative.
 </p>
 
 ---
@@ -136,7 +142,7 @@ on-device, offline-capable inference across a 500-sign vocabulary (see
 | Signer-independent generalisation analysis | ✅ **Done** — per-signer accuracy with Wilson-score CIs |
 | Document dataset bias, failure modes, and confidence calibration | ✅ **Done** — [`LIMITATIONS.md`](LIMITATIONS.md), 18 documented limitations |
 | KSL adaptation roadmap | ✅ **Done** — [Section 17](#17-ksl-adaptation-roadmap) |
-| Docker, full test suite, one-page report | ✅ **Done** — Stage 10 / remainder of Stage 11, see [Section 19](#19-project-status-and-remaining-work) |
+| Docker, full test suite, CI/CD, one-page report | ✅ **Done** — Stages 10–11 complete |
 
 ---
 
@@ -261,7 +267,7 @@ treats as non-negotiable for any honest small-data evaluation claim.
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │
                                 ▼
-┌──────────────────────────────────────────────────────────────────────┐ 
+┌──────────────────────────────────────────────────────────────────────┐
 │         UNIFIED INFERENCE ENGINE  —  GesturePredictor (Stage 7)      │
 │   FrameBuffer (rolling 100-frame window) → FeaturePipeline →         │
 │   model(x, training=False) → PredictionSmoother (5-frame majority    │
@@ -300,8 +306,12 @@ lower-probability risk this leaves open.
 ```
 wlasl-gesture-recognition/
 │
+├── assets/
+│   ├── demo.mp4                                 ✅ Real-time webcam demo recording
+│   └── Screenshot 2026-07-08 074358.png         ✅ MLflow 23-run experiment dashboard
+│
 ├── data/
-│   ├── raw/                                    # Downloaded WLASL videos — gitignored
+│   ├── raw/                                     # Downloaded WLASL videos — gitignored
 │   ├── landmarks/                               # Cached .npy landmark arrays — gitignored
 │   │   ├── train/<sign>/<video_id>.npy          ✅ 236 clips
 │   │   ├── val/<sign>/<video_id>.npy            ✅ 52 clips
@@ -313,13 +323,13 @@ wlasl-gesture-recognition/
 │
 ├── notebooks/
 │   ├── 01_data_exploration.ipynb                ✅
-│   ├── 02_landmark_inspection.ipynb              ✅
-│   ├── 03_full_landmark_analysis.ipynb           ✅
-│   ├── 04_feature_engineering.ipynb              ✅ gate: PASS
-│   ├── 05_model_experiments.ipynb                ✅ 23-run analysis
-│   ├── 06_evaluation_error_analysis.ipynb        ✅ confusion matrix, calibration, signer analysis
-│   ├── 07_tflite_verification.ipynb              ✅ release gate, size/accuracy/per-class figures
-│   └── 08_interpretability_shap.ipynb            ✅ frame/landmark/per-class SHAP, confusable pairs
+│   ├── 02_landmark_inspection.ipynb             ✅
+│   ├── 03_full_landmark_analysis.ipynb          ✅
+│   ├── 04_feature_engineering.ipynb             ✅ gate: PASS
+│   ├── 05_model_experiments.ipynb               ✅ 23-run analysis
+│   ├── 06_evaluation_error_analysis.ipynb       ✅ confusion matrix, calibration, signer analysis
+│   ├── 07_tflite_verification.ipynb             ✅ release gate, size/accuracy/per-class figures
+│   └── 08_interpretability_shap.ipynb           ✅ frame/landmark/per-class SHAP, confusable pairs
 │
 ├── src/
 │   ├── data/
@@ -327,72 +337,79 @@ wlasl-gesture-recognition/
 │   │
 │   ├── features/
 │   │   ├── constants.py  extractor.py  augmentation.py     ✅
-│   │   ├── pipeline.py  dataset.py                          ✅
+│   │   ├── pipeline.py  dataset.py                         ✅
 │   │
 │   ├── models/
-│   │   ├── architectures.py  factory.py  train.py           ✅
+│   │   ├── architectures.py  factory.py  train.py          ✅
 │   │
-│   ├── evaluation/                                          ✅ Stage 6 — complete
+│   ├── evaluation/                                         ✅ Stage 6 — complete
 │   │   ├── metrics.py            # macro-F1, per-class metrics, bootstrap CI
 │   │   ├── benchmark.py          # latency harness, TFLiteCallable adapter
 │   │   ├── calibration.py        # reliability diagram, ECE/MCE, threshold curve
 │   │   └── signer_analysis.py    # per-signer accuracy, Wilson-score CIs
 │   │
-│   ├── export/                                              ✅ Stage 8 — complete
+│   ├── export/                                             ✅ Stage 8 — complete
 │   │   ├── convert.py            # verified SavedModel → TFLite export
 │   │   └── verify.py             # accuracy verification, release gate, model metadata
 │   │
-│   ├── inference/                                           ✅ Stage 7 — complete
+│   ├── inference/                                          ✅ Stage 7 — complete
 │   │   └── predictor.py          # GesturePredictor, FrameBuffer, PredictionSmoother
 │   │
-│   ├── demo/                                                ✅ Stage 9 — complete
+│   ├── demo/                                               ✅ Stage 9 — complete
 │   │   └── webcam_demo.py        # GestureStreamSession + live OpenCV HUD
 │   │
 │   └── utils/
 │       ├── config.py  logger.py  reproducibility.py  label_map.py   ✅
 │
 ├── pipelines/
-│   ├── run_preprocessing.py                      ✅ Stage 1
-│   ├── run_landmark_extraction.py                ✅ Stage 3
-│   ├── run_training.py  run_all_experiments.py   ✅ Stage 5
-│   ├── run_evaluation.py                         ✅ Stage 6
-│   └── run_export_verification.py               ✅ Stage 8 — CLI release-gate runner
+│   ├── run_preprocessing.py                     ✅ Stage 1
+│   ├── run_landmark_extraction.py               ✅ Stage 3
+│   ├── run_training.py  run_all_experiments.py  ✅ Stage 5
+│   ├── run_evaluation.py                        ✅ Stage 6
+│   ├── run_export_verification.py               ✅ Stage 8 — CLI release-gate runner
+│   └── run_model_registration.py               ✅ Stage 10 — MLflow Model Registry
 │
-├── configs/                                       ✅ OmegaConf + Pydantic v2, complete
+├── configs/                                     ✅ OmegaConf + Pydantic v2, complete
 │
 ├── tests/
-│   ├── test_augmentation.py  test_pipeline.py    ✅
-│   ├── test_predictor.py                          ✅ Stage 7 suite
-│   ├── test_tflite_export.py                      ✅ Stage 8 suite (14 tests)
-│   ├── test_downloader.py  test_validator.py
-│   ├── test_extractor.py  test_model_factory.py  
+│   ├── test_augmentation.py  test_pipeline.py   ✅
+│   ├── test_predictor.py                         ✅ Stage 7 suite
+│   ├── test_tflite_export.py                     ✅ Stage 8 suite (14 tests)
+│   ├── test_downloader.py  test_validator.py     ✅ Stage 10
+│   ├── test_extractor.py  test_model_factory.py  ✅ Stage 10
 │
 ├── artifacts/
-│   ├── label_map_v1.json                         ✅ 35 signs, schema v1.1, locked
-│   └── experiments/bilstm_hands_only_v4_aug/      ✅ config_snapshot.yaml, manifests, metrics
+│   ├── label_map_v1.json                        ✅ 35 signs, schema v1.1, locked
+│   └── experiments/bilstm_hands_only_v4_aug/    ✅ config_snapshot.yaml, manifests, metrics
 │
 ├── models/
-│   ├── bilstm_hands_only_v4_aug_saved_model/      ✅ Champion Keras SavedModel
-│   ├── gesture_bilstm_v1.tflite                   ✅ 0.1596 MB — deployed artefact
-│   ├── gesture_model_metadata.json                ✅ config-derived deployment metadata
-│   ├── export_manifest.json                       ✅ SHA-256 checksum, conversion provenance
-│   └── [22 additional ablation SavedModel dirs]   ✅
+│   ├── bilstm_hands_only_v4_aug_saved_model/    ✅ Champion Keras SavedModel
+│   ├── gesture_bilstm_v1.tflite                 ✅ 0.1596 MB — deployed artefact
+│   ├── gesture_model_metadata.json              ✅ config-derived deployment metadata
+│   ├── export_manifest.json                     ✅ SHA-256 checksum, conversion provenance
+│   └── [22 additional ablation SavedModel dirs] ✅
 │
 ├── reports/
-│   ├── figures/                                   ✅ 35+ figures across Stages 1–9
+│   ├── figures/                                 ✅ 35+ figures across Stages 1–9
 │   ├── evaluation/
-│   │   ├── evaluation_report.json                 ✅ Stage 6 consolidated report
-│   │   ├── tflite_verification_report.json        ✅ Stage 8 verification report
-│   │   ├── release_gate.json                      ✅ Stage 8 gate verdict
-│   │   └── test_precommitment_log.md              ✅ timestamped, finalised
-│   ├── experiment_summary.md                      ✅ full 23-run registry
-│   └── report.pdf                                 ✅ one-page report
+│   │   ├── evaluation_report.json               ✅ Stage 6 consolidated report
+│   │   ├── tflite_verification_report.json      ✅ Stage 8 verification report
+│   │   ├── release_gate.json                    ✅ Stage 8 gate verdict
+│   │   └── test_precommitment_log.md            ✅ timestamped, finalised
+│   ├── experiment_summary.md                    ✅ full 23-run registry
+│   └── report.pdf                               ✅ one-page technical report
 │
-├── LIMITATIONS.md                                 ✅ 18 documented limitations, complete
-├── MODEL_CARD.md                                  ✅ complete, cross-referenced with LIMITATIONS.md
-├── README.md                                       (this file)
-├── requirements.txt  requirements-dev.txt          ✅
-└── Dockerfile  Dockerfile.inference  docker-compose.yml  Makefile   ✅ Stage 10
+├── .github/
+│   └── workflows/
+│       └── ci.yml                               ✅ Stage 10 — 3-job CI pipeline
+│
+├── LIMITATIONS.md                               ✅ 18 documented limitations, complete
+├── MODEL_CARD.md                                ✅ complete, cross-referenced
+├── README.md                                    (this file)
+├── Makefile                                     ✅ Stage 10 — full pipeline targets
+├── requirements.txt  requirements-dev.txt       ✅
+├── requirements-inference.txt                   ✅ Stage 10 — lean inference deps
+└── Dockerfile  Dockerfile.inference  docker-compose.yml   ✅ Stage 10
 ```
 
 ---
@@ -445,7 +462,7 @@ published WLASL benchmarks, which is *not* directly comparable to the numbers in
 
 | Split | Clips | Signers | Classes represented |
 |---|---|---|---|
-| Train | 236 | 31 | 35 |
+| Train | 236 | 31 (all unseen in val/test) | 35 |
 | Val | 52 | 7 (all unseen) | 35 |
 | Test | 51 | 7 (all unseen) | 35 |
 
@@ -474,8 +491,8 @@ published WLASL benchmarks, which is *not* directly comparable to the numbers in
 | **7 — Unified Inference Engine** | `GesturePredictor`, `FrameBuffer`, `PredictionSmoother`, model-format auto-detection | ✅ Complete |
 | **8 — TFLite Export & Verification** | Dynamic-range quantisation, accuracy verification, automated release gate (6/6 PASS) | ✅ Complete |
 | **9 — Real-Time Webcam Demo** | `GestureStreamSession`, MediaPipe Hands, calibration-aware HUD, session summary | ✅ Complete |
-| **10 — Infrastructure** | Docker, CI/CD, Makefile, remaining unit tests | ✅ Complete |
-| **11 — Report & Theoretical Assessment** | One-page report, 5-question theoretical assessment (Model Card already shipped) | ✅ Complete |
+| **10 — Infrastructure** | Docker (training + inference images), CI/CD (GitHub Actions), Makefile, remaining unit tests, MLflow Model Registry | ✅ Complete |
+| **11 — Report & Theoretical Assessment** | One-page technical report, 5-question theoretical assessment | ✅ Complete |
 
 ### Stage 4: feature engineering pipeline
 
@@ -607,10 +624,9 @@ is too small for a reliable temperature estimate (see [L11](LIMITATIONS.md#l11))
   | cousin ↔ mother | 0.927, 0.947 |
   | girl ↔ orange | 0.963, 0.937 |
 
-  These are the direct cause of several confusion-matrix entries (`before↔chair`,
-  `cousin↔go/now`, `drink↔boy/orange/who`, `girl↔go/now`, `who↔candy`) and are surfaced as a
-  first-class UI element in the Stage 9 demo (top-3 panel + confusable-pair badge), not silently
-  absorbed — see [L12](LIMITATIONS.md#l12).
+  These are the direct cause of several confusion-matrix entries and are surfaced as a
+  first-class UI element in the Stage 9 demo (top-3 panel + confusable-pair badge), not
+  silently absorbed — see [L12](LIMITATIONS.md#l12).
 
 ### Signer-independent generalisation
 
@@ -680,6 +696,20 @@ required; full-integer quantisation infeasible for this architecture under TF 2.
 
 ## 13. Stage 9 — Real-Time Webcam Demo
 
+<p align="center">
+
+https://github.com/user-attachments/assets/demo.mp4
+
+</p>
+<p align="center">
+  <em>Live BiLSTM inference at ~17–18 FPS on CPU. The HUD shows the predicted sign with a
+  calibrated confidence bar (threshold marker at 0.35), a top-3 panel with confusable-pair
+  badges, a stability dot, per-stage latency breakdown, and hand-detection indicators.
+  Session summary is printed to stdout on exit.</em>
+</p>
+
+> **Can't see the video?** Download [`assets/demo.mp4`](assets/demo.mp4).
+
 ```bash
 python src/demo/webcam_demo.py
 python src/demo/webcam_demo.py --model models/gesture_bilstm_v1.tflite --camera 1
@@ -741,10 +771,10 @@ cross-platform OpenCV font compatibility.
   resources, and the OpenCV window are released deterministically regardless of how the loop
   exits (normal quit, camera disconnection, or an unhandled exception).
 
-See [`LIMITATIONS.md` Section 8](LIMITATIONS.md#8-real-time-system-limitations-stage-9) (L14–L16)
-for the documented, honest limitations of the live system: MediaPipe detection sensitivity to
-lighting/angle, the deliberate ~8-frame display lag from smoothing + debounce, no
-out-of-distribution rejection, and single-threaded/single-sign scope.
+See [`LIMITATIONS.md`](LIMITATIONS.md) (L14–L16) for the documented, honest limitations of the
+live system: MediaPipe detection sensitivity to lighting/angle, the deliberate ~8-frame display
+lag from smoothing + debounce, no out-of-distribution rejection, and single-threaded/single-sign
+scope.
 
 ---
 
@@ -766,18 +796,19 @@ print(f'TF: {tf.__version__}  MediaPipe: {mediapipe.__version__}  MLflow: {mlflo
 "
 ```
 
-### Run the full pipeline
+### Run the full pipeline (Make targets)
 
 ```bash
-make preprocess    # Extract MediaPipe landmarks → .npy cache
-make train         # Run the full 23-run experiment matrix (MLflow tracked)
-make evaluate       # Stage 6: test-set evaluation, calibration, SHAP
-make export        # Stage 8: TFLite export + release gate
-make demo           # Stage 9: real-time webcam demo
+make preprocess    # Stage 1: download WLASL videos + signer-aware splits
+make extract       # Stage 3: MediaPipe landmark extraction → .npy cache
+make train         # Stage 5: full 23-run experiment matrix (MLflow tracked)
+make evaluate      # Stage 6: test-set evaluation, calibration, SHAP
+make export        # Stage 8: TFLite export + 6/6 release gate
+make register      # Stage 10: register champion in MLflow Model Registry
+make demo          # Stage 9: real-time webcam demo
+make test          # Stage 10: pytest + coverage
+make lint          # Stage 10: flake8
 ```
-
-> `Makefile` / `make` targets ship as part of Stage 10 — until then, invoke each pipeline
-> script directly (shown below).
 
 ### Train the champion configuration
 
@@ -834,19 +865,82 @@ print("Pipeline verified.")
 ```bash
 pytest tests/ -v --cov=src --cov-report=term-missing
 pytest tests/test_predictor.py -v        # Stage 7 suite
-pytest tests/test_tflite_export.py -v    # Stage 8 suite
+pytest tests/test_tflite_export.py -v    # Stage 8 suite (14 tests)
 ```
 
 ---
 
 ## 15. Docker
 
-*(Stage 10 — open)*
+Two production Docker images ship as part of Stage 10.
 
-Two images are planned: a full training image (TensorFlow + MediaPipe, ~4 GB) and a lean
-inference image (`Dockerfile.inference`, TFLite runtime only, ~800 MB) that intentionally
-excludes `src/evaluation` and the full TensorFlow training stack, matching the project's
-documented `GesturePredictor`-only deployment contract.
+| Image | Purpose | Key stack | Size |
+|---|---|---|---|
+| `wlasl-train:latest` | Full pipeline reproduction: preprocessing → training → evaluation → export | TF 2.13.1, MediaPipe 0.10.14, MLflow, sklearn, OpenCV | ~3–4 GB |
+| `wlasl-inference:latest` | Lean production serving: `GesturePredictor` + TFLite runtime only | `tflite-runtime==2.13.0`, MediaPipe, OpenCV-headless | ~300 MB |
+
+The split is deliberate — the inference image intentionally excludes TensorFlow, MLflow, and
+`src/evaluation/`. The TFLite model is **mounted at runtime** (not baked into the image) so
+model updates never require an image rebuild.
+
+### Build
+
+```bash
+# Training image (~15–20 min first time; TF 2.13.1 is a large download)
+docker build -t wlasl-train:latest .
+
+# Inference image (~3–5 min)
+docker build -f Dockerfile.inference -t wlasl-inference:latest .
+```
+
+### Run pipeline stages
+
+```bash
+docker-compose run --rm preprocess   # Stage 1
+docker-compose run --rm extract      # Stage 3
+docker-compose run --rm train        # Stage 5: full 23-run matrix
+docker-compose run --rm evaluate     # Stage 6
+docker-compose run --rm export       # Stage 8: TFLite export + release gate
+docker-compose run --rm register     # Stage 10: MLflow Model Registry
+docker-compose run --rm lint         # flake8
+docker-compose run --rm test         # pytest + coverage
+```
+
+### Launch MLflow UI
+
+```bash
+docker-compose up mlflow
+# Open http://localhost:5000
+```
+
+### Run the webcam demo (Linux — requires /dev/video0)
+
+```bash
+docker-compose run --rm inference
+# Or directly:
+docker run --rm \
+    -v $(pwd)/models:/app/models:ro \
+    -v $(pwd)/artifacts:/app/artifacts:ro \
+    --device /dev/video0:/dev/video0 \
+    -e DISPLAY=$DISPLAY \
+    --network host \
+    wlasl-inference:latest \
+    python src/demo/webcam_demo.py --model models/gesture_bilstm_v1.tflite
+```
+
+### Key design decisions
+
+- **`python:3.10-slim` base** (not `tensorflow/tensorflow:2.13.x`) — mirrors the project's
+  Miniconda venv exactly for byte-for-byte identical dependency resolution.
+- **`protobuf==3.20.3` pre-installed before MediaPipe** — prevents pip from silently pulling in
+  protobuf 4.x which breaks MediaPipe 0.10.14's C++/Python bridge.
+- **Determinism env vars as `ENV` directives** — `PYTHONHASHSEED=42`, `TF_DETERMINISTIC_OPS=1`,
+  `TF_CUDNN_DETERMINISTIC=1` are baked into both images so they are set before Python starts,
+  regardless of how the container is launched.
+- **Non-root `mluser` (UID/GID 1000)** — matches the default Linux desktop user so
+  bind-mounted directories have correct permissions without manual `chown`.
+- **Layer ordering for cache efficiency** — system libs → requirements → source code. A
+  source-only change skips the expensive pip layer entirely.
 
 ---
 
@@ -860,9 +954,29 @@ as an MLflow artefact.
 
 ```bash
 mlflow ui --host 0.0.0.0 --port 5000
+# Or via Docker:
+docker-compose up mlflow
 ```
 
-The champion is tracked under MLflow run ID `cb16f689d2294001a2ff2d3e02419d27`.
+<p align="center">
+  <img
+    src="assets/Screenshot 2026-07-08 074358.png"
+    alt="MLflow experiment dashboard showing all 23 WLASL-35-class runs sorted by val_macro_f1 descending. The champion bilstm_hands_only_v4_aug is highlighted at the top with val_macro_f1 = 0.6011."
+    width="900"
+  />
+</p>
+<p align="center">
+  <em>MLflow experiment dashboard — all 23 runs under <code>WLASL-35-class</code>, sorted by
+  <code>val_macro_f1</code> descending. The champion
+  <code>bilstm_hands_only_v4_aug</code> (val macro-F1 = 0.6011, MLflow run ID
+  <code>cb16f689</code>) is at the top. Every ablation run — architecture, augmentation,
+  sequence length, and landmark-configuration groups — is visible in a single view, proving
+  all 23 experiments were systematically tracked rather than cherry-picked.</em>
+</p>
+
+The champion is tracked under MLflow run ID `cb16f689d2294001a2ff2d3e02419d27`. The
+`gesture-lstm-production` MLflow Model Registry entry (Stage 10) points to this run and is
+transitioned to `Production` stage by `pipelines/run_model_registration.py`.
 
 ---
 
@@ -891,11 +1005,12 @@ Evaluate all three with **per-class recall**, not aggregate accuracy — this pr
 per-class data-scarcity failures ([L2](LIMITATIONS.md#l2)) are likely to recur, possibly worse,
 at 500-class KSL scale.
 
-**Data requirement:** ~100–200 clips/sign (current AI4KSL: ~40 clips/sign — below viability).
-**Architecture scaling:** `hidden_units ∈ {128, 256}` should be the first ablation point (current
-champion: 64). **Estimated timeline:** 3–6 months, dominated by data collection, not modelling —
-consistent with this project's own finding that architecture search converges quickly relative
-to the cost of data scarcity.
+**Data requirement:** ~100–200 clips/sign (current AI4KSL: ~40 clips/sign — below viability).  
+**Architecture scaling:** `hidden_units ∈ {128, 256}` should be the first ablation point
+(current champion: 64).  
+**Estimated timeline:** 3–6 months, dominated by data collection, not modelling — consistent
+with this project's own finding that architecture search converges quickly relative to the cost
+of data scarcity.
 
 ---
 
@@ -913,22 +1028,40 @@ future report should be read relative to that document. Headline points:
 | Evaluation | 21/35 val classes are singletons; champion's val macro-F1 should be read as **≈0.58 ± 0.03**, not a fixed point ([L3](LIMITATIONS.md#l3), [L7](LIMITATIONS.md#l7)) |
 | Evaluation | The 14.3pp val→test gap is the project's most important honesty check — quote the **test** number externally ([L6](LIMITATIONS.md#l6)) |
 | Model | 70% target not met (0.6011 Keras val achieved); evidence points to data, not architecture, as the binding constraint ([L8](LIMITATIONS.md#l8)) |
-| Calibration | Model is **underconfident** (ECE = 0.2009); mitigated with a 0.35 display threshold, not temperature scaling (not yet implemented) ([L11](LIMITATIONS.md#l11)) |
+| Calibration | Model is **underconfident** (ECE = 0.2009); mitigated with a 0.35 display threshold, not temperature scaling ([L11](LIMITATIONS.md#l11)) |
 | Real-time system | No out-of-distribution rejection — any input produces a confident-looking prediction among the 35 known classes ([L15](LIMITATIONS.md#l15)) |
 | Real-time system | Latency verified on development-machine CPU only — **never benchmarked on Android**, the stated primary deployment target ([L17](LIMITATIONS.md#l17)) |
 | Scope | ASL ≠ KSL — this model is not deployable to the actual production target without the roadmap in [Section 17](#17-ksl-adaptation-roadmap) ([L18](LIMITATIONS.md#l18)) |
 
 ---
 
-## 19. Contributing
+## 19. Project Status and Remaining Work
+
+All 11 stages are complete. There is no outstanding work required for the project's stated
+scope. The only natural extension is KSL data collection and the three-protocol transfer
+learning comparison described in [Section 17](#17-ksl-adaptation-roadmap) — that work is
+explicitly a separate project phase, not an open item in this one.
+
+| Stage | Status | Notes |
+|---|---|---|
+| 1–9 (core pipeline) | ✅ Complete | Data, training, eval, inference, demo |
+| 10 — Infrastructure | ✅ Complete | Docker, CI/CD, Makefile, unit tests, Model Registry |
+| 11 — Report & Assessment | ✅ Complete | One-page report, theoretical assessment |
+| MODEL_CARD.md | ✅ Complete | Config-derived, cross-referenced with LIMITATIONS.md |
+| LIMITATIONS.md | ✅ Complete | 18 documented limitations, authoritative |
+| KSL adaptation | 🔜 Future work | Requires ~100–200 clips/sign; see Section 17 |
+
+---
+
+## 20. Contributing
 
 ```bash
 pip install -r requirements-dev.txt
 pre-commit install   # black + flake8 git hooks
 
 pytest tests/ -v --cov=src --cov-report=term-missing   # test
-flake8 src/ pipelines/ tests/ --max-line-length 100      # lint
-black src/ pipelines/ tests/                              # format
+flake8 src/ pipelines/ tests/ --max-line-length 100     # lint
+black src/ pipelines/ tests/                             # format
 ```
 
 Please open an issue before submitting a pull request for significant changes. The
@@ -938,7 +1071,7 @@ config field must be added to both the YAML defaults and the Pydantic schema in
 
 ---
 
-## 20. License and Citation
+## 21. License and Citation
 
 This project is licensed under the MIT License — see [`LICENSE`](LICENSE).
 
@@ -962,8 +1095,9 @@ If you use this model or dataset in research, please cite:
 
 <p align="center">
   <sub>
-    Stages 1–9 complete · 23 MLflow runs · champion val macro-F1: 0.6011 (Keras) / 0.5916 (TFLite)
+    Stages 1–11 complete · 23 MLflow runs · champion val macro-F1: 0.6011 (Keras) / 0.5916 (TFLite)
     · test macro-F1: 0.4581 (Keras) / 0.4867 (TFLite) · 68,771 parameters · 0.1596 MB TFLite ·
-    release gate 6/6 PASS · 47.11 ms full-pipeline latency · live webcam demo verified
+    release gate 6/6 PASS · 47.11 ms full-pipeline latency · live webcam demo verified ·
+    Docker infrastructure complete
   </sub>
 </p>
