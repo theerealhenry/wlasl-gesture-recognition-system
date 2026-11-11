@@ -2,6 +2,15 @@
 ### A Production-Grade, End-to-End Landmark-Based Sign Language Recognition Pipeline
 
 <p align="center">
+  <img src="assets/demo-family-sign.jpg" alt="Live demo of the WLASL sign recognition system: MediaPipe hand landmarks are tracked on both hands and the sign 'family' is predicted with 81% confidence, with the top-3 predictions, model details and per-stage latency shown in the HUD" width="860"/>
+</p>
+<p align="center">
+  <em>Live demo: MediaPipe tracks both hands and a 0.16 MB TFLite BiLSTM predicts the sign
+  (here <strong>"family"</strong>, 81% confidence). The HUD shows the top-3 predictions, model
+  metrics and a per-stage latency breakdown.</em>
+</p>
+
+<p align="center">
 
 https://github.com/user-attachments/assets/demo.mp4
 
@@ -308,6 +317,7 @@ wlasl-gesture-recognition/
 │
 ├── assets/
 │   ├── demo.mp4                                 ✅ Real-time webcam demo recording
+│   ├── demo-family-sign.jpg                     ✅ Demo screenshot (sign "family", 81%)
 │   └── Screenshot 2026-07-08 074358.png         ✅ MLflow 23-run experiment dashboard
 │
 ├── data/
@@ -709,6 +719,14 @@ https://github.com/user-attachments/assets/demo.mp4
 </p>
 
 > **Can't see the video?** Download [`assets/demo.mp4`](assets/demo.mp4).
+
+<p align="center">
+  <img src="assets/demo-family-sign.jpg" alt="Webcam demo HUD showing the predicted sign 'family' at 81% confidence, the top-3 predictions panel, session statistics, model metrics and the per-stage latency breakdown" width="760"/>
+</p>
+<p align="center">
+  <em>Example frame: predicted sign, calibrated confidence bar, top-3 panel, session statistics,
+  model panel (val/test F1, size, threshold) and per-stage pipeline latency.</em>
+</p>
 
 ```bash
 python src/demo/webcam_demo.py
