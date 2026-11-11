@@ -12,7 +12,7 @@
 
 <p align="center">
 
-https://github.com/user-attachments/assets/demo.mp4
+https://github.com/user-attachments/assets/319213a2-ee6a-4211-a0fc-73be665e0379
 
 </p>
 <p align="center">
@@ -708,7 +708,7 @@ required; full-integer quantisation infeasible for this architecture under TF 2.
 
 <p align="center">
 
-https://github.com/user-attachments/assets/demo.mp4
+https://github.com/user-attachments/assets/319213a2-ee6a-4211-a0fc-73be665e0379
 
 </p>
 <p align="center">
